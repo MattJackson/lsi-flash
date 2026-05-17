@@ -11,6 +11,7 @@ rust-version = "1.74"
 [dependencies]
 thiserror = "1"
 anyhow = "1"
+libc = "0.2"
 
 [profile.release]
 lto = true

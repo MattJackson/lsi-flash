@@ -1,5 +1,6 @@
 mod error;
 
+pub mod hcb;
 pub mod mpi;
 pub mod sbr;
 
