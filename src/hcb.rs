@@ -100,7 +100,7 @@ pub fn resolve_physical_address(buffer: &[u8; HCDW_SIZE]) -> Result<u64, HcbErro
     })?;
 
     let pfn = entry & ((1u64 << 55) - 1);
-    let physical_address = (pfn as u64) << 12;
+    let physical_address = pfn << 12;
 
     Ok(physical_address)
 }
