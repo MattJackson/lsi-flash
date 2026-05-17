@@ -53,14 +53,14 @@ pub const MPI2_DCR_ADDRESS: u32 = 0x3c;
 
 /// Read 32-bit value from BAR1 offset with volatile semantics. Cites lsirec.c:89-92.
 #[inline]
-fn read32(bar1: &[u8], offset: u32) -> u32 {
+pub(crate) fn read32(bar1: &[u8], offset: u32) -> u32 {
     let ptr = unsafe { bar1.as_ptr().add(offset as usize) } as *const u32;
     unsafe { std::ptr::read_volatile(ptr) }
 }
 
 /// Write 32-bit value to BAR1 offset with volatile semantics. Cites lsirec.c:94-97.
 #[inline]
-fn write32(bar1: &mut [u8], offset: u32, data: u32) {
+pub(crate) fn write32(bar1: &mut [u8], offset: u32, data: u32) {
     let ptr = unsafe { bar1.as_mut_ptr().add(offset as usize) } as *mut u32;
     unsafe { std::ptr::write_volatile(ptr, data) }
 }
