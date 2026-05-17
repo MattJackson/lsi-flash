@@ -1,3 +1,4 @@
+mod card_database;
 mod error;
 
 pub mod firmware;

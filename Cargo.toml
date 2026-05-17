@@ -12,6 +12,8 @@ rust-version = "1.74"
 thiserror = "1"
 anyhow = "1"
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 lto = true
