@@ -9,6 +9,8 @@ readme = "README.md"
 rust-version = "1.74"
 
 [dependencies]
+thiserror = "1"
+anyhow = "1"
 
 [profile.release]
 lto = true
