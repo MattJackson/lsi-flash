@@ -1,3 +1,4 @@
+pub mod mpi;
 pub mod sbr;
 
 fn main() {
