@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_parse_2118it_bin() {
-        let data = std::fs::read("/Users/mjackson/Developer/lsi-flash-notes/references/upstream/lsi_sas_hba_crossflash_guide/2118it.bin").unwrap();
+        let data = std::fs::read("/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide/2118it.bin").unwrap();
         let header = parse_fw_header(&data).unwrap();
 
         assert_eq!(header.signature, MPI2_FW_HEADER_SIGNATURE);

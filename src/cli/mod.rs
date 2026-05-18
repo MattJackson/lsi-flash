@@ -1,6 +1,10 @@
-//! CLI surface for `lsi-flash`. Per ADR-007: 4 verbs, no nested subcommand sprawl.
+//! CLI surface for `lsi-flash`. Per ADR-007 + ADR-014: 5 top-level verbs
+//! (detect/backup/flash/recover/sbr).
 //!
-//! See `lsi-flash-notes/scoping/adr/007-cli-surface.md`.
+//! See `lsi-flash-notes/01-architecture/adr/007-cli-surface.md` and
+//! `lsi-flash-notes/01-architecture/adr/014-sbr-verb-and-card-database.md`.
+
+pub mod sbr;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -94,6 +98,12 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+
+    /// SBR (Subsystem Boot Record) operations. Per ADR-014.
+    Sbr {
+        #[command(subcommand)]
+        sub: sbr::SbrCommand,
+    },
 }
 
 /// Firmware-mode targets for `flash`. Per ADR-007:
@@ -160,6 +170,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             );
             Ok(())
         }
+        Command::Sbr { sub } => sbr::run(sub),
     }
 }
 

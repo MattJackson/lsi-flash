@@ -1,0 +1,481 @@
+# SAS2008 card identity database — canonical source
+#
+# This file is the source of truth consumed by the `lsi-flash` CLI at build
+# time. The CLI embeds it via `include_str!("../resources/card-database.toml")`
+# after `cargo run --bin sync-card-db` copies it into the CLI source tree.
+#
+# Per ADR-014 (lsi-flash-notes/01-architecture/adr/014-sbr-verb-and-card-database.md):
+#   - STRICT tier: only byte-confirmed identities (sample SBR, byte-diff RE,
+#     real-hardware lspci capture, OR canonical pci.ids)
+#   - User override path: ~/.config/lsi-flash/card-database.toml replaces this
+#   - `lsi-flash update-manifest` fetches the latest version of this file
+#
+# Canonical pci.ids (pci-ids.ucw.cz/v2.2/pci.ids) is treated as byte-confirmed
+# for the purposes of strict embed because:
+#   1. The same file ships as /usr/share/hwdata/pci.ids in every Linux distro
+#   2. lspci uses it to label Subsystem lines
+#   3. Incorrect entries would be caught by any user running lspci over the
+#      past decade — entries here have a decade of distributed verification
+#
+# Rumored / forum-only / un-byte-confirmed identities live in
+# `card-database-tier2.toml` (separate file, manual opt-in via user override).
+#
+# Adding a new identity requires:
+#   1. A sample SBR file in this repo (sas2008-<vendor>-<model>-*.sbr), OR
+#   2. A byte-diff RE confirming SubsysVID/PID offsets across cohort, OR
+#   3. A real-hardware lspci capture in 09-research-archive/fixtures/, OR
+#   4. An entry in canonical pci.ids (https://pci-ids.ucw.cz/v2.2/pci.ids)
+
+schema_version = 1
+last_updated = "2026-05-18"
+tier = "strict"
+
+# ============================================================================
+# LSI / Avago / Broadcom — stock cards (un-OEM'd)
+# ============================================================================
+
+[card.lsi-9211-8i]
+display = "LSI SAS 9211-8i"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1000
+subsys_pid = 0x3020
+chip_family = "SAS2008"
+default_personality = "IT"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+factory_firmware = "sas2008-lsi-p20-00-07-00-it"
+compatible_firmware = [
+  "sas2008-lsi-p20-00-07-00-it",
+  "sas2008-lsi-p20-00-07-00-ir",
+  "sas2008-lsi-p19-00-00-00-it",
+  "sas2008-lsi-p13-00-66-00-it",
+  "sas2008-lsi-p07-00-00-00-it",
+]
+quirks = []
+form_factor = "PCIe full-height, 2× SFF-8087 internal"
+confirmed_via = "lsirec-marcan/sample_sbr/sbr_sas9211-8i_itir.cfg:8-9 (byte-confirmed sample SBR) + canonical pci.ids"
+notes = "Canonical reference card. No OEM tamper checks. Ships with IT firmware from factory."
+
+[card.lsi-9210-8i]
+display = "LSI SAS 9210-8i"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1000
+subsys_pid = 0x3040
+chip_family = "SAS2008"
+default_personality = "IT"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = []
+confirmed_via = "canonical pci.ids (pci-ids.ucw.cz/v2.2/pci.ids)"
+notes = "Sibling of 9211-8i; same chip silicon. Less common in homelab."
+
+# ============================================================================
+# Dell — non-PERC SAS HBA + PERC H200 family (DID=0x0072 IR personality)
+# ============================================================================
+
+[card.dell-6gbps-sas-hba-adapter]
+display = "Dell 6Gbps SAS HBA Adapter"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f1c
+chip_family = "SAS2008"
+default_personality = "IT"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = ["dell-tamper-check"]
+form_factor = "PCIe full-height (non-PERC; standalone HBA)"
+confirmed_via = "lsirec-marcan/sample_sbr/sbr_dell_h200e_itir.cfg:8-9 (file labeled 'h200e' but actually this 6Gbps HBA per canonical pci.ids) + pci.ids"
+notes = "Standalone 6Gbps SAS HBA — NOT a PERC H200. Often confused with H200 because the lsirec sample SBR is mislabeled. PID 0x1F1C is this card; H200 Adapter is 0x1F1D."
+
+[card.dell-h200-adapter]
+display = "Dell PERC H200 Adapter"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f1d
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+factory_firmware = "sas2008-dell-h200a-a11-ir"
+compatible_firmware = [
+  "sas2008-dell-h200a-a11-ir",
+  "sas2008-dell-h200a-a09-ir",
+  "sas2008-dell-h200a-a04-ir",
+  "sas2008-dell-h200a-a03-ir",
+  "sas2008-dell-h200a-a00-ir",
+]
+quirks = ["dell-tamper-check"]
+form_factor = "PCIe full-height, 2× SFF-8087 internal"
+confirmed_via = "real-hardware lspci on dev-1 (09-research-archive/fixtures/stage-0/01-initial/lspci-pre.txt:2) + Dell driver INF (DriverMax 1234723) + canonical pci.ids"
+notes = "Most common Dell H200 variant. Tamper check on flash erase: requires megarec -cleanflash 0 or lsirec HCB hostboot path."
+
+[card.dell-h200-integrated]
+display = "Dell PERC H200 Integrated"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f1e
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = ["dell-tamper-check"]
+form_factor = "Server-board-embedded (R220, R710, etc.)"
+confirmed_via = "canonical pci.ids"
+notes = "Embedded on Dell server boards. Same procedure as Adapter variant."
+
+[card.dell-h200-modular]
+display = "Dell PERC H200 Modular"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f1f
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = ["dell-tamper-check"]
+form_factor = "Blade mezzanine (M610, M710, etc.)"
+confirmed_via = "canonical pci.ids"
+notes = "Blade-form-factor variant."
+
+[card.dell-h200-embedded]
+display = "Dell PERC H200 Embedded"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f20
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = ["dell-tamper-check"]
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h200-tape-adapter]
+display = "Dell PERC H200 Internal Tape Adapter"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1028
+subsys_pid = 0x1f22
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = ["dell-tamper-check", "dell-h200-tape-adapter-smaller-flash"]
+confirmed_via = "canonical pci.ids"
+notes = "Smaller flash than other H200 variants. 2118it.bin won't fit; use Dell IT firmware or LSI IT phase ≤ P7."
+
+# ============================================================================
+# Dell PERC H310 family (DID=0x0073 IMR personality)
+# ============================================================================
+
+[card.dell-h310-adapter]
+display = "Dell PERC H310 Adapter"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f4e
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h310-integrated]
+display = "Dell PERC H310 Integrated"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f4f
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h310-mini-blades]
+display = "Dell PERC H310 Mini Blades"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f50
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+form_factor = "Blade mezzanine"
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h310-mini-monolithics]
+display = "Dell PERC H310 Mini Monolithics"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f51
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite", "dell-h310-mini-mono-idrac-lock"]
+form_factor = "iDRAC-shared storage slot (R320, R420, etc.)"
+confirmed_via = "firmware repo sas2008-dell-h310-stock.sbr (bytes 0x14-0x17 = 28 10 51 1f) + canonical pci.ids"
+notes = "iDRAC validation gate post-flash on some servers. The 'stock' SBR in our firmware repo is from a Mini Mono card."
+
+[card.dell-h310-embedded1]
+display = "Dell PERC H310 Embedded1"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f52
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h310-embedded2]
+display = "Dell PERC H310 Embedded2"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f53
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+[card.dell-h310-full-size]
+display = "Dell PERC H310 (full-size half-height)"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1028
+subsys_pid = 0x1f78
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x0c
+compatible_firmware = []
+quirks = ["dell-tamper-check", "imr-composite"]
+form_factor = "PCIe half-height, 2× SFF-8087 internal"
+confirmed_via = "firmware repo sas2008-dell-h310-full-modded.sbr (bytes 0x14-0x17 = 28 10 78 1f) + canonical pci.ids"
+
+# ============================================================================
+# IBM ServeRAID family (DID=0x0073 IMR personality factory)
+# ============================================================================
+
+[card.ibm-m1015]
+display = "IBM ServeRAID M1015"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1014
+subsys_pid = 0x03b1
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+factory_firmware = "sas2008-ibm-m1015-imr"
+compatible_firmware = [
+  "sas2008-ibm-m1015-imr",
+]
+quirks = ["imr-composite"]
+form_factor = "PCIe half-height, 2× SFF-8087 internal"
+confirmed_via = "firmware repo sas2008-ibm-m1015.ir (256-byte SBR misnamed as .ir; bytes 0x14-0x17 = 14 10 b1 03) + IBM driver INF (DriverMax 245276) + canonical pci.ids"
+notes = "Most popular cross-flash target in the community. No Dell-style tamper check. megarec -cleanflash 0 typically succeeds without HCB hostboot."
+
+[card.ibm-m1115]
+display = "IBM ServeRAID M1115"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1014
+subsys_pid = 0x040d
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+form_factor = "PCIe half-height, 2× SFF-8087 internal"
+confirmed_via = "IBM driver INF (DriverMax 4442185, 1219023) + canonical pci.ids"
+notes = "Same chip as M1015, different PHY placement. Notorious memory compatibility quirk in IBM System x chassis."
+
+[card.ibm-6gb-sas-hba-9212-4i4e]
+display = "IBM 6Gb SAS HBA (9212-4i4e)"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1014
+subsys_pid = 0x03ca
+chip_family = "SAS2008"
+default_personality = "IT"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = []
+form_factor = "4× SAS internal + 4× SAS external"
+confirmed_via = "canonical pci.ids"
+
+# ============================================================================
+# Fujitsu — SAS2008, IR personality
+# ============================================================================
+
+[card.fujitsu-d2607]
+display = "Fujitsu D2607"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x1734
+subsys_pid = 0x1177
+chip_family = "SAS2008"
+default_personality = "IR"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+factory_firmware = "sas2008-fujitsu-d2607-ir"
+compatible_firmware = [
+  "sas2008-fujitsu-d2607-ir",
+]
+quirks = ["fujitsu-a21-wiring"]
+form_factor = "PCIe full-height, 2× SFF-8087 internal"
+confirmed_via = "lsirec-marcan/sample_sbr/sbr_fujitsu_d2607_itir.cfg:8-9 + lrq3000 archive SBR-A11.bin/SBR-A21.bin (bytes 0x14-0x17 = 34 17 77 11 in both) + canonical pci.ids"
+notes = "Two SBR variants: A11 (HwConfig=0x04) vs A21 (HwConfig=0x00, preserves Fujitsu wiring). Same SubsysVID:PID for both. Fault 704 expected on first flash attempt; requires sas2haxp20.efi tool path."
+
+# ============================================================================
+# Cisco — SAS2008, IMR personality
+# ============================================================================
+
+[card.cisco-ucsc-raid-sas-2008m-8i-b0]
+display = "Cisco UCSC RAID SAS 2008M-8i (rev B0)"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1137
+subsys_pid = 0x00b0
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+confirmed_via = "Cisco driver INF (DriverMax 1720838) + canonical pci.ids"
+notes = "Cisco UCS rack server controller. Already supports JBOD passthrough at stock; cross-flash optional."
+
+[card.cisco-ucsc-raid-sas-2008m-8i-b1]
+display = "Cisco UCSC RAID SAS 2008M-8i (rev B1)"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x1137
+subsys_pid = 0x00b1
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+# ============================================================================
+# Intel — SAS2008
+# ============================================================================
+
+[card.intel-rs2wc080]
+display = "Intel RS2WC080"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x8086
+subsys_pid = 0x9240
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+form_factor = "PCIe half-height, 2× SFF-8087 internal"
+confirmed_via = "h-node.org community lspci capture (h-node.org/raidadapters/view/en/1109/) + canonical pci.ids + Intel product docs"
+
+[card.intel-rms2ll040]
+display = "Intel RMS2LL040 RAID Controller"
+vid = 0x1000
+did = 0x0072
+subsys_vid = 0x8086
+subsys_pid = 0x350f
+chip_family = "SAS2008"
+default_personality = "IT"
+sas_oui = 0x500605b0
+interface_byte = 0x00
+compatible_firmware = []
+quirks = []
+confirmed_via = "canonical pci.ids"
+
+[card.intel-rms2af040]
+display = "Intel RMS2AF040 RAID Controller"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x8086
+subsys_pid = 0x350d
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+# ============================================================================
+# Supermicro — SAS2008, IMR personality
+# ============================================================================
+
+[card.supermicro-smc2008-imr]
+display = "Supermicro SMC2008-iMR"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x15d9
+subsys_pid = 0x0400
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+confirmed_via = "canonical pci.ids"
+notes = "Onboard SMC2008 chip in some Supermicro server boards (X9DRi-LN4F+ etc.)."
+
+# ============================================================================
+# Lenovo — SAS2008, IMR personality
+# ============================================================================
+
+[card.lenovo-thinkserver-raid-510i]
+display = "Lenovo ThinkServer RAID 510i"
+vid = 0x1000
+did = 0x0073
+subsys_vid = 0x17aa
+subsys_pid = 0x1051
+chip_family = "SAS2008"
+default_personality = "IMR"
+sas_oui = 0x500605b0
+interface_byte = 0x10
+compatible_firmware = []
+quirks = ["imr-composite"]
+confirmed_via = "canonical pci.ids"
+
+# ============================================================================
+# End of strict-tier identities — 25 entries
+# ============================================================================
