@@ -236,8 +236,8 @@ interface_byte = 0x0c
 compatible_firmware = []
 quirks = ["dell-tamper-check", "imr-composite", "dell-h310-mini-mono-idrac-lock"]
 form_factor = "iDRAC-shared storage slot (R320, R420, etc.)"
-confirmed_via = "firmware repo sas2008-dell-h310-stock.sbr (bytes 0x14-0x17 = 28 10 51 1f) + canonical pci.ids"
-notes = "iDRAC validation gate post-flash on some servers. The 'stock' SBR in our firmware repo is from a Mini Mono card."
+confirmed_via = "firmware repo sas2008-dell-h310-mini-mono.sbr (bytes 0x14-0x17 = 28 10 51 1f) + canonical pci.ids"
+notes = "iDRAC validation gate post-flash on some servers. Renamed 2026-05-18 from sas2008-dell-h310-stock.sbr — the 'stock' label was misleading because the SBR actually encodes a PERC H310 Mini Monolithics card identity (1028:1F51), not a generic H310 stock."
 
 [card.dell-h310-embedded1]
 display = "Dell PERC H310 Embedded1"
@@ -302,8 +302,8 @@ compatible_firmware = [
 ]
 quirks = ["imr-composite"]
 form_factor = "PCIe half-height, 2× SFF-8087 internal"
-confirmed_via = "firmware repo sas2008-ibm-m1015.ir (256-byte SBR misnamed as .ir; bytes 0x14-0x17 = 14 10 b1 03) + IBM driver INF (DriverMax 245276) + canonical pci.ids"
-notes = "Most popular cross-flash target in the community. No Dell-style tamper check. megarec -cleanflash 0 typically succeeds without HCB hostboot."
+confirmed_via = "firmware repo sas2008-ibm-m1015-imr.sbr (formerly sas2008-intel-imr.sbr, mis-attributed; bytes 0x14-0x17 = 14 10 b1 03) and sas2008-ibm-m1015-imr-variant-b.sbr (formerly sas2008-ibm-m1015.ir with misleading .ir extension; same SubsysVID:PID, different HwConfig byte) + IBM driver INF (DriverMax 245276) + canonical pci.ids"
+notes = "Most popular cross-flash target in the community. No Dell-style tamper check. megarec -cleanflash 0 typically succeeds without HCB hostboot. Two SBR variants in firmware repo differ only at HwConfig byte 0x12 (0x07 vs 0x04)."
 
 [card.ibm-m1115]
 display = "IBM ServeRAID M1115"
