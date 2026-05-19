@@ -4,6 +4,7 @@
 //! See `lsi-flash-notes/01-architecture/adr/007-cli-surface.md` and
 //! `lsi-flash-notes/01-architecture/adr/014-sbr-verb-and-card-database.md`.
 
+pub mod detect;
 pub mod sbr;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -104,6 +105,12 @@ pub enum Command {
         #[command(subcommand)]
         sub: sbr::SbrCommand,
     },
+
+    /// Manipulator-grade firmware operations (offline; doesn't touch hardware).
+    Firmware {
+        #[command(subcommand)]
+        sub: FirmwareCommand,
+    },
 }
 
 /// Firmware-mode targets for `flash`. Per ADR-007:
@@ -119,6 +126,25 @@ pub enum Mode {
     /// RAID mode (LSI IR firmware — RAID 0/1/1E/10 in firmware). Alias: IR.
     #[value(alias = "IR", alias = "ir", alias = "raid")]
     RAID,
+}
+
+/// Manipulator-grade firmware synthesis subcommands. Cites
+/// `lsi-flash-notes/03-firmware-formats/mpt-firmware-format.md` §N (PHY-to-slot map).
+#[derive(Subcommand, Debug)]
+pub enum FirmwareCommand {
+    /// Synthesize a PHY-reversed firmware blob (Port 0↔7 / 1↔6 / 2↔5 / 3↔4).
+    ///
+    /// Closes the gap left by the absent `phase15_reversed.zip` from
+    /// Broadcom's public archive — any standard MPT firmware can be
+    /// permuted into a PHY-reversed variant.
+    ReversePhy {
+        /// Input firmware path (e.g. `2118it.bin` or `H200A.FW`).
+        #[arg(long = "in", value_name = "PATH")]
+        input: String,
+        /// Output path for the synthesized firmware.
+        #[arg(long = "out", value_name = "PATH")]
+        output: String,
+    },
 }
 
 /// Entry point invoked from `main.rs`. All subcommands stub out for now —
@@ -171,6 +197,18 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             Ok(())
         }
         Command::Sbr { sub } => sbr::run(sub),
+        Command::Firmware { sub } => match sub {
+            FirmwareCommand::ReversePhy { input, output } => {
+                let data = std::fs::read(&input)?;
+                let out = crate::firmware::synthesize::synthesize_reverse_phy(&data)?;
+                std::fs::write(&output, &out)?;
+                eprintln!(
+                    "synthesized {} bytes → {} (PhyData permuted, file checksum recomputed)",
+                    out.len(), output
+                );
+                Ok(())
+            }
+        },
     }
 }
 
@@ -253,5 +291,26 @@ mod tests {
     fn json_flag_global() {
         let cli = Cli::try_parse_from(["lsi-flash", "--json", "detect"]).unwrap();
         assert!(cli.json);
+    }
+
+    #[test]
+    fn firmware_reverse_phy_parses() {
+        let cli = Cli::try_parse_from([
+            "lsi-flash",
+            "firmware",
+            "reverse-phy",
+            "--in",
+            "/tmp/a",
+            "--out",
+            "/tmp/b",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Firmware { sub: FirmwareCommand::ReversePhy { input, output } } => {
+                assert_eq!(input, "/tmp/a");
+                assert_eq!(output, "/tmp/b");
+            }
+            _ => panic!("expected Firmware::ReversePhy"),
+        }
     }
 }

@@ -10,6 +10,9 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("firmware synthesis error: {0}")]
+    Synth(#[from] crate::firmware::synthesize::SynthError),
+
     #[error("Unexpected error: {0}")]
     Other(String),
 }
