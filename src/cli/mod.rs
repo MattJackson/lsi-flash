@@ -151,10 +151,7 @@ pub enum FirmwareCommand {
 /// real implementations land in Stages 2/3.
 pub fn run(cli: Cli) -> Result<(), crate::Error> {
     match cli.command {
-        Command::Detect => {
-            eprintln!("lsi-flash detect — not yet implemented (Stage 2)");
-            Ok(())
-        }
+        Command::Detect => detect::run(cli.json),
         Command::Backup { out } => {
             eprintln!(
                 "lsi-flash backup --out {:?} — not yet implemented (Stage 2)",
