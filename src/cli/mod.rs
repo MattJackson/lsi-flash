@@ -204,7 +204,8 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                 std::fs::write(&output, &out)?;
                 eprintln!(
                     "synthesized {} bytes → {} (PhyData permuted, file checksum recomputed)",
-                    out.len(), output
+                    out.len(),
+                    output
                 );
                 Ok(())
             }
@@ -231,21 +232,30 @@ mod tests {
     #[test]
     fn flash_hba_parses() {
         let cli = Cli::try_parse_from(["lsi-flash", "flash", "HBA"]).unwrap();
-        assert!(matches!(cli.command, Command::Flash { mode: Mode::HBA, .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Flash {
+                mode: Mode::HBA,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn flash_it_alias_parses() {
         let cli = Cli::try_parse_from(["lsi-flash", "flash", "IT"]).unwrap();
-        assert!(matches!(cli.command, Command::Flash { mode: Mode::HBA, .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Flash {
+                mode: Mode::HBA,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn flash_raid_with_identity_parses() {
-        let cli = Cli::try_parse_from([
-            "lsi-flash", "flash", "RAID", "--as", "dell-h200",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["lsi-flash", "flash", "RAID", "--as", "dell-h200"]).unwrap();
         match cli.command {
             Command::Flash { mode, identity, .. } => {
                 assert!(matches!(mode, Mode::RAID));
@@ -306,7 +316,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Firmware { sub: FirmwareCommand::ReversePhy { input, output } } => {
+            Command::Firmware {
+                sub: FirmwareCommand::ReversePhy { input, output },
+            } => {
                 assert_eq!(input, "/tmp/a");
                 assert_eq!(output, "/tmp/b");
             }

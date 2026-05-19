@@ -1,6 +1,7 @@
 mod card_database;
 mod cli;
 mod error;
+pub mod pci;
 
 pub mod firmware;
 pub mod hcb;
