@@ -5,6 +5,8 @@ use std::io;
 
 /// MFG block length in bytes (76 bytes including checksum). Cites sbrtool.py:40.
 pub const MFG_BLOCK_LEN: usize = 0x4c;
+pub const MFG_OFFSET_PRIMARY: usize = 0x00;
+pub const MFG_OFFSET_BACKUP: usize = MFG_BLOCK_LEN; // 0x4c
 
 /// Total SBR size. Cites sbrtool.py:92.
 pub const SBR_SIZE: usize = 256;
