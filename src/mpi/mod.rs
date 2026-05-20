@@ -4,5 +4,8 @@
 pub mod diag;
 pub mod doorbell;
 pub mod messages;
+pub mod mock_ioc;
+pub mod session;
+
 pub use doorbell::*;
 pub use messages::*;

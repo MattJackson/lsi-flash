@@ -3,8 +3,62 @@
 //! Cites: 04-mpi-protocol/*.md wire-format documentation (Tier-2 source-of-truth).
 //! Implements typed Request/Reply for the 5 MPI messages needed by lsi-flash CLI.
 
-use bitflags::bitflags;
 use thiserror::Error;
+
+/// Toolbox clean flags - bitfield representing components to wipe.
+/// Cites: toolbox-and-config.md §5.2 (mpi2_tool.h:93-103)
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ToolboxCleanFlags(u32);
+
+impl ToolboxCleanFlags {
+    /// Wipe NVSRAM — bit 0
+    pub const NVRAM: Self = Self(0x00000001);
+
+    /// Wipe serial EEPROM — bit 1
+    pub const SEEPROM: Self = Self(0x00000002);
+
+    /// Wipe flash array (non-volatile) — bit 2
+    pub const FLASH: Self = Self(0x00000004);
+
+    /// Wipe initialization data — bit 24
+    pub const INITIALIZATION: Self = Self(0x01000000);
+
+    /// Wipe MegaRAID metadata — bit 25
+    pub const MEGARAID: Self = Self(0x02000000);
+
+    /// Wipe backup firmware image — bit 27
+    pub const FW_BACKUP: Self = Self(0x08000000);
+
+    /// Wipe current running firmware — bit 28
+    pub const FW_CURRENT: Self = Self(0x10000000);
+
+    /// Wipe other persistent pages — bit 29
+    pub const OTHER_PERSIST_PAGES: Self = Self(0x20000000);
+
+    /// Wipe persistent manufacturing pages — bit 30
+    pub const PERSIST_MANUFACT_PAGES: Self = Self(0x40000000);
+
+    /// Wipe boot services area — bit 31
+    pub const BOOT_SERVICES: Self = Self(0x80000000);
+
+    /// Convenience flag: wipe everything (all bits set)
+    pub const ALL: Self = Self(0xFFFFFFFF);
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(&self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+impl std::ops::BitOr for ToolboxCleanFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
 
 // ============================================================================
 // Function Codes — mpi-overview.md §1, fw-download-upload.md §3.1/§4.1
@@ -59,7 +113,7 @@ impl MpiFunction {
 ///
 /// Cites: fw-download-upload.md §3.2 (mpi2_ioc.h:1154-1162)
 #[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ImageType {
     Reserved = 0,
     Fw = 1,         // MPI2_FW_DOWNLOAD_ITYPE_FW
@@ -324,51 +378,6 @@ impl IocStatus {
 // ============================================================================
 // ToolboxCleanFlags — toolbox-and-config.md §5.2 (mpi2_tool.h:93-103)
 // ============================================================================
-
-/// Bitflags for TOOLBOX_CLEAN operation flags field.
-///
-/// Cites: toolbox-and-config.md §5.2 (mpi2_tool.h:93-103)
-bitflags! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    pub struct ToolboxCleanFlags: u32 {
-        /// Wipe NVSRAM — bit 0
-        const NVRAM = 0x00000001;
-
-        /// Wipe serial EEPROM — bit 1
-        const SEEPROM = 0x00000002;
-
-        /// Wipe flash array (non-volatile) — bit 2
-        const FLASH = 0x00000004;
-
-        /// Wipe initialization data — bit 24 (toolbox-and-config.md §5.2)
-        const INITIALIZATION = 0x01000000;
-
-        /// Wipe MegaRAID metadata — bit 25
-        const MEGARAID = 0x02000000;
-
-        /// Wipe backup firmware image — bit 27
-        const FW_BACKUP = 0x08000000;
-
-        /// Wipe current running firmware — bit 28
-        const FW_CURRENT = 0x10000000;
-
-        /// Wipe other persistent pages — bit 29
-        const OTHER_PERSIST_PAGES = 0x20000000;
-
-        /// Wipe persistent manufacturing pages — bit 30 (toolbox-and-config.md §5.1 open question)
-        const PERSIST_MANUFACT_PAGES = 0x40000000;
-
-        /// Wipe boot services area — bit 31
-        const BOOT_SERVICES = 0x80000000;
-
-        /// Convenience flag: wipe everything (all bits set)
-        const ALL = Self::NVRAM.bits() | Self::SEEPROM.bits() | Self::FLASH.bits()
-                  | Self::INITIALIZATION.bits() | Self::MEGARAID.bits()
-                  | Self::FW_BACKUP.bits() | Self::FW_CURRENT.bits()
-                  | Self::OTHER_PERSIST_PAGES.bits() | Self::PERSIST_MANUFACT_PAGES.bits()
-                  | Self::BOOT_SERVICES.bits();
-    }
-}
 
 // ============================================================================
 // IEEE SGE (Scatter/Gather Element) — sgl-and-replies.md §7.1, §7.3
@@ -1103,6 +1112,18 @@ pub enum MpiError {
     /// Unknown ImageType code.
     #[error("unknown ImageType code 0x{0:02X}")]
     UnknownImageType(u8),
+
+    /// ADR-015 Rule 1: running firmware personality does not match target.
+    /// Compile-time prevention of cross-personality writes (the dev-1 brick scenario).
+    #[error("personality mismatch: running={running:?}, target={target:?} — ADR-015 Rule 1")]
+    PersonalityMismatch {
+        running: crate::mpi::session::Personality,
+        target: crate::mpi::session::Personality,
+    },
+
+    /// ADR-015 Rule 4/6: verify-after-write detected byte mismatch.
+    #[error("verify-after-write mismatch at offset {offset}")]
+    VerifyMismatch { offset: usize },
 }
 
 // ============================================================================
