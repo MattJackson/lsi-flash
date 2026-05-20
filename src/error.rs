@@ -17,6 +17,15 @@ pub enum Error {
     #[error("firmware synthesis error: {0}")]
     Synth(#[from] crate::firmware::synthesize::SynthError),
 
+    #[error("backup error: {0}")]
+    Backup(#[from] crate::cli::backup::BackupError),
+
+    #[error("serde_json: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+
+    #[error("toml ser: {0}")]
+    TomlSer(#[from] toml::ser::Error),
+
     #[error("Unexpected error: {0}")]
     Other(String),
 }

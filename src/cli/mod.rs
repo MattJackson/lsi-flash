@@ -4,6 +4,7 @@
 //! See `lsi-flash-notes/01-architecture/adr/007-cli-surface.md` and
 //! `lsi-flash-notes/01-architecture/adr/014-sbr-verb-and-card-database.md`.
 
+pub mod backup;
 pub mod detect;
 pub mod sbr;
 
@@ -152,13 +153,7 @@ pub enum FirmwareCommand {
 pub fn run(cli: Cli) -> Result<(), crate::Error> {
     match cli.command {
         Command::Detect => detect::run(cli.json),
-        Command::Backup { out } => {
-            eprintln!(
-                "lsi-flash backup --out {:?} — not yet implemented (Stage 2)",
-                out
-            );
-            Ok(())
-        }
+        Command::Backup { out } => backup::run(out, cli.json),
         Command::Flash {
             mode,
             identity,
