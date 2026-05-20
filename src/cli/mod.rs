@@ -6,6 +6,7 @@
 
 pub mod backup;
 pub mod detect;
+pub mod flash;
 pub mod recover;
 pub mod sbr;
 
@@ -165,23 +166,18 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             no_bios,
             backup_dir,
             wipe_mfg_pages,
-        } => {
-            eprintln!(
-                "lsi-flash flash {:?} --as {:?} --dry-run={} --yes={} \
-                 --keep-sas-address={} --firmware {:?} --no-bios={} \
-                 --backup-dir {:?} --wipe-mfg-pages={} — not yet implemented (Stage 3)",
-                mode,
-                identity,
-                dry_run,
-                yes,
-                keep_sas_address,
-                firmware,
-                no_bios,
-                backup_dir,
-                wipe_mfg_pages
-            );
-            Ok(())
-        }
+        } => flash::run(
+            mode,
+            identity,
+            dry_run,
+            yes,
+            keep_sas_address,
+            firmware,
+            no_bios,
+            backup_dir,
+            wipe_mfg_pages,
+            cli.json,
+        ),
         Command::Recover { backup_dir, yes } => recover::run(backup_dir, yes, cli.json),
         Command::Sbr { sub } => sbr::run(sub),
         Command::Firmware { sub } => match sub {

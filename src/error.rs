@@ -23,6 +23,9 @@ pub enum Error {
     #[error("recover error: {0}")]
     Recover(#[from] crate::cli::recover::RecoverError),
 
+    #[error("flash error: {0}")]
+    Flash(#[from] crate::cli::flash::FlashError),
+
     #[error("serde_json: {0}")]
     SerdeJson(#[from] serde_json::Error),
 
