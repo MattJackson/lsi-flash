@@ -20,6 +20,9 @@ pub enum Error {
     #[error("backup error: {0}")]
     Backup(#[from] crate::cli::backup::BackupError),
 
+    #[error("recover error: {0}")]
+    Recover(#[from] crate::cli::recover::RecoverError),
+
     #[error("serde_json: {0}")]
     SerdeJson(#[from] serde_json::Error),
 

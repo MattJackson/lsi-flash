@@ -6,6 +6,7 @@
 
 pub mod backup;
 pub mod detect;
+pub mod recover;
 pub mod sbr;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -181,13 +182,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             );
             Ok(())
         }
-        Command::Recover { backup_dir, yes } => {
-            eprintln!(
-                "lsi-flash recover --backup-dir {} --yes={} — not yet implemented (Stage 3)",
-                backup_dir, yes
-            );
-            Ok(())
-        }
+        Command::Recover { backup_dir, yes } => recover::run(backup_dir, yes, cli.json),
         Command::Sbr { sub } => sbr::run(sub),
         Command::Firmware { sub } => match sub {
             FirmwareCommand::ReversePhy { input, output } => {
