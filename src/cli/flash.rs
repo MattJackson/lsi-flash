@@ -368,9 +368,37 @@ impl<B: IocBackend> Orchestrator<B> {
         }
     }
 
-    /// Safety guards check (mounts, volume groups, etc.). STUB for skeleton cycle.
+    /// Safety guards check (mounts, volume groups, etc.). Per ADR-007 D-5.
     fn check_safety_guards(&self) -> Result<(), FlashError> {
-        // STUB: separate freshman cycle implements findmnt/vgdisplay/mdadm/zpool checks
+        use crate::cli::safety::{check_all, devices_attached_to_card};
+
+        // BDF is currently a stub; in v1.0 we detect it via PCI sysfs walk
+        // TODO: thread real BDF through orchestrator from detect verb
+        let bdf = "03:00.0";
+
+        let devices =
+            devices_attached_to_card(bdf).map_err(|e| FlashError::SafetyGuard(e.to_string()))?;
+
+        if self.dry_run {
+            eprintln!(
+                "[dry-run] would check {} downstream devices for safety concerns",
+                devices.len()
+            );
+            return Ok(());
+        }
+
+        let concerns = check_all(&devices).map_err(|e| FlashError::SafetyGuard(e.to_string()))?;
+
+        if !concerns.is_empty() {
+            // Format all concerns as a single user-facing message with educational guidance
+            let msg = concerns
+                .iter()
+                .map(|c| c.human())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            return Err(FlashError::SafetyGuard(msg));
+        }
+
         Ok(())
     }
 

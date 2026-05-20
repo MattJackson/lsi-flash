@@ -8,6 +8,7 @@ pub mod backup;
 pub mod detect;
 pub mod flash;
 pub mod recover;
+pub mod safety;
 pub mod sbr;
 
 use clap::{Parser, Subcommand, ValueEnum};
