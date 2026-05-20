@@ -231,7 +231,7 @@ pub enum ChipFamily {
 }
 
 /// Card-specific quirks that affect flashing procedure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Quirk {
     TamperCheckRequired,      // Dell/IBM require megarec or hostboot path
     FujitsuSbrVariantA11,     // D2607 A11 variant (standard SBR)
