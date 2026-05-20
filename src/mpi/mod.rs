@@ -3,4 +3,6 @@
 
 pub mod diag;
 pub mod doorbell;
+pub mod messages;
 pub use doorbell::*;
+pub use messages::*;

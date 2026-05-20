@@ -7,6 +7,10 @@ pub enum Error {
     #[error("MPI DIAG error: {0}")]
     MpiDiag(#[from] crate::mpi::diag::MpiError),
 
+    /// MPI message serialization/deserialization error.
+    #[error("MPI message error: {0}")]
+    MpiMessage(#[from] crate::mpi::messages::MpiError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
