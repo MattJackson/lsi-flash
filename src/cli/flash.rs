@@ -79,8 +79,9 @@ impl std::fmt::Display for AbortReason {
 }
 
 /// All states the orchestrator can be in. Per Stage 3 scoping doc §2.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Phase {
+    #[default]
     Detect,
     Halt {
         current_personality: Personality,
@@ -110,12 +111,6 @@ pub enum Phase {
         reason: AbortReason,
         backup_dir: Option<PathBuf>,
     },
-}
-
-impl Default for Phase {
-    fn default() -> Self {
-        Self::Detect
-    }
 }
 
 /// The orchestrator driver. Generic over any IocBackend implementation.
@@ -280,11 +275,31 @@ impl<B: IocBackend> Orchestrator<B> {
 
     /// Step 5: Erase flash partitions with TOOLBOX_CLEAN.
     fn step_erase(&mut self) -> Result<Phase, FlashError> {
-        // STUB: send TOOLBOX_CLEAN via Session
         if self.dry_run {
             eprintln!("[dry-run] would erase flash (TOOLBOX_CLEAN)");
         } else {
-            // TODO: session.raw_toolbox_clean() with appropriate flags
+            // Initialize IOC first (required before Toolbox operations per mpi-overview.md §9)
+            let init_req = crate::mpi::messages::IocInitRequest {
+                who_init: 0x04,
+                host_msix_vectors: 0,
+                reply_descriptor_post_queue_depth: 16,
+                system_request_frame_base_address: 0,
+                reply_descriptor_post_queue_address: 0,
+            };
+            self.session.raw_ioc_init(&init_req)?;
+
+            // Erase firmware + BIOS partitions per toolbox-and-config.md §5.2
+            let req = crate::mpi::messages::ToolboxCleanRequest {
+                flags: crate::mpi::messages::ToolboxCleanFlags::FW_CURRENT
+                    | crate::mpi::messages::ToolboxCleanFlags::FLASH,
+            };
+            let reply = self.session.raw_toolbox_clean(&req)?;
+            if reply.ioc_status.is_flash_hard_stop() {
+                return Ok(Phase::Aborted {
+                    reason: AbortReason::IocStatusError(reply.ioc_status),
+                    backup_dir: None,
+                });
+            }
         }
         eprintln!("erase complete");
 
@@ -295,28 +310,44 @@ impl<B: IocBackend> Orchestrator<B> {
 
     /// Step 6: Download main firmware with verify-after-write (Rule 4).
     fn step_download_fw(&mut self, _image: Vec<u8>) -> Result<Phase, FlashError> {
-        // STUB: use session.fw_download_verified per Rule 4
+        let target = mode_to_personality(self.mode);
         if self.dry_run {
-            eprintln!("[dry-run] would download firmware (verify-after-write)");
+            eprintln!(
+                "[dry-run] would download {} bytes of firmware (verify-after-write)",
+                _image.len()
+            );
         } else {
-            // TODO: load actual image bytes, call session.fw_download_verified(ImageType::Fw)
+            // Session::fw_download_verified handles Rule 1 (personality match) + Rule 4 (verify after write)
+            // STUB: firmware source resolution is Stage 4 work — using empty vec for now
+            self.session.fw_download_verified(
+                crate::mpi::messages::ImageType::Fw,
+                target,
+                &_image,
+            )?;
         }
         eprintln!("firmware download complete");
 
-        let image = vec![]; // STUB: BIOS image would come from manifest
-        Ok(Phase::DownloadBios { image })
+        let bios = vec![]; // STUB: BIOS image would come from manifest
+        Ok(Phase::DownloadBios { image: bios })
     }
 
     /// Step 7: Download BIOS option-ROM.
     fn step_download_bios(&mut self, _image: Vec<u8>) -> Result<Phase, FlashError> {
+        let target = mode_to_personality(self.mode);
         if self.dry_run {
-            eprintln!("[dry-run] would download BIOS option-ROM");
+            eprintln!("[dry-run] would download {} bytes of BIOS", _image.len());
         } else {
-            // TODO: session.fw_download_verified(ImageType::Bios)
+            // Session::fw_download_verified handles Rule 1 + Rule 4
+            // STUB: firmware source resolution is Stage 4 work
+            self.session.fw_download_verified(
+                crate::mpi::messages::ImageType::Bios,
+                target,
+                &_image,
+            )?;
         }
         eprintln!("BIOS download complete");
 
-        let sbr = vec![]; // STUB: synthesized SBR bytes
+        let sbr = vec![]; // STUB: SBR needs hardware I²C integration
         Ok(Phase::WriteSbr { sbr })
     }
 
@@ -337,7 +368,15 @@ impl<B: IocBackend> Orchestrator<B> {
         if self.dry_run {
             eprintln!("[dry-run] would reset adapter (IOC_INIT)");
         } else {
-            // TODO: session.raw_ioc_init() to restart ARM core
+            // Initialize IOC to restart ARM core per mpi-overview.md §9
+            let init_req = crate::mpi::messages::IocInitRequest {
+                who_init: 0x04,
+                host_msix_vectors: 0,
+                reply_descriptor_post_queue_depth: 16,
+                system_request_frame_base_address: 0,
+                reply_descriptor_post_queue_address: 0,
+            };
+            let _reply = self.session.raw_ioc_init(&init_req)?;
         }
         eprintln!("adapter reset complete");
 
@@ -509,5 +548,144 @@ mod tests {
         };
         let phase2 = phase1.clone();
         assert_eq!(phase1, phase2);
+    }
+
+    #[test]
+    fn orchestrator_dry_run_completes_successfully() {
+        use crate::mpi::mock_ioc::MockIoc;
+        use crate::mpi::session::Session;
+
+        let mock_ioc = MockIoc::new(Personality::It);
+        let session = Session::new(mock_ioc);
+
+        // Dry-run mode: no HW access, auto-confirm with yes=true
+        let orchestrator = Orchestrator::new(
+            session,
+            Mode::HBA,
+            None,
+            true, // dry_run = true
+            true, // yes = true (auto-confirm)
+            false,
+        );
+
+        let result = orchestrator.run();
+
+        assert!(
+            result.is_ok(),
+            "Dry-run orchestrator should complete successfully"
+        );
+    }
+
+    #[test]
+    fn abort_reason_iocstatus_error_formats_correctly() {
+        // Test that AbortReason::IocStatusError variant exists and formats correctly
+        let reason = AbortReason::IocStatusError(IocStatus::InternalError);
+        assert_eq!(format!("{}", reason), "IOC status error: InternalError");
+
+        let reason2 = AbortReason::IocStatusError(IocStatus::Busy);
+        assert_eq!(format!("{}", reason2), "IOC status error: Busy");
+    }
+
+    #[test]
+    fn fw_download_verified_enforces_personality_match() {
+        use crate::mpi::mock_ioc::MockIoc;
+        use crate::mpi::session::{PersonalityMatched, Session};
+
+        let mut mock = MockIoc::new(Personality::It);
+        let mut session = Session::new(mock);
+
+        // Initialize first (required for download to succeed)
+        let init_req = crate::mpi::messages::IocInitRequest {
+            who_init: 0x04,
+            host_msix_vectors: 0,
+            reply_descriptor_post_queue_depth: 16,
+            system_request_frame_base_address: 0,
+            reply_descriptor_post_queue_address: 0,
+        };
+        let _ = session.raw_ioc_init(&init_req);
+
+        // Try to write IR personality while IT is running — should fail Rule 1
+        let result = session.fw_download_verified(
+            crate::mpi::messages::ImageType::Fw,
+            Personality::Ir,
+            &[0u8; 100],
+        );
+
+        assert!(matches!(result, Err(MpiError::PersonalityMismatch { .. })));
+
+        if let Err(MpiError::PersonalityMismatch { running, target }) = result {
+            assert_eq!(running, Personality::It);
+            assert_eq!(target, Personality::Ir);
+        }
+    }
+
+    #[test]
+    fn toolbox_clean_flags_combine_correctly() {
+        use crate::mpi::messages::{ImageType, ToolboxCleanFlags};
+
+        // Test flag combination for erase operation (FW + FLASH)
+        let flags = ToolboxCleanFlags::FW_CURRENT | ToolboxCleanFlags::FLASH;
+
+        assert!(flags.contains(ToolboxCleanFlags::FW_CURRENT));
+        assert!(flags.contains(ToolboxCleanFlags::FLASH));
+        assert!(!flags.contains(ToolboxCleanFlags::NVRAM));
+
+        // Test that ALL flags contain individual flags
+        let all = ToolboxCleanFlags::ALL;
+        assert!(all.contains(ToolboxCleanFlags::FW_CURRENT));
+        assert!(all.contains(ToolboxCleanFlags::FLASH));
+        assert!(all.contains(ToolboxCleanFlags::NVRAM));
+    }
+
+    #[test]
+    fn session_raw_toolbox_clean_exists_and_calls_backend() {
+        use crate::mpi::messages::ToolboxCleanFlags;
+        use crate::mpi::mock_ioc::MockIoc;
+        use crate::mpi::session::Session;
+
+        let mock = MockIoc::new(Personality::It);
+        let mut session = Session::new(mock);
+
+        // Initialize first
+        let init_req = crate::mpi::messages::IocInitRequest {
+            who_init: 0x04,
+            host_msix_vectors: 0,
+            reply_descriptor_post_queue_depth: 16,
+            system_request_frame_base_address: 0,
+            reply_descriptor_post_queue_address: 0,
+        };
+        let _ = session.raw_ioc_init(&init_req);
+
+        // Test raw_toolbox_clean exists and works
+        let req = crate::mpi::messages::ToolboxCleanRequest {
+            flags: ToolboxCleanFlags::FW_CURRENT | ToolboxCleanFlags::FLASH,
+        };
+
+        let reply = session.raw_toolbox_clean(&req).unwrap();
+        assert_eq!(reply.ioc_status, IocStatus::Success);
+    }
+
+    #[test]
+    fn orchestrator_personality_mismatch_caught_via_verified_helper() {
+        use crate::mpi::session::{PersonalityMatched, Session};
+
+        // Test that PersonalityMatched::verify_match enforces Rule 1
+        let result = PersonalityMatched::verify_match(Personality::It, Personality::Ir);
+
+        assert!(result.is_err(), "Personality mismatch should be rejected");
+
+        if let Err(MpiError::PersonalityMismatch { running, target }) = result {
+            assert_eq!(running, Personality::It);
+            assert_eq!(target, Personality::Ir);
+        } else {
+            panic!("Expected MpiError::PersonalityMismatch");
+        }
+
+        // Test that matching personalities are allowed
+        let result_ok = PersonalityMatched::verify_match(Personality::It, Personality::It);
+        assert!(
+            result_ok.is_ok(),
+            "Matching personalities should be allowed"
+        );
     }
 }
