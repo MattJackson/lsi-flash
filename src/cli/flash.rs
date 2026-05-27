@@ -248,9 +248,7 @@ impl<B: IocBackend> Orchestrator<B> {
             }
         }
         eprintln!("backup complete");
-        Ok(Phase::Hostboot {
-            target_personality: mode_to_personality(self.mode),
-        })
+        Ok(Phase::Erase)
     }
 
     /// Step 4: Hostboot — load matching firmware into chip RAM if personality mismatch.
