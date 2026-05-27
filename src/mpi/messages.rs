@@ -1124,6 +1124,16 @@ pub enum MpiError {
     /// ADR-015 Rule 4/6: verify-after-write detected byte mismatch.
     #[error("verify-after-write mismatch at offset {offset}")]
     VerifyMismatch { offset: usize },
+
+    /// Hardware path not yet implemented. Used by RealIoc destructive ops
+    /// until CH341A SPI clip + cold-spare card are on hand (see
+    /// memory/lsiutil_fragility_and_brick.md for why these stay gated).
+    #[error("{op} not implemented yet (brick-gated; see lsiutil_fragility_and_brick.md)")]
+    NotImplementedYet { op: &'static str },
+
+    /// I/O error during hardware access (BAR1 mmap, sysfs read, etc.).
+    #[error("hardware I/O error: {0}")]
+    Io(String),
 }
 
 // ============================================================================

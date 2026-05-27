@@ -4,6 +4,7 @@
 pub mod diag;
 pub mod doorbell;
 pub mod messages;
+pub mod mmap_region;
 pub mod mock_ioc;
 pub mod real_ioc;
 pub mod session;
