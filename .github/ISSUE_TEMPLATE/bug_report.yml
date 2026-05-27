@@ -1,0 +1,85 @@
+name: Bug report
+description: Something went wrong while running lsi-flash
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. If the bug **bricked or might have bricked a card**,
+        please mark it P0 in the title and include as much detail as you can —
+        those reports get top priority.
+
+        If this is a security vulnerability (e.g. a code path that could brick a
+        card without user confirmation), please report it privately first via
+        [GitHub Security Advisories](https://github.com/MattJackson/lsi-flash/security/advisories/new)
+        instead of filing a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: lsi-flash version
+      description: Output of `lsi-flash --version`, or the commit SHA if built from source.
+      placeholder: "v0.1.0 or 9f1a5dc"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Linux kernel
+      description: Output of `uname -r`.
+      placeholder: "6.6.32-generic"
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card under test
+      description: PCI ID (vendor:device subsys) and human name if you know it.
+      placeholder: "1000:0072 1028:1f1c — Dell PERC H200 Adapter"
+    validations:
+      required: true
+  - type: textarea
+    id: detect
+    attributes:
+      label: lsi-flash detect output
+      description: Paste the full output of `sudo lsi-flash detect` (sanitize the SAS WWN if you prefer).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: The exact `lsi-flash` invocation.
+      render: bash
+      placeholder: "sudo lsi-flash flash 500605b00abc1234 --to it --firmware sas2008-9211-p20-it"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Error message, panic, stuck process, bricked card, etc.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / dmesg
+      description: Relevant `dmesg` output around the failure, and any `lsi-flash` log output.
+      render: text
+  - type: checkboxes
+    id: card-state
+    attributes:
+      label: Card state after the failure
+      options:
+        - label: Card still enumerates on PCI (`lspci | grep -i sas`)
+        - label: Card is bricked (does not enumerate)
+        - label: Card enumerates but firmware does not boot (subsys = 0xFFFF, etc.)
+        - label: Disks attached to the card are still readable

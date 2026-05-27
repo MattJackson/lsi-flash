@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a new capability for lsi-flash
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature ideas are welcome. Bear in mind the project scope: a Rust CLI for
+        cross-flashing LSI SAS2008-family HBAs safely. Features outside that scope
+        (other chip families, GUI, anything that requires shelling out to
+        Broadcom-proprietary tools) probably won't land.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem you are trying to solve
+      description: What can you not do today that this feature would let you do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Rough sketch of how the CLI surface or behavior would change.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing tools, workarounds, why they are not enough.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This is for an LSI SAS2008-family card (1000:0072 / 1000:0064 / etc.)
+        - label: I have read the README support matrix and confirmed this card is in scope

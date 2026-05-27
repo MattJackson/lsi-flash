@@ -1,0 +1,74 @@
+name: Hardware compatibility report
+description: Report that a SAS2008 card works (or does not work) with lsi-flash
+labels: ["hardware-compat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are the highest-leverage contribution to the project —
+        they fill in the support matrix. Both **positive** ("this card worked") and
+        **negative** ("this card failed with X") reports are valuable. Negative
+        reports are especially valuable.
+  - type: input
+    id: card-name
+    attributes:
+      label: Card name
+      description: Vendor + model as printed on the card.
+      placeholder: "Dell PERC H200 Adapter / LSI 9211-8i / IBM ServeRAID M1015 / ..."
+    validations:
+      required: true
+  - type: input
+    id: pci-id
+    attributes:
+      label: PCI ID
+      description: Output of `lspci -nn -s <bdf>`.
+      placeholder: "01:00.0 SAS [0107]: LSI [1000:0072] (rev 03) Subsystem: Dell [1028:1f1c]"
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target personality
+      options:
+        - IT (initiator/target — JBOD)
+        - IR (integrated RAID)
+        - IMR (integrated MegaRAID)
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Worked perfectly
+        - Worked with caveats (see notes)
+        - Failed during flash
+        - Bricked the card
+        - detect / backup worked but did not attempt flash
+    validations:
+      required: true
+  - type: textarea
+    id: detect
+    attributes:
+      label: lsi-flash detect output
+      description: Paste the full output (sanitize SAS WWN if you prefer).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: firmware-from
+    attributes:
+      label: Source firmware (before flash)
+      description: What was on the card before, if known.
+      placeholder: "Dell ITA A04 IT 07.15.08.00"
+  - type: input
+    id: firmware-to
+    attributes:
+      label: Target firmware
+      description: Which firmware did you flash to?
+      placeholder: "sas2008-9211-p20-it (20.00.07.00)"
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Anything else useful — disk array attached, BIOS quirks, etc.

@@ -1,5 +1,33 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
 Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
 *.swp
 *.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Local-only files
+*.local
+.envrc
+.direnv/
+
+# Logs and dumps from local hardware testing
+*.log
+/dumps/
+/backups/
+
+# Coverage
+*.profraw
+*.profdata
+/coverage/
+
+# Generated docs
+/book/
