@@ -587,9 +587,9 @@ mod tests {
     #[test]
     fn fw_download_verified_enforces_personality_match() {
         use crate::mpi::mock_ioc::MockIoc;
-        use crate::mpi::session::{PersonalityMatched, Session};
+        use crate::mpi::session::Session;
 
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first (required for download to succeed)
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn toolbox_clean_flags_combine_correctly() {
-        use crate::mpi::messages::{ImageType, ToolboxCleanFlags};
+        use crate::mpi::messages::ToolboxCleanFlags;
 
         // Test flag combination for erase operation (FW + FLASH)
         let flags = ToolboxCleanFlags::FW_CURRENT | ToolboxCleanFlags::FLASH;
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn orchestrator_personality_mismatch_caught_via_verified_helper() {
-        use crate::mpi::session::{PersonalityMatched, Session};
+        use crate::mpi::session::PersonalityMatched;
 
         // Test that PersonalityMatched::verify_match enforces Rule 1
         let result = PersonalityMatched::verify_match(Personality::It, Personality::Ir);

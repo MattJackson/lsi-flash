@@ -240,11 +240,11 @@ impl<B: IocBackend> Session<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mpi::mock_ioc::{FailureInjector, MockIoc};
+    use crate::mpi::mock_ioc::MockIoc;
 
     #[test]
     fn session_new_creates_with_smid_1() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let session = Session::new(mock);
 
         // Can't directly check smid_next (private), but we can test behavior
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn fw_download_verified_enforces_personality_match() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first (required for download to succeed)
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn fw_download_verified_personality_match_succeeds() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn raw_methods_passthrough_to_backend() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first

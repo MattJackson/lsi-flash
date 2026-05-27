@@ -184,7 +184,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mpi::messages::{FwDownloadRequest, IocStatus};
+    use crate::mpi::messages::IocStatus;
     use tempfile::TempDir;
 
     fn setup_mock_with_data() -> Session<MockIoc> {
@@ -215,7 +215,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("backup-test");
 
-        let mut session = setup_mock_with_data();
+        let session = setup_mock_with_data();
 
         // Run backup logic inline since run() is not exposed for test
         ensure_dir_empty(&out).unwrap();

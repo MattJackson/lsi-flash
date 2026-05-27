@@ -158,7 +158,7 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::cli::backup::BackupArtifact;
-    use crate::mpi::messages::{FwDownloadRequest, IocStatus};
+    use crate::mpi::messages::IocStatus;
     use tempfile::TempDir;
 
     fn create_test_backup(dir: &std::path::Path) -> BackupManifest {

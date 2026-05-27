@@ -29,12 +29,30 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 - `cli/detect.rs` — `lsi-flash detect` verb
 - `pci.rs` `Platform` trait refactor (Task #22 per ADR-004)
 - Embedded card-database via `include_str!` (ADR-014)
-- Test count: 22 → 173 (Stage 1 → mid-Stage 3)
+- `RealIoc::send_ioc_init` + `send_fw_upload` doorbell-handshake impls (cycle
+  2b-1). Both serialize the MPI request to wire format and post via the
+  DOORBELL register at BAR1+0x00, then parse the reply. `send_fw_upload`
+  also pre-validates `image_size <= payload_buffer.len()` before any BAR1
+  access so it remains testable on non-Linux targets.
+- GitHub Actions CI: rustfmt + clippy + test (stable) + musl static binary,
+  plus issue/PR templates and dependabot
+- Test count: 22 → 174 (Stage 1 → mid-Stage 3)
 
 ### Fixed
 - Flash orchestrator `step_backup` was unconditionally returning
   `Phase::Hostboot`, causing infinite Halt→Backup→Hostboot→Halt loop when
   personalities already matched. Now correctly transitions to `Phase::Erase`.
+
+### Known issues
+- `RealIoc::send_ioc_init` / `send_fw_upload` do not currently wait for the
+  `IOC_DOORBELL_INT` bit in HISTATUS between dword writes / reads. On real
+  silicon this can race the IOC; the write/read loops assume the host can
+  drive the doorbell at memory speed. Will be addressed during dev-1
+  hardware bring-up — both ops are still read-only / safe from a brick
+  standpoint regardless.
+- ~30 pre-existing clippy warnings (dead code reserved for future stages,
+  capitalized acronyms `HBA` / `IMR` / `RAID` that are legitimate domain
+  terms). CI keeps clippy advisory until a dedicated sweep lands.
 
 ### Safety
 - Destructive `RealIoc` ops (`send_fw_download`, `send_toolbox_clean`) return

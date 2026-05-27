@@ -10,18 +10,17 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Note (2026-05-27): rustfmt + clippy + MSRV gates are temporarily
-# advisory (`continue-on-error: true`) while src/mpi/real_ioc.rs is in
-# flight on freshman cycle 2b-1. Restore strictness after that cycle
-# lands and the post-audit cleanup commit runs `cargo fmt && cargo
-# clippy --fix`. MSRV needs revisiting too — clap_lex 1.1.0 requires
-# edition 2024, so 1.74 is no longer realistic.
+# Note (2026-05-27): clippy is still advisory pending a sweep of
+# ~30 pre-existing dead-code / capitalized-acronym warnings inherited
+# from Stage 1+2. Hard-gating clippy without that cleanup would just
+# encourage scattered #[allow] noise. Tracked separately; restore once
+# the sweep commit lands. MSRV is dropped to "stable only" — clap_lex
+# 1.1.0 requires Rust edition 2024, so 1.74 is no longer realistic.
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,7 +43,6 @@ jobs:
   test:
     name: test (${{ matrix.rust }})
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

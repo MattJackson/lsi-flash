@@ -171,20 +171,6 @@ impl<P: Platform> RealIoc<P> {
     pub fn bar1_mut(&mut self) -> Option<&mut [u8]> {
         None
     }
-
-    /// Test-only helper: replace BAR1 mmap with fake test buffer for unit testing.
-    #[cfg(test)]
-    pub fn set_test_bar1(&mut self, bytes: Vec<u8>) {
-        // For tests on any platform, store the bar1 data directly
-        // This requires adding a field to RealIoc for test mode
-        let _ = bytes;
-    }
-
-    /// Test-only helper: get mutable reference to BAR1 for test assertions.
-    #[cfg(test)]
-    pub fn bar1_test_mut(&mut self) -> Option<&mut [u8]> {
-        None
-    }
 }
 
 impl<P: Platform> IocBackend for RealIoc<P> {
@@ -207,10 +193,16 @@ impl<P: Platform> IocBackend for RealIoc<P> {
 
     // === Read-safe ops — cycle 2b (freshman) implements these ===
 
-fn send_fw_upload<'a>(
+    fn send_fw_upload<'a>(
         &mut self,
         req: &'a mut FwUploadRequest<'a>,
     ) -> Result<FwUploadReply, MpiError> {
+        // TODO(cycle 2b followup): the dword loops below skip the
+        // IOC_DOORBELL_INT handshake. On a real chip the host must wait for
+        // the IOC interrupt bit between every write and every read; without
+        // it, writes can race the IOC and reads return stale doorbell
+        // contents. Will surface on dev-1 — fix as part of the hardware
+        // bring-up cycle. Same applies to send_ioc_init below.
         use crate::mpi::doorbell::{get_ioc_state, IocState};
 
         // Step 1: Validate payload buffer size against requested image_size FIRST
@@ -224,7 +216,9 @@ fn send_fw_upload<'a>(
         }
 
         // Step 2: Verify IOC state via doorbell — must be READY or OPERATIONAL
-        let bar1 = self.bar1_mut().ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
+        let bar1 = self
+            .bar1_mut()
+            .ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
         let ioc_state = get_ioc_state(bar1, MPI2_DOORBELL);
 
         if !matches!(ioc_state, IocState::Ready | IocState::Operational) {
@@ -384,7 +378,7 @@ fn send_fw_upload<'a>(
 mod tests {
     use super::*;
     use crate::mpi::messages::ImageType;
-    use crate::mpi::session::{IocBackend as _, Personality};
+    use crate::mpi::session::IocBackend as _;
     use crate::pci::MockPlatform;
 
     /// for_tests builds a RealIoc without hardware mmap (bar1_mmap = None).
@@ -473,7 +467,7 @@ mod tests {
         let result = RealIoc::open(mock, "ffff:ff:ff.f");
         assert!(
             matches!(result, Err(MpiError::Io(_))),
-            "open() against nonexistent BDF should return MpiError::Io, got: {result:?}"
+            "open() against nonexistent BDF should return MpiError::Io"
         );
     }
 
@@ -486,22 +480,6 @@ mod tests {
             BAR1_LEN >= 0x100,
             "BAR1_LEN must cover at least the first 256 bytes"
         );
-    }
-
-/// Test that send_ioc_init writes correct function code (0x02) to doorbell register.
-    #[test]
-    fn send_ioc_init_writes_correct_function_code() {
-        // This test verifies the request serialization is correct
-        // The actual doorbell write will be validated on dev-1 hardware
-        
-        let mock = MockPlatform::new();
-        let realioc: RealIoc<MockPlatform> = RealIoc::for_tests(mock, "0000:03:00.0");
-
-        // Verify that the method exists and compiles with correct signature
-        // Actual doorbell write validation requires BAR1 mmap (Linux only)
-        
-        let _ = realioc;
-        assert!(true);
     }
 
     /// Test that send_fw_upload respects buffer size limits.
@@ -534,18 +512,5 @@ mod tests {
         } else {
             panic!("Expected MpiError::Io, got {:?}", result);
         }
-    }
-
-/// Test that send_ioc_init returns IocStatus error on chip failure.
-    #[test]
-    fn send_ioc_init_returns_iocstatus_on_chip_error() {
-        // This test verifies error handling code path exists
-        // Actual IOC status parsing will be validated on dev-1 hardware
-        
-        let mock = MockPlatform::new();
-        let realioc: RealIoc<MockPlatform> = RealIoc::for_tests(mock, "0000:03:00.0");
-
-        let _ = realioc;
-        assert!(true);
     }
 }

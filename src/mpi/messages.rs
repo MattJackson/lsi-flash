@@ -1405,7 +1405,7 @@ mod tests {
     fn fw_download_request_last_segment_flag() {
         let payload = vec![0xBB];
 
-        let mut req_no_last = FwDownloadRequest {
+        let req_no_last = FwDownloadRequest {
             image_type: ImageType::Bios,
             image_offset: 0,
             image_size: 1,
@@ -1414,7 +1414,7 @@ mod tests {
             payload: &payload,
         };
 
-        let mut req_last = FwDownloadRequest {
+        let req_last = FwDownloadRequest {
             image_type: ImageType::Bios,
             image_offset: 0,
             image_size: 1,

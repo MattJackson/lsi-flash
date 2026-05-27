@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn session_fw_download_verified_enforces_personality_match() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first (required for download to succeed)
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn session_fw_download_verified_with_matching_personality() {
-        let mut mock = MockIoc::new(Personality::It);
+        let mock = MockIoc::new(Personality::It);
         let mut session = Session::new(mock);
 
         // Initialize first
