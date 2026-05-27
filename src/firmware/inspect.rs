@@ -197,7 +197,14 @@ mod tests {
 
     #[test]
     fn test_parse_2118it_bin() {
-        let data = std::fs::read("/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide/2118it.bin").unwrap();
+        // Fixture lives in the sibling lsi-flash-notes repo (not shipped here);
+        // skip cleanly when it isn't present (CI runners, contributors, etc.).
+        let fixture =
+            "/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide/2118it.bin";
+        let Ok(data) = std::fs::read(fixture) else {
+            eprintln!("skipping: fixture {fixture} not present");
+            return;
+        };
         let header = parse_fw_header(&data).unwrap();
 
         assert_eq!(header.signature, MPI2_FW_HEADER_SIGNATURE);
