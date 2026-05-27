@@ -156,7 +156,11 @@ impl CardEntry {
             interface_byte: self.interface_byte,
             factory_firmware: self.factory_firmware,
             compatible_firmware: self.compatible_firmware,
-            quirks: self.quirks.iter().map(|s| Quirk::from(s.as_str())).collect(),
+            quirks: self
+                .quirks
+                .iter()
+                .map(|s| Quirk::from(s.as_str()))
+                .collect(),
             form_factor: self.form_factor,
             confirmed_via: self.confirmed_via,
             notes: self.notes,

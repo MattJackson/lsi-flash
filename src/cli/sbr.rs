@@ -83,7 +83,10 @@ fn print_sbr_summary(file: &std::path::Path, sbr: &Sbr, identity: Option<&CardIn
     println!("SBR file:    {}", file.display());
     println!("Size:        256 bytes");
     println!();
-    println!("PCI VID:DID       0x{:04x}:0x{:04x}", sbr.mfg.pcivid, sbr.mfg.pcipid);
+    println!(
+        "PCI VID:DID       0x{:04x}:0x{:04x}",
+        sbr.mfg.pcivid, sbr.mfg.pcipid
+    );
     println!(
         "Subsystem ID      0x{:04x}:0x{:04x}",
         sbr.mfg.subsys_vid, sbr.mfg.subsys_pid
@@ -127,11 +130,7 @@ fn print_sbr_summary(file: &std::path::Path, sbr: &Sbr, identity: Option<&CardIn
     println!("Checksums:");
     println!(
         "  MFG block       {}",
-        if sbr.checksum_valid {
-            "OK"
-        } else {
-            "INVALID"
-        }
+        if sbr.checksum_valid { "OK" } else { "INVALID" }
     );
     println!(
         "  MFG duplicate   {}",
@@ -202,7 +201,10 @@ fn run_verify(file: &std::path::Path) -> Result<(), crate::Error> {
     }
 
     if failures == 0 {
-        println!("OK: {} passes all structural and checksum checks", file.display());
+        println!(
+            "OK: {} passes all structural and checksum checks",
+            file.display()
+        );
         Ok(())
     } else {
         eprintln!("\n{} check(s) failed", failures);
@@ -265,10 +267,12 @@ mod tests {
 
     #[test]
     fn sbr_show_parses() {
-        let cli = crate::cli::Cli::try_parse_from(["lsi-flash", "sbr", "show", "/tmp/x.sbr"])
-            .unwrap();
+        let cli =
+            crate::cli::Cli::try_parse_from(["lsi-flash", "sbr", "show", "/tmp/x.sbr"]).unwrap();
         match cli.command {
-            crate::cli::Command::Sbr { sub: SbrCommand::Show { file } } => {
+            crate::cli::Command::Sbr {
+                sub: SbrCommand::Show { file },
+            } => {
                 assert_eq!(file, PathBuf::from("/tmp/x.sbr"));
             }
             _ => panic!("expected Sbr::Show"),
@@ -277,26 +281,25 @@ mod tests {
 
     #[test]
     fn sbr_verify_parses() {
-        let cli = crate::cli::Cli::try_parse_from(["lsi-flash", "sbr", "verify", "/tmp/x.sbr"])
-            .unwrap();
+        let cli =
+            crate::cli::Cli::try_parse_from(["lsi-flash", "sbr", "verify", "/tmp/x.sbr"]).unwrap();
         assert!(matches!(
             cli.command,
-            crate::cli::Command::Sbr { sub: SbrCommand::Verify { .. } }
+            crate::cli::Command::Sbr {
+                sub: SbrCommand::Verify { .. }
+            }
         ));
     }
 
     #[test]
     fn sbr_build_parses_with_identity() {
-        let cli = crate::cli::Cli::try_parse_from([
-            "lsi-flash",
-            "sbr",
-            "build",
-            "--as",
-            "lsi-9211-8i",
-        ])
-        .unwrap();
+        let cli =
+            crate::cli::Cli::try_parse_from(["lsi-flash", "sbr", "build", "--as", "lsi-9211-8i"])
+                .unwrap();
         match cli.command {
-            crate::cli::Command::Sbr { sub: SbrCommand::Build { identity, .. } } => {
+            crate::cli::Command::Sbr {
+                sub: SbrCommand::Build { identity, .. },
+            } => {
                 assert_eq!(identity, "lsi-9211-8i");
             }
             _ => panic!("expected Sbr::Build"),

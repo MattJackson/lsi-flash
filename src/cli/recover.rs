@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::cli::backup::BackupManifest;
+use crate::mpi::messages::{ImageType, IocInitRequest, MpiError};
 use crate::mpi::mock_ioc::MockIoc;
 use crate::mpi::session::{Personality, Session};
-use crate::mpi::messages::{ImageType, IocInitRequest, MpiError};
 
 #[derive(Debug, Error)]
 pub enum RecoverError {
@@ -23,7 +23,11 @@ pub enum RecoverError {
     ManifestParse(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("artifact {name} sha256 mismatch: manifest={expected}, actual={actual}\nArtifact may have been tampered with or corrupted. Aborting to prevent writing bad data.")]
-    Sha256Mismatch { name: String, expected: String, actual: String },
+    Sha256Mismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
 
     #[error("artifact {0} referenced in manifest but file missing")]
     ArtifactMissing(String),
@@ -50,8 +54,9 @@ pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error
         return Err(RecoverError::ManifestNotFound(dir).into());
     }
     let manifest_str = std::fs::read_to_string(&manifest_path)?;
-    let manifest: BackupManifest = toml::from_str(&manifest_str)
-        .map_err(|e| RecoverError::ManifestParse(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
+    let manifest: BackupManifest = toml::from_str(&manifest_str).map_err(|e| {
+        RecoverError::ManifestParse(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    })?;
 
     // 2. Verify every artifact's sha256 BEFORE we touch the card (Rule 5: don't trust without verification)
     for artifact in &manifest.artifacts {
@@ -66,7 +71,8 @@ pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error
                 name: artifact.path.clone(),
                 expected: artifact.sha256.clone(),
                 actual,
-            }.into());
+            }
+            .into());
         }
     }
 
@@ -133,11 +139,7 @@ pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error
         });
         println!("{}", serde_json::to_string(&output)?);
     } else {
-        println!(
-            "recovered {} artifacts from {}",
-            restored.len(),
-            backup_dir
-        );
+        println!("recovered {} artifacts from {}", restored.len(), backup_dir);
         for r in &restored {
             println!("  ✓ {}", r);
         }
@@ -259,7 +261,7 @@ mod tests {
         // Create a mock with failure injection
         let mut mock_ioc = MockIoc::new(Personality::It);
         mock_ioc.inject.next_fw_download_error = Some(IocStatus::InternalError);
-        
+
         let manifest_str = std::fs::read_to_string(tmp.path().join("manifest.toml")).unwrap();
         let mut session = Session::new(mock_ioc);
         let init_req = IocInitRequest {
@@ -274,7 +276,7 @@ mod tests {
         // Manually test the download path with injected failure
         let bytes = std::fs::read(tmp.path().join("firmware.bin")).unwrap();
         let result = session.fw_download_verified(ImageType::Fw, Personality::It, &bytes);
-        
+
         assert!(matches!(
             result,
             Err(MpiError::IocStatus(IocStatus::InternalError))
@@ -300,9 +302,12 @@ mod tests {
 
         // This should not panic or block on stdin when yes=true
         let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
-        
+
         // Should succeed (or at least not fail with Declined)
-        assert!(!matches!(result, Err(crate::Error::Recover(RecoverError::Declined))));
+        assert!(!matches!(
+            result,
+            Err(crate::Error::Recover(RecoverError::Declined))
+        ));
     }
 
     #[test]
@@ -317,7 +322,7 @@ mod tests {
 
         // Should fail on bios validation before any download happens
         let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
-        
+
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::Sha256Mismatch { .. }))
@@ -351,7 +356,7 @@ mod tests {
         session.raw_ioc_init(&init_req).unwrap();
 
         let result = run(tmp.path().to_str().unwrap().to_string(), true, true);
-        
+
         // Should succeed with JSON output (no panic)
         assert!(result.is_ok());
     }

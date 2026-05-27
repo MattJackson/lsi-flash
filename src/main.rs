@@ -9,7 +9,7 @@ pub mod mpi;
 pub mod sbr;
 
 use clap::Parser;
-pub use cli::{Cli, run};
+pub use cli::{run, Cli};
 pub use error::Error;
 pub use firmware::*;
 

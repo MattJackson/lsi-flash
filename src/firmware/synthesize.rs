@@ -183,7 +183,9 @@ mod cross_cohort_tests {
 
     fn load_fixture(name: &str) -> Option<Vec<u8>> {
         let path = fixture_path(name);
-        if !path.exists() { return None; }
+        if !path.exists() {
+            return None;
+        }
         Some(std::fs::read(path).expect("fixture exists but unreadable"))
     }
 
@@ -203,7 +205,8 @@ mod cross_cohort_tests {
                 synth[phydata_off + i * PHYDATA_STRIDE],
                 (7 - i) as u8,
                 "Port byte at PhyData[{}] should be {} after reverse",
-                i, 7 - i
+                i,
+                7 - i
             );
         }
 
@@ -211,13 +214,20 @@ mod cross_cohort_tests {
         let mut sum: u32 = 0;
         let len = synth.len() & !3;
         for i in (0..len).step_by(4) {
-            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i+4].try_into().unwrap()));
+            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i + 4].try_into().unwrap()));
         }
         assert_eq!(sum, 0, "file-level U32 sum should be 0 after recompute");
 
         // Only the 8 Port bytes should differ from the original
-        let diff_count = orig.iter().zip(synth.iter()).filter(|(a, b)| a != b).count();
-        assert_eq!(diff_count, 8, "only 8 Port bytes should change (minimal diff)");
+        let diff_count = orig
+            .iter()
+            .zip(synth.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            diff_count, 8,
+            "only 8 Port bytes should change (minimal diff)"
+        );
     }
 
     #[test]
@@ -236,7 +246,8 @@ mod cross_cohort_tests {
                 synth[phydata_off + i * PHYDATA_STRIDE],
                 (7 - i) as u8,
                 "Dell PhyData[{}] Port should be {} after reverse",
-                i, 7 - i
+                i,
+                7 - i
             );
         }
 
@@ -244,15 +255,25 @@ mod cross_cohort_tests {
         let mut sum: u32 = 0;
         let len = synth.len() & !3;
         for i in (0..len).step_by(4) {
-            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i+4].try_into().unwrap()));
+            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i + 4].try_into().unwrap()));
         }
-        assert_eq!(sum, 0, "Dell file-level U32 sum should be 0 after recompute");
+        assert_eq!(
+            sum, 0,
+            "Dell file-level U32 sum should be 0 after recompute"
+        );
 
         // 8 Port bytes differ + possibly last U32 word adjusted (sum-preserving permutation
         // means last word may or may not change — sum of [0..7] == sum of [7..0] so checksum
         // is invariant in this specific case)
-        let diff_count = orig.iter().zip(synth.iter()).filter(|(a, b)| a != b).count();
-        assert!(diff_count <= 12, "only Port bytes (8) + possibly last U32 (4) should change; got {diff_count}");
+        let diff_count = orig
+            .iter()
+            .zip(synth.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            diff_count <= 12,
+            "only Port bytes (8) + possibly last U32 (4) should change; got {diff_count}"
+        );
     }
 
     #[test]
@@ -261,10 +282,10 @@ mod cross_cohort_tests {
             eprintln!("SKIP: fixture not present (notes repo missing)");
             return;
         };
-        
+
         // Find the real PhyData offset in original firmware
         let orig_base = find_phydata_offset(&orig).expect("IR should have valid PhyData[]");
-        
+
         let synth = synthesize_reverse_phy(&orig).expect("synthesis should succeed on LSI IR");
 
         // Verify Port bytes are reversed at the ORIGINAL location.
@@ -272,23 +293,34 @@ mod cross_cohort_tests {
         // due to false positives in IR firmware (see debug_ir4.rs analysis),
         // so we verify at the known original offset instead.
         for i in 0..8 {
-            assert_eq!(synth[orig_base + i * PHYDATA_STRIDE], (7 - i) as u8,
-                "Port byte at PhyData[{}] should be {} after reverse", i, 7 - i);
+            assert_eq!(
+                synth[orig_base + i * PHYDATA_STRIDE],
+                (7 - i) as u8,
+                "Port byte at PhyData[{}] should be {} after reverse",
+                i,
+                7 - i
+            );
         }
 
         // Verify the file checksum still validates
         let mut sum: u32 = 0;
         let len = synth.len() & !3;
         for i in (0..len).step_by(4) {
-            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i+4].try_into().unwrap()));
+            sum = sum.wrapping_add(u32::from_le_bytes(synth[i..i + 4].try_into().unwrap()));
         }
         assert_eq!(sum, 0, "IR file-level U32 sum should be 0 after recompute");
     }
 
     #[test]
     fn lsi_and_dell_have_different_phydata_offsets() {
-        let Some(lsi) = load_fixture("2118it.bin") else { eprintln!("SKIP"); return; };
-        let Some(dell) = load_fixture("DELL_6GBPSAS.FW") else { eprintln!("SKIP"); return; };
+        let Some(lsi) = load_fixture("2118it.bin") else {
+            eprintln!("SKIP");
+            return;
+        };
+        let Some(dell) = load_fixture("DELL_6GBPSAS.FW") else {
+            eprintln!("SKIP");
+            return;
+        };
 
         let lsi_off = find_phydata_offset(&lsi).expect("LSI should have PhyData");
         let dell_off = find_phydata_offset(&dell).expect("Dell should have PhyData");

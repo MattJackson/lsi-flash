@@ -3,7 +3,8 @@
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:194-223 (lsi_open), :314-340 (lsi_unbind_driver), :342-390 (lsi_rescan)
 //! Cites: references/oems/card-database.md (card identification data)
 
-#[cfg(test)] use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -85,10 +86,8 @@ impl MockPlatform {
             dirs: HashMap::new(),
         };
         // Initialize the devices directory for empty-dir tests
-        mock.dirs.insert(
-            PathBuf::from("/sys/bus/pci/devices"),
-            Vec::new(),
-        );
+        mock.dirs
+            .insert(PathBuf::from("/sys/bus/pci/devices"), Vec::new());
         mock
     }
 
@@ -113,7 +112,10 @@ impl MockPlatform {
             &format!("{base}/subsystem_vendor"),
             &format!("0x{:04x}", ssvid),
         );
-        self.add_file(&format!("{base}/subsystem_device"), &format!("0x{:04x}", ssdid));
+        self.add_file(
+            &format!("{base}/subsystem_device"),
+            &format!("0x{:04x}", ssdid),
+        );
         self.add_file(&format!("{base}/class"), &format!("{:06x}", class));
 
         let bdf_path = PathBuf::from(bdf);
@@ -159,12 +161,12 @@ impl Platform for MockPlatform {
 /// PCI device discovered via sysfs walk. Cites lsirec.c:194-223 pattern for reading vendor/device/class.
 #[derive(Debug, Clone)]
 pub struct PciDevice {
-    pub bdf: String,          // e.g., "0000:01:00.0"
+    pub bdf: String, // e.g., "0000:01:00.0"
     pub vendor_id: u16,
     pub device_id: u16,
     pub subsystem_vendor_id: u16,
     pub subsystem_device_id: u16,
-    pub class_code: u32,      // from class file (lsirec.c:205 pattern)
+    pub class_code: u32, // from class file (lsirec.c:205 pattern)
 }
 
 impl PciDevice {
@@ -174,30 +176,18 @@ impl PciDevice {
 
         // Read vendor ID (lsirec.c:205 pattern)
         let vendor_str = plat.read_to_string(&base.join("vendor"))?;
-        let vendor_id = u16::from_str_radix(
-            vendor_str.trim().trim_start_matches("0x"),
-            16,
-        )?;
+        let vendor_id = u16::from_str_radix(vendor_str.trim().trim_start_matches("0x"), 16)?;
 
         // Read device ID (lsirec.c:205 pattern)
         let device_str = plat.read_to_string(&base.join("device"))?;
-        let device_id = u16::from_str_radix(
-            device_str.trim().trim_start_matches("0x"),
-            16,
-        )?;
+        let device_id = u16::from_str_radix(device_str.trim().trim_start_matches("0x"), 16)?;
 
         // Read subsystem VID/DID (card-database lookup keys)
         let ssid_vid_str = plat.read_to_string(&base.join("subsystem_vendor"))?;
-        let ssid_vid = u16::from_str_radix(
-            ssid_vid_str.trim().trim_start_matches("0x"),
-            16,
-        )?;
+        let ssid_vid = u16::from_str_radix(ssid_vid_str.trim().trim_start_matches("0x"), 16)?;
 
         let ssid_did_str = plat.read_to_string(&base.join("subsystem_device"))?;
-        let ssid_did = u16::from_str_radix(
-            ssid_did_str.trim().trim_start_matches("0x"),
-            16,
-        )?;
+        let ssid_did = u16::from_str_radix(ssid_did_str.trim().trim_start_matches("0x"), 16)?;
 
         // Read class code (lsirec.c:205 pattern)
         let class_str = plat.read_to_string(&base.join("class"))?;
@@ -217,10 +207,10 @@ impl PciDevice {
 /// Card identification result. Cites references/oems/card-database.md.
 #[derive(Debug, Clone)]
 pub struct CardInfo {
-    pub name: String,         // e.g., "Dell PERC H200" or "Unknown SAS2008 card"
+    pub name: String, // e.g., "Dell PERC H200" or "Unknown SAS2008 card"
     pub chip_family: ChipFamily,
     pub flash_size: Option<usize>,
-    pub quirks: Vec<Quirk>,   // e.g., TamperCheckRequired
+    pub quirks: Vec<Quirk>, // e.g., TamperCheckRequired
 }
 
 /// SAS2008 chip family constant (lsirec.c VID/DID checks).
@@ -233,9 +223,9 @@ pub enum ChipFamily {
 /// Card-specific quirks that affect flashing procedure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Quirk {
-    TamperCheckRequired,      // Dell/IBM require megarec or hostboot path
-    FujitsuSbrVariantA11,     // D2607 A11 variant (standard SBR)
-    FujitsuSbrVariantA21,     // D2607 A21 variant (preserves wiring byte at 0x2A)
+    TamperCheckRequired,  // Dell/IBM require megarec or hostboot path
+    FujitsuSbrVariantA11, // D2607 A11 variant (standard SBR)
+    FujitsuSbrVariantA21, // D2607 A21 variant (preserves wiring byte at 0x2A)
 }
 
 /// Lookup card info from VID/DID/SSID. Cites references/oems/card-database.md tables.
@@ -303,31 +293,37 @@ impl PciHandle {
         // Check if device exists (lsirec.c:205 pattern)
         let resource1_path = format!("/sys/bus/pci/devices/{bdf}/resource1");
         if !std::path::Path::new(&resource1_path).exists() {
-            return Err(super::error::PciError::DeviceNotFound { bdf: bdf.to_string() });
+            return Err(super::error::PciError::DeviceNotFound {
+                bdf: bdf.to_string(),
+            });
         }
 
         // Open BAR1 (lsirec.c:207-213 pattern) - use mmap_ro abstraction
-        let mapping_bytes = plat.mmap_ro(
-            PathBuf::from(&resource1_path).as_path(),
-            0,
-            4096,
-        )?;
+        let mapping_bytes = plat.mmap_ro(PathBuf::from(&resource1_path).as_path(), 0, 4096)?;
 
         // Convert Box<[u8]> to Box<[u8; 4096]>
         if mapping_bytes.len() != 4096 {
-            return Err(super::error::PciError::Mmap("BAR1 mapping size mismatch".to_string()));
+            return Err(super::error::PciError::Mmap(
+                "BAR1 mapping size mismatch".to_string(),
+            ));
         }
         let mut array: [u8; 4096] = [0; 4096];
         array.copy_from_slice(&mapping_bytes);
 
-        Ok(Self { device, bar1_mapping: Box::new(array) })
+        Ok(Self {
+            device,
+            bar1_mapping: Box::new(array),
+        })
     }
 
     /// Unbind kernel driver from this device. Cites lsirec.c:314-340.
     pub fn unbind_driver<P: Platform>(&self, plat: &P) -> Result<(), super::error::PciError> {
         let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", self.device.bdf);
 
-        match plat.write(&PathBuf::from(&unbind_path).as_path(), self.device.bdf.as_bytes()) {
+        match plat.write(
+            &PathBuf::from(&unbind_path).as_path(),
+            self.device.bdf.as_bytes(),
+        ) {
             Ok(_) => {
                 println!("Kernel driver unbound from device");
                 Ok(())
@@ -361,7 +357,9 @@ impl PciHandle {
 }
 
 /// Walk sysfs and return all SAS2008-based devices. Cites lsirec.c:314-390 pattern.
-pub fn discover_sas2008_devices<P: Platform>(plat: &P) -> Result<Vec<PciDevice>, super::error::PciError> {
+pub fn discover_sas2008_devices<P: Platform>(
+    plat: &P,
+) -> Result<Vec<PciDevice>, super::error::PciError> {
     let sysfs_path = PathBuf::from("/sys/bus/pci/devices");
     let mut devices = Vec::new();
 

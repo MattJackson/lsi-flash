@@ -59,9 +59,13 @@ pub fn build_sbr(template: &[u8], identity: &IdentityPayload) -> Result<[u8; 256
     Ok(out)
 }
 
-fn write_mfg_block(out: &mut [u8; 256], base: usize, id: &IdentityPayload) -> Result<(), BuildError> {
-    const OFF_PCI_VID:   usize = 0x0C;
-    const OFF_PCI_DID:   usize = 0x0E;
+fn write_mfg_block(
+    out: &mut [u8; 256],
+    base: usize,
+    id: &IdentityPayload,
+) -> Result<(), BuildError> {
+    const OFF_PCI_VID: usize = 0x0C;
+    const OFF_PCI_DID: usize = 0x0E;
     const OFF_SUBSYS_VID: usize = 0x14;
     const OFF_SUBSYS_PID: usize = 0x16;
 
@@ -83,7 +87,10 @@ fn write_wwid_block(out: &mut [u8; 256], sas_wwn: u64) {
 
 fn fix_mfg_checksum(out: &mut [u8; 256], base: usize) {
     const MFG_PAYLOAD_LEN: usize = 0x4b;
-    let sum: u32 = out[base..base + MFG_PAYLOAD_LEN].iter().map(|&b| b as u32).sum();
+    let sum: u32 = out[base..base + MFG_PAYLOAD_LEN]
+        .iter()
+        .map(|&b| b as u32)
+        .sum();
     out[base + MFG_PAYLOAD_LEN] = 0x5bu8.wrapping_sub(sum as u8);
 }
 
@@ -92,14 +99,30 @@ mod tests {
     use super::*;
 
     fn lsi_id() -> IdentityPayload {
-        IdentityPayload { pci_vid: 0x1000, pci_did: 0x0072, subsys_vid: 0x1000, subsys_pid: 0x3020, sas_wwn: 0x5006_05b1_2345_6789, board_name: "9211-8i".into() }
+        IdentityPayload {
+            pci_vid: 0x1000,
+            pci_did: 0x0072,
+            subsys_vid: 0x1000,
+            subsys_pid: 0x3020,
+            sas_wwn: 0x5006_05b1_2345_6789,
+            board_name: "9211-8i".into(),
+        }
     }
 
     fn dell_id() -> IdentityPayload {
-        IdentityPayload { pci_vid: 0x1000, pci_did: 0x0072, subsys_vid: 0x1028, subsys_pid: 0x1f1d, sas_wwn: 0x5006_05b1_dead_beef, board_name: "PERC H200 Adapter".into() }
+        IdentityPayload {
+            pci_vid: 0x1000,
+            pci_did: 0x0072,
+            subsys_vid: 0x1028,
+            subsys_pid: 0x1f1d,
+            sas_wwn: 0x5006_05b1_dead_beef,
+            board_name: "PERC H200 Adapter".into(),
+        }
     }
 
-    fn tpl() -> Vec<u8> { vec![0u8; 256] }
+    fn tpl() -> Vec<u8> {
+        vec![0u8; 256]
+    }
 
     #[test]
     fn build_rejects_invalid_template_size() {
@@ -110,14 +133,23 @@ mod tests {
     fn build_rejects_invalid_oui() {
         let mut id = lsi_id();
         id.sas_wwn = 0x1234_5678_9abc_def0;
-        assert!(matches!(build_sbr(&tpl(), &id), Err(BuildError::InvalidWwn { .. })));
+        assert!(matches!(
+            build_sbr(&tpl(), &id),
+            Err(BuildError::InvalidWwn { .. })
+        ));
     }
 
     #[test]
     fn build_writes_pci_identity_into_both_mfg_copies() {
         let sbr = build_sbr(&tpl(), &dell_id()).unwrap();
-        assert_eq!(&sbr[MFG_OFFSET_PRIMARY + 0x14..MFG_OFFSET_PRIMARY + 0x18], &[0x28, 0x10, 0x1d, 0x1f]);
-        assert_eq!(&sbr[MFG_OFFSET_BACKUP + 0x14..MFG_OFFSET_BACKUP + 0x18], &[0x28, 0x10, 0x1d, 0x1f]);
+        assert_eq!(
+            &sbr[MFG_OFFSET_PRIMARY + 0x14..MFG_OFFSET_PRIMARY + 0x18],
+            &[0x28, 0x10, 0x1d, 0x1f]
+        );
+        assert_eq!(
+            &sbr[MFG_OFFSET_BACKUP + 0x14..MFG_OFFSET_BACKUP + 0x18],
+            &[0x28, 0x10, 0x1d, 0x1f]
+        );
     }
 
     #[test]
