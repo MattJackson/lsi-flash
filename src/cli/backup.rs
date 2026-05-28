@@ -82,6 +82,30 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
 
     if let Some(bdf) = pci {
         let platform = crate::pci::LinuxSysfs;
+        // Prefer the HwBackend path (VFIO) — it does the driver bind dance
+        // and provides chip-readable DMA buffers, so FW_UPLOAD returns real
+        // bytes instead of the 885-KB-of-zeros bug (ADR-016). Falls back to
+        // the legacy direct-sysfs mmap path if no backend can attach (e.g.,
+        // VFIO modules missing) — operator can still get a partial result
+        // by unbinding mpt3sas manually first.
+        #[cfg(target_os = "linux")]
+        let real_ioc = match crate::hw::auto_detect(&bdf) {
+            Ok(backend) => {
+                crate::mpi::real_ioc::RealIoc::from_backend(platform, backend).map_err(|e| {
+                    crate::Error::Other(format!("RealIoc::from_backend({}) failed: {}", bdf, e))
+                })?
+            }
+            Err(hw_err) => {
+                eprintln!(
+                    "warning: HwBackend (VFIO) attach failed: {} — falling back to direct sysfs mmap (no DMA, FW_UPLOAD may return zeros)",
+                    hw_err
+                );
+                crate::mpi::real_ioc::RealIoc::open(platform, &bdf).map_err(|e| {
+                    crate::Error::Other(format!("RealIoc::open({}) failed: {}", bdf, e))
+                })?
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
         let real_ioc = crate::mpi::real_ioc::RealIoc::open(platform, &bdf)
             .map_err(|e| crate::Error::Other(format!("RealIoc::open({}) failed: {}", bdf, e)))?;
         let mut session = Session::new(real_ioc);
