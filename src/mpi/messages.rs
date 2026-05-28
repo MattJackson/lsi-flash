@@ -1274,13 +1274,13 @@ impl IocFactsReply {
         // Offset 0x03: Function — mpi2_ioc.h:236 (should be 0x03)
         let function = bytes[3];
         if function != MpiFunction::IocFacts.as_u8() {
-            return Err(MpiError::MalformedReply {
-                function: MpiFunction::IocFacts,
-                got: bytes.len(),
-                need: 96,
+            return Err(MpiError::WrongReplyFunction {
+                expected: MpiFunction::IocFacts,
+                got_function: function,
+                expected_function: MpiFunction::IocFacts.as_u8(),
+                head: bytes[..bytes.len().min(16)].to_vec(),
             });
         }
-
         // Offset 0x04-0x05: HeaderVersion — mpi2_ioc.h:237
         let header_version = u16::from_le_bytes([bytes[4], bytes[5]]);
 
@@ -1540,6 +1540,16 @@ pub enum MpiError {
         function: MpiFunction,
         got: usize,
         need: usize,
+    },
+
+    /// Reply frame's Function byte didn't match the request. Usually means the
+    /// IOC is mid-state-transition or a previous message wasn't drained.
+    #[error("malformed reply for {expected:?}: function byte = 0x{got_function:02X} (expected 0x{expected_function:02X}); first 16 reply bytes = {head:02X?}")]
+    WrongReplyFunction {
+        expected: MpiFunction,
+        got_function: u8,
+        expected_function: u8,
+        head: Vec<u8>,
     },
 
     /// Unknown IOCStatus code returned by IOC (not in iocstatus-table.md §10).
