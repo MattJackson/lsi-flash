@@ -2,7 +2,7 @@
 //! Enforces ADR-015 Rules 1, 4, 5, 6 at this layer.
 
 use crate::mpi::messages::{
-    ConfigReply, FwDownloadReply, FwUploadReply, IocInitReply, ToolboxReply,
+    ConfigReply, FwDownloadReply, FwUploadReply, IocFactsReply, IocInitReply, ToolboxReply,
 };
 use crate::mpi::messages::{
     ConfigRequest, FwDownloadRequest, FwUploadRequest, IocInitRequest, ToolboxCleanRequest,
@@ -85,6 +85,7 @@ pub trait IocBackend {
     fn send_toolbox_clean(&mut self, req: &ToolboxCleanRequest) -> Result<ToolboxReply, MpiError>;
     fn send_config(&mut self, req: &ConfigRequest<'_>) -> Result<ConfigReply, MpiError>;
     fn send_ioc_init(&mut self, req: &IocInitRequest) -> Result<IocInitReply, MpiError>;
+    fn send_ioc_facts(&mut self) -> Result<IocFactsReply, MpiError>; // Added for IOC_FACTS query
     fn current_personality(&self) -> Result<Personality, MpiError>;
 }
 
@@ -229,6 +230,12 @@ impl<B: IocBackend> Session<B> {
     pub fn raw_ioc_init(&mut self, req: &IocInitRequest) -> Result<IocInitReply, MpiError> {
         let _smid = self.next_smid();
         self.backend.send_ioc_init(req)
+    }
+
+    /// Raw passthrough for IOC_FACTS query.
+    pub fn raw_ioc_facts(&mut self) -> Result<IocFactsReply, MpiError> {
+        let _smid = self.next_smid();
+        self.backend.send_ioc_facts()
     }
 
     /// Get the current personality from the backend.

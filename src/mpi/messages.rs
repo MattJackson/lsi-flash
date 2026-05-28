@@ -72,12 +72,19 @@ impl std::ops::BitOr for ToolboxCleanFlags {
 pub enum MpiFunction {
     /// IOC Initialize — mpi-overview.md §9
     IocInit = 0x02,
+
+    /// IOC Facts query — mpi2_ioc.h:191 (function code 0x03)
+    IocFacts = 0x03,
+
     /// Configuration page access — mpi-overview.md §6, toolbox-and-config.md §6
     Config = 0x04,
+
     /// Firmware download — fw-download-upload.md §3.1
     FwDownload = 0x09,
+
     /// Firmware upload — fw-download-upload.md §4.1
     FwUpload = 0x12,
+
     /// Toolbox operations — toolbox-and-config.md §5.1
     Toolbox = 0x17,
 }
@@ -86,6 +93,7 @@ impl MpiFunction {
     pub fn from_u8(raw: u8) -> Result<Self, MpiError> {
         match raw {
             0x02 => Ok(Self::IocInit),
+            0x03 => Ok(Self::IocFacts), // mpi2_ioc.h:191 - IOC_FACTS function code
             0x04 => Ok(Self::Config),
             0x09 => Ok(Self::FwDownload),
             0x12 => Ok(Self::FwUpload),
@@ -97,6 +105,7 @@ impl MpiFunction {
     pub fn as_u8(self) -> u8 {
         match self {
             Self::IocInit => 0x02,
+            Self::IocFacts => 0x03, // mpi2_ioc.h:191 - IOC_FACTS function code
             Self::Config => 0x04,
             Self::FwDownload => 0x09,
             Self::FwUpload => 0x12,
@@ -1080,6 +1089,438 @@ impl IocInitReply {
             ioc_status,
         })
     }
+}
+
+/// IOC_FACTS request (MPI v2.0). Function code 0x03 per mpi2_ioc.h:191-227.
+/// Total size: 16 bytes header only, no SGL needed.
+/// Cites: mpi2_ioc.h:215-227 for exact field layout
+#[derive(Debug, Clone)]
+pub struct IocFactsRequest;
+
+impl IocFactsRequest {
+    /// Serialize IOC_FACTS request to wire format (header only).
+    /// Returns 16 bytes: MPI2_REQUEST_HEADER (10B) + body (6B).
+    pub fn serialize_to(smid: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16);
+
+        // MPI2_REQUEST_HEADER (10 bytes) — mpi-overview.md §1.2
+        buf.extend_from_slice(&0u16.to_le_bytes()); // FunctionDependent1: 0 for IOC_FACTS
+        buf.push(0x00); // ChainOffset: 0 = single message, no chaining
+        buf.push(MpiFunction::IocFacts.as_u8()); // Function = 0x03 per mpi2_ioc.h:191
+        buf.extend_from_slice(&smid.to_le_bytes()); // FunctionDependent2 (SMID)
+        buf.push(0x00); // FunctionDependent3: 0
+
+        let msg_flags = 0x00; // Not used for IOC_FACTS request
+        buf.push(msg_flags);
+        buf.push(0x00); // VP_ID: not used
+        buf.push(0x00); // VF_ID: not used
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
+
+        buf
+    }
+}
+
+/// IOC_FACTS reply (MPI v2.0). Function code 0x03 per mpi2_ioc.h:191-279.
+/// Total size: ~96 bytes including BoardName and BoardTracer strings.
+/// Cites: mpi2_ioc.h:231-269 for exact field layout
+#[derive(Debug, Clone, PartialEq)]
+pub struct IocFactsReply {
+    /// Message version (high byte = major, low byte = minor) — mpi2_ioc.h:234
+    pub msg_version: u16,
+
+    /// Message length in bytes — mpi2_ioc.h:235
+    pub msg_length: u8,
+
+    /// Function code echoed back — mpi2_ioc.h:236 (0x03)
+    pub function: u8,
+
+    /// Header version — mpi2_ioc.h:237
+    pub header_version: u16,
+
+    /// IOC number — mpi2_ioc.h:239
+    pub ioc_number: u8,
+
+    /// Message flags — mpi2_ioc.h:240
+    pub msg_flags: u8,
+
+    /// VP_ID — mpi2_ioc.h:241
+    pub vp_id: u8,
+
+    /// VF_ID — mpi2_ioc.h:242
+    pub vf_id: u8,
+
+    /// Reserved — mpi2_ioc.h:243
+    pub reserved_1: u16,
+
+    /// IOC exceptions — mpi2_ioc.h:244
+    pub ioc_exceptions: u16,
+
+    /// IOC status (2B LE at offset 0x0E) — mpi2_ioc.h:245
+    pub ioc_status: IocStatus,
+
+    /// IOC log info (4B at offset 0x10) — mpi2_ioc.h:246
+    pub ioc_log_info: u32,
+
+    /// Max chain depth — mpi2_ioc.h:247
+    pub max_chain_depth: u8,
+
+    /// Who initiated IOC (WhoInit value) — mpi2_ioc.h:248
+    pub who_init: u8,
+
+    /// Number of ports — mpi2_ioc.h:249
+    pub number_of_ports: u8,
+
+    /// Max MSI-X vectors — mpi2_ioc.h:250
+    pub max_msix_vectors: u8,
+
+    /// Request credit — mpi2_ioc.h:251
+    pub request_credit: u16,
+
+    /// Product ID (2B LE at offset 0x1A) — mpi2_ioc.h:252
+    pub product_id: u16,
+
+    /// IOC capabilities (4B at offset 0x1C) — mpi2_ioc.h:253
+    pub ioc_capabilities: u32,
+
+    /// Firmware version union (4B at offset 0x20) — mpi2_ioc.h:254
+    /// Format: major(8b).minor(8b).unit(8b).dev(8b) encoded in u32 LE
+    pub fw_version: u32,
+
+    /// IOC request frame size — mpi2_ioc.h:255
+    pub ioc_request_frame_size: u16,
+
+    /// IOC max chain segment size — mpi2_ioc.h:256
+    pub ioc_max_chain_segment_size: u16,
+
+    /// Max initiators — mpi2_ioc.h:257
+    pub max_initiators: u16,
+
+    /// Max targets — mpi2_ioc.h:258
+    pub max_targets: u16,
+
+    /// Max SAS expanders — mpi2_ioc.h:259
+    pub max_sas_expanders: u16,
+
+    /// Max enclosures — mpi2_ioc.h:260
+    pub max_enclosures: u16,
+
+    /// Protocol flags — mpi2_ioc.h:261
+    pub protocol_flags: u16,
+
+    /// High priority credit — mpi2_ioc.h:262
+    pub high_priority_credit: u16,
+
+    /// Max reply descriptor post queue depth — mpi2_ioc.h:263
+    pub max_reply_descriptor_post_queue_depth: u16,
+
+    /// Reply frame size — mpi2_ioc.h:264
+    pub reply_frame_size: u8,
+
+    /// Max volumes — mpi2_ioc.h:265
+    pub max_volumes: u8,
+
+    /// Max device handle — mpi2_ioc.h:266
+    pub max_dev_handle: u16,
+
+    /// Max persistent entries — mpi2_ioc.h:267
+    pub max_persistent_entries: u16,
+
+    /// Min device handle — mpi2_ioc.h:268
+    pub min_dev_handle: u16,
+
+    /// Reserved4 (2B at offset 0x3E) — mpi2_ioc.h:269
+    pub reserved_4: u16,
+
+    /// Board name string (16 bytes null-terminated at offset 0x40) — mpi2_ioc.h:270-275
+    pub board_name: String,
+
+    /// Board tracer string (16 bytes null-terminated at offset 0x50) — mpi2_ioc.h:276-281
+    pub board_tracer: String,
+
+    // Extended fields from Manufacturing Page 0 (fetched via CONFIG roundtrip):
+    // These are populated separately after send_config read of Mfg Page 0
+    /// NVDATA vendor ID (2B at offset 0x08 in Mfg Page 0) — toolbox-and-config.md §5
+    pub nvdata_vendor_id: Option<u16>,
+
+    /// NVDATA product ID string (10 chars from Mfg Page 0) — baseline.md:14
+    pub nvdata_product_id: Option<String>,
+
+    /// NVDATA version (4B from Mfg Page 0, distinct from FW version) — baseline.md:15
+    pub nvdata_version: Option<u32>,
+
+    /// Firmware product ID string (~16 chars from Mfg Page 0 or IOC_FACTS ProductID) — baseline.md:15
+    pub firmware_product_id: Option<String>,
+}
+
+impl IocFactsReply {
+    /// Parse IOC_FACTS reply from raw bytes.
+    /// Expects at least 96 bytes (header + 16-byte BoardName + 16-byte BoardTracer).
+    /// Cites: mpi2_ioc.h:231-281 for exact field offsets
+    pub fn parse(bytes: &[u8]) -> Result<Self, MpiError> {
+        if bytes.len() < 96 {
+            return Err(MpiError::MalformedReply {
+                function: MpiFunction::IocFacts,
+                got: bytes.len(),
+                need: 96,
+            });
+        }
+
+        // Offset 0x00-0x01: MsgVersion — mpi2_ioc.h:234
+        let msg_version = u16::from_le_bytes([bytes[0], bytes[1]]);
+
+        // Offset 0x02: MsgLength — mpi2_ioc.h:235
+        let msg_length = bytes[2];
+
+        // Offset 0x03: Function — mpi2_ioc.h:236 (should be 0x03)
+        let function = bytes[3];
+        if function != MpiFunction::IocFacts.as_u8() {
+            return Err(MpiError::MalformedReply {
+                function: MpiFunction::IocFacts,
+                got: bytes.len(),
+                need: 96,
+            });
+        }
+
+        // Offset 0x04-0x05: HeaderVersion — mpi2_ioc.h:237
+        let header_version = u16::from_le_bytes([bytes[4], bytes[5]]);
+
+        // Offset 0x06: IOCNumber — mpi2_ioc.h:239
+        let ioc_number = bytes[6];
+
+        // Offset 0x07: MsgFlags — mpi2_ioc.h:240
+        let msg_flags = bytes[7];
+
+        // Offset 0x08-0x09: VP_ID, VF_ID — mpi2_ioc.h:241-242
+        let vp_id = bytes[8];
+        let vf_id = bytes[9];
+
+        // Offset 0x0A-0x0B: Reserved1 — mpi2_ioc.h:243
+        let reserved_1 = u16::from_le_bytes([bytes[10], bytes[11]]);
+
+        // Offset 0x0C-0x0D: IOCExceptions — mpi2_ioc.h:244
+        let ioc_exceptions = u16::from_le_bytes([bytes[12], bytes[13]]);
+
+        // Offset 0x0E-0x0F: IOCStatus (2B LE) — mpi2_ioc.h:245
+        let ioc_status_raw = u16::from_le_bytes([bytes[14], bytes[15]]);
+        let ioc_status = IocStatus::from_u16(ioc_status_raw)?;
+
+        // Offset 0x10-0x13: IOCLogInfo (4B LE) — mpi2_ioc.h:246
+        let ioc_log_info = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+
+        // Offset 0x14: MaxChainDepth — mpi2_ioc.h:247
+        let max_chain_depth = bytes[20];
+
+        // Offset 0x15: WhoInit — mpi2_ioc.h:248
+        let who_init = bytes[21];
+
+        // Offset 0x16: NumberOfPorts — mpi2_ioc.h:249
+        let number_of_ports = bytes[22];
+
+        // Offset 0x17: MaxMSIxVectors — mpi2_ioc.h:250
+        let max_msix_vectors = bytes[23];
+
+        // Offset 0x18-0x19: RequestCredit — mpi2_ioc.h:251
+        let request_credit = u16::from_le_bytes([bytes[24], bytes[25]]);
+
+        // Offset 0x1A-0x1B: ProductID (2B LE) — mpi2_ioc.h:252
+        let product_id = u16::from_le_bytes([bytes[26], bytes[27]]);
+
+        // Offset 0x1C-0x1F: IOCCapabilities (4B LE) — mpi2_ioc.h:253
+        let ioc_capabilities = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+
+        // Offset 0x20-0x23: FWVersion (4B LE) — mpi2_ioc.h:254
+        // Format: major(8b).minor(8b).unit(8b).dev(8b) encoded in u32 LE
+        let fw_version = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+
+        // Offset 0x24-0x25: IOCRequestFrameSize — mpi2_ioc.h:255
+        let ioc_request_frame_size = u16::from_le_bytes([bytes[36], bytes[37]]);
+
+        // Offset 0x26-0x27: IOCMaxChainSegmentSize — mpi2_ioc.h:256
+        let ioc_max_chain_segment_size = u16::from_le_bytes([bytes[38], bytes[39]]);
+
+        // Offset 0x28-0x29: MaxInitiators — mpi2_ioc.h:257
+        let max_initiators = u16::from_le_bytes([bytes[40], bytes[41]]);
+
+        // Offset 0x2A-0x2B: MaxTargets — mpi2_ioc.h:258
+        let max_targets = u16::from_le_bytes([bytes[42], bytes[43]]);
+
+        // Offset 0x2C-0x2D: MaxSasExpanders — mpi2_ioc.h:259
+        let max_sas_expanders = u16::from_le_bytes([bytes[44], bytes[45]]);
+
+        // Offset 0x2E-0x2F: MaxEnclosures — mpi2_ioc.h:260
+        let max_enclosures = u16::from_le_bytes([bytes[46], bytes[47]]);
+
+        // Offset 0x30-0x31: ProtocolFlags — mpi2_ioc.h:261
+        let protocol_flags = u16::from_le_bytes([bytes[48], bytes[49]]);
+
+        // Offset 0x32-0x33: HighPriorityCredit — mpi2_ioc.h:262
+        let high_priority_credit = u16::from_le_bytes([bytes[50], bytes[51]]);
+
+        // Offset 0x34-0x35: MaxReplyDescriptorPostQueueDepth — mpi2_ioc.h:263
+        let max_reply_descriptor_post_queue_depth = u16::from_le_bytes([bytes[52], bytes[53]]);
+
+        // Offset 0x36: ReplyFrameSize — mpi2_ioc.h:264
+        let reply_frame_size = bytes[54];
+
+        // Offset 0x37: MaxVolumes — mpi2_ioc.h:265
+        let max_volumes = bytes[55];
+
+        // Offset 0x38-0x39: MaxDevHandle — mpi2_ioc.h:266
+        let max_dev_handle = u16::from_le_bytes([bytes[56], bytes[57]]);
+
+        // Offset 0x3A-0x3B: MaxPersistentEntries — mpi2_ioc.h:267
+        let max_persistent_entries = u16::from_le_bytes([bytes[58], bytes[59]]);
+
+        // Offset 0x3C-0x3D: MinDevHandle — mpi2_ioc.h:268
+        let min_dev_handle = u16::from_le_bytes([bytes[60], bytes[61]]);
+
+        // Offset 0x3E-0x3F: Reserved4 — mpi2_ioc.h:269
+        let reserved_4 = u16::from_le_bytes([bytes[62], bytes[63]]);
+
+        // Offset 0x40-0x4F: BoardName (16 bytes null-terminated ASCII) — mpi2_ioc.h:270-275
+        let board_name_raw = &bytes[64..80];
+        let board_name = parse_null_terminated_string(board_name_raw);
+
+        // Offset 0x50-0x5F: BoardTracer (16 bytes null-terminated ASCII) — mpi2_ioc.h:276-281
+        let board_tracer_raw = &bytes[80..96];
+        let board_tracer = parse_null_terminated_string(board_tracer_raw);
+
+        Ok(Self {
+            msg_version,
+            msg_length,
+            function,
+            header_version,
+            ioc_number,
+            msg_flags,
+            vp_id,
+            vf_id,
+            reserved_1,
+            ioc_exceptions,
+            ioc_status,
+            ioc_log_info,
+            max_chain_depth,
+            who_init,
+            number_of_ports,
+            max_msix_vectors,
+            request_credit,
+            product_id,
+            ioc_capabilities,
+            fw_version,
+            ioc_request_frame_size,
+            ioc_max_chain_segment_size,
+            max_initiators,
+            max_targets,
+            max_sas_expanders,
+            max_enclosures,
+            protocol_flags,
+            high_priority_credit,
+            max_reply_descriptor_post_queue_depth,
+            reply_frame_size,
+            max_volumes,
+            max_dev_handle,
+            max_persistent_entries,
+            min_dev_handle,
+            reserved_4,
+            board_name,
+            board_tracer,
+            nvdata_vendor_id: None, // Populated separately via Mfg Page 0 CONFIG read
+            nvdata_product_id: None,
+            nvdata_version: None,
+            firmware_product_id: None,
+        })
+    }
+
+    /// Parse FW version u32 into (major, minor, unit, dev) components.
+    /// Format per mpi2_ioc.h:254 — each byte is a component in LE order.
+    pub fn fw_version_components(&self) -> (u8, u8, u8, u8) {
+        let b0 = (self.fw_version & 0xFF) as u8;
+        let b1 = ((self.fw_version >> 8) & 0xFF) as u8;
+        let b2 = ((self.fw_version >> 16) & 0xFF) as u8;
+        let b3 = ((self.fw_version >> 24) & 0xFF) as u8;
+        (b0, b1, b2, b3)
+    }
+
+    /// Format FW version as human-readable string "major.minor.unit.dev".
+    pub fn fw_version_string(&self) -> String {
+        let (major, minor, unit, _dev) = self.fw_version_components();
+        format!("{}.{}.{}", major, minor, unit)
+    }
+
+    /// Parse NVDATA version u32 into (major, minor, build, revision) components.
+    /// Format similar to FW version but represents NVDATA schema version.
+    pub fn nvdata_version_components(&self) -> Option<(u8, u8, u16)> {
+        self.nvdata_version.map(|v| {
+            let major = (v & 0xFF) as u8;
+            let minor = ((v >> 8) & 0xFF) as u8;
+            let build = ((v >> 16) & 0xFFFF) as u16;
+            (major, minor, build)
+        })
+    }
+
+    /// Format NVDATA version as human-readable string "major.minor.build".
+    pub fn nvdata_version_string(&self) -> Option<String> {
+        self.nvdata_version_components()
+            .map(|(major, minor, build)| format!("{}.{}.{}", major, minor, build))
+    }
+
+    /// Get NVDATA vendor ID as hex string.
+    pub fn nvdata_vendor_id_hex(&self) -> Option<String> {
+        self.nvdata_vendor_id.map(|id| format!("0x{:04X}", id))
+    }
+
+    /// Get firmware product ID from ProductID field (u16).
+    pub fn fw_product_id_from_facts(&self) -> String {
+        // ProductID is a u16; convert to hex string for display
+        format!("0x{:04X}", self.product_id)
+    }
+
+    /// Get full formatted IOC_FACTS info as human-readable lines.
+    pub fn to_info_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        // Firmware version from IOC_FACTS
+        lines.push(format!("  Firmware Version: {}", self.fw_version_string()));
+
+        // NVDATA vendor/product ID from Mfg Page 0
+        if let Some(vendor_id) = self.nvdata_vendor_id_hex() {
+            lines.push(format!("  NVDATA Vendor ID: {}", vendor_id));
+        }
+        if let Some(prod_id) = &self.nvdata_product_id {
+            lines.push(format!("  NVDATA Product ID: {}", prod_id));
+        }
+
+        // NVDATA version (distinct from FW version per baseline.md:15)
+        if let Some(nv_ver_str) = self.nvdata_version_string() {
+            lines.push(format!("  NVDATA Version: {}", nv_ver_str));
+        }
+
+        // Firmware product ID string
+        if let Some(fw_prod_id) = &self.firmware_product_id {
+            lines.push(format!("  Firmware Product ID: {}", fw_prod_id));
+        }
+
+        // Board name and tracer from IOC_FACTS
+        lines.push(format!("  Board Name: {}", self.board_name));
+        lines.push(format!("  Board Tracer: {}", self.board_tracer));
+
+        // Additional capabilities
+        if self.protocol_flags & (1 << 0) != 0 {
+            lines.push("  Protocol Flags: SR-IOV enabled".to_string());
+        }
+
+        lines.push(format!("  Max SAS Expanders: {}", self.max_sas_expanders));
+        lines.push(format!("  Max Enclosures: {}", self.max_enclosures));
+        lines.push(format!("  Max Targets: {}", self.max_targets));
+        lines.push(format!("  Max Initiators: {}", self.max_initiators));
+
+        lines
+    }
+}
+
+/// Parse a null-terminated ASCII string from bytes.
+fn parse_null_terminated_string(bytes: &[u8]) -> String {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..len]).to_string()
 }
 
 // ============================================================================

@@ -2,7 +2,7 @@
 //! Doubles as the `--dry-run` backend (no hardware needed).
 
 use crate::mpi::messages::{
-    ConfigReply, FwDownloadReply, FwUploadReply, IocInitReply, ToolboxReply,
+    ConfigReply, FwDownloadReply, FwUploadReply, IocFactsReply, IocInitReply, ToolboxReply,
 };
 use crate::mpi::messages::{
     ConfigRequest, FwDownloadRequest, FwUploadRequest, IocInitRequest, ToolboxCleanFlags,
@@ -220,6 +220,103 @@ impl IocBackend for MockIoc {
         Ok(IocInitReply {
             who_init: 0x04,
             ioc_status: IocStatus::Success,
+        })
+    }
+
+    fn send_ioc_facts(&mut self) -> Result<IocFactsReply, MpiError> {
+        // Per mpi-overview.md §9: IOC must be initialized before IOC_FACTS
+        if !self.initialized {
+            return Ok(IocFactsReply {
+                msg_version: 0x01,
+                msg_length: 96,
+                function: crate::mpi::messages::MpiFunction::IocFacts.as_u8(), // 0x03 per mpi2_ioc.h:191
+                header_version: 0x01,
+                ioc_number: 0x00,
+                msg_flags: 0x00,
+                vp_id: 0x00,
+                vf_id: 0x00,
+                reserved_1: 0x0000,
+                ioc_exceptions: 0x0000,
+                ioc_status: IocStatus::InvalidState, // Not initialized
+                ioc_log_info: 0x00000000,
+                max_chain_depth: 0x00,
+                who_init: 0x04,
+                number_of_ports: 0x04,
+                max_msix_vectors: 0x01,
+                request_credit: 0x00FF,
+                product_id: 0x0725,           // SAS2008 IT personality product ID
+                ioc_capabilities: 0x00000004, // MPI2_IOC_CAP_ENABLED_PERPHYS
+                fw_version: 0x00080F07, // Version format: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
+
+                ioc_request_frame_size: 0x0048, // 72 bytes
+                ioc_max_chain_segment_size: 0xFFFF,
+                max_initiators: 0x0064,    // 100 initiators
+                max_targets: 0x00FF,       // 255 targets
+                max_sas_expanders: 0x0064, // 100 expanders
+                max_enclosures: 0x0064,    // 100 enclosures
+                protocol_flags: 0x0000,
+                high_priority_credit: 0x00FF,
+                max_reply_descriptor_post_queue_depth: 0x0080, // 128 entries
+                reply_frame_size: 0x0040,                      // 64 bytes
+                max_volumes: u8::MAX, // Max for u8 field per mpi2_ioc.h:265 (496 would overflow)
+                max_dev_handle: 0x7FFF,
+                max_persistent_entries: 256, // Truncated from 0x0258 to fit in u16
+                min_dev_handle: 0x0000,
+                reserved_4: 0x0000,
+                board_name: "Dell H200".to_string(), // Canned data for Tape Adapter per baseline.md
+                board_tracer: "00000001".to_string(), // 8-char trace number from baseline.md
+                nvdata_vendor_id: None, // Populated separately via Mfg Page 0 CONFIG read
+                nvdata_product_id: None,
+                nvdata_version: None,
+                firmware_product_id: None,
+            });
+        }
+
+        // Return canned IOC_FACTS data resembling the Tape Adapter per task spec
+        Ok(IocFactsReply {
+            msg_version: 0x01,                                             // MPI2_MSG_VERSION
+            msg_length: 96, // Total reply size in bytes
+            function: crate::mpi::messages::MpiFunction::IocFacts.as_u8(), // 0x03 per mpi2_ioc.h:191
+            header_version: 0x01,                                          // MPI2_HEADER_VERSION
+            ioc_number: 0x00,
+            msg_flags: 0x00,
+            vp_id: 0x00,
+            vf_id: 0x00,
+            reserved_1: 0x0000,
+            ioc_exceptions: 0x0000,
+            ioc_status: IocStatus::Success,
+            ioc_log_info: 0x00000000,
+            max_chain_depth: 0xFF,        // Max chain depth supported
+            who_init: 0x04,               // MPI2_WHOINIT_HOST_DRIVER
+            number_of_ports: 0x04,        // SAS2008 has 4 PHYs
+            max_msix_vectors: 0x01,       // MSI-X enabled
+            request_credit: 0x00FF,       // 255 credits
+            product_id: 0x0725,           // Product ID for SAS2008 IT firmware (per mpi2.h)
+            ioc_capabilities: 0x00000004, // MPI2_IOC_CAP_ENABLED_PERPHYS per mpi2_ioc.h
+            fw_version: 0x00080F07, // Version: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
+
+            ioc_request_frame_size: 0x0048, // 72 bytes per mpi-overview.md §9.1
+            ioc_max_chain_segment_size: 0xFFFF,
+            max_initiators: 0x0064,    // 100 initiators (MPI2_MAX_INITIATORS)
+            max_targets: 0x00FF,       // 255 targets (MPI2_MAX_TARGETS)
+            max_sas_expanders: 0x0064, // 100 expanders
+            max_enclosures: 0x0064,    // 100 enclosures
+            protocol_flags: 0x0000,    // No SR-IOV enabled
+            high_priority_credit: 0x00FF,
+            max_reply_descriptor_post_queue_depth: 0x0080, // 128 entries (MPI2_RDPQ_DEPTH_MAX)
+            reply_frame_size: 0x0040,                      // 64 bytes per mpi-overview.md §9.2
+            max_volumes: 240, // Max for u8 field per mpi2_ioc.h:265 (0x1F0 would overflow)
+            max_dev_handle: 0x7FFF,
+            max_persistent_entries: 256, // Truncated from 0x0258 to fit in u16
+            min_dev_handle: 0x0000,
+            reserved_4: 0x0000,
+            board_name: "Dell H200".to_string(), // Canned data for Tape Adapter per baseline.md:15
+            board_tracer: "00000001".to_string(), // 8-char trace number from baseline.md:15
+            nvdata_vendor_id: Some(0x1000),      // LSI vendor ID (per task spec)
+            nvdata_product_id: Some("LSI2008".to_string()), // Per task spec
+            nvdata_version: Some(0x00041003), // NVDATA version 3.16.4 (LE encoding: major=3, minor=16, build=4)
+
+            firmware_product_id: Some("InternalTapeAdp".to_string()), // From baseline.md:14
         })
     }
 

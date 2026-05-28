@@ -37,6 +37,24 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 - GitHub Actions CI: rustfmt + clippy + test (stable) + musl static binary,
   plus issue/PR templates and dependabot
 - Test count: 22 → 174 (Stage 1 → mid-Stage 3)
+- `src/mpi/messages.rs` — `IocFactsRequest` + `IocFactsReply` types with function code
+  `0x03` per mpi2_ioc.h:191; reply includes firmware version, NVDATA vendor/product ID,
+  board name (16B), board tracer (16B) — cites mpi2_ioc.h:231-281 for exact field layout
+- `src/mpi/session.rs` — `send_ioc_facts()` method on `IocBackend` trait with
+  `raw_ioc_facts()` helper in `Session`
+- `src/mpi/mock_ioc.rs` — `send_ioc_facts()` returns canned Tape Adapter data
+  (vendor=0x1000, product=`LSI2008`, fw_version=7.15.8.0, board=`Dell H200`) for
+  tests without real hardware
+- `src/mpi/real_ioc.rs` — `send_ioc_facts()` follows same doorbell-handshake pattern as
+  `send_ioc_init`; writes function code + size to DOORBELL register, sends request payload,
+  reads 96-byte reply (TODO: add IOC_DOORBELL_INT wait for real hardware bring-up)
+- `src/cli/detect.rs` — extended output with NVDATA Vendor/Product ID, Firmware Product ID,
+  NVDATA Version (distinct from FW version per baseline.md:15), Board Name, and Board Tracer;
+  graceful skip on MPI failure (no panic when card not initialized or hardware absent)
+- `src/cli/detect.rs` — JSON output (`--json`) includes all extended fields as optional keys
+- Manufacturing Page 0 fetch via CONFIG read (action=0x06 NVRAM copy, page type=0x09 Mfg, page=0);
+  parses NVDATA vendor ID at offset 0x08, product ID string at 0x0A, NVDATA version at 0x18,
+  firmware product ID at 0x28 per toolbox-and-config.md §5 and baseline.md:14-15
 
 ### Fixed
 - Flash orchestrator `step_backup` was unconditionally returning
