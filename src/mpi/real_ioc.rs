@@ -34,6 +34,8 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use crate::hw::{DmaBuffer, HwBackend};
 use crate::mpi::doorbell::MPI2_DOORBELL;
 use crate::mpi::messages::{
     ConfigReply, FwDownloadReply, FwUploadReply, IocFactsReply, IocInitReply, ToolboxReply,
@@ -73,6 +75,14 @@ pub struct RealIoc<P: Platform> {
     #[cfg(target_os = "linux")]
     pub bar1_mmap: Option<MmapRegion>,
 
+    /// Optional hardware backend (VFIO etc.). When set, BAR1 access and DMA
+    /// allocation go through here instead of the direct sysfs mmap path —
+    /// gets us out of having to unbind mpt3sas by hand, plus enables
+    /// alloc_dma for chip-readable buffers. Constructed via
+    /// `RealIoc::from_backend`.
+    #[cfg(target_os = "linux")]
+    pub hw_backend: Option<Box<dyn HwBackend>>,
+
     /// Current personality detected from chip (IT=0x13, IR=0x17).
     /// Populated by cycle 2b's `current_personality()` impl on first call.
     pub current_personality: Option<Personality>,
@@ -99,6 +109,7 @@ impl<P: Platform> RealIoc<P> {
             pci_bdf: bdf,
             bar1_path,
             bar1_mmap: Some(bar1_mmap),
+            hw_backend: None,
             current_personality: None,
         })
     }
@@ -111,6 +122,56 @@ impl<P: Platform> RealIoc<P> {
             "RealIoc::open requires Linux sysfs (bdf={})",
             pci_bdf.into()
         )))
+    }
+
+    /// Open RealIoc backed by an `HwBackend` (VFIO in production).
+    ///
+    /// This is the preferred constructor for ops that need DMA buffers
+    /// (FW_UPLOAD, FW_DOWNLOAD). The backend handles the driver bind dance
+    /// — no need for the operator to `lsirec unbind` first — and provides
+    /// chip-readable IOVAs for SGEs.
+    ///
+    /// BAR1 access goes through `backend.bar1()` instead of the direct
+    /// sysfs mmap. `bar1_mmap` is left `None`.
+    #[cfg(target_os = "linux")]
+    pub fn from_backend(platform: P, backend: Box<dyn HwBackend>) -> Result<Self, MpiError> {
+        let bdf = backend.bdf().to_string();
+        let bar1_path = PathBuf::from(format!("/sys/bus/pci/devices/{}/resource1", bdf));
+        Ok(Self {
+            platform,
+            pci_bdf: bdf,
+            bar1_path,
+            bar1_mmap: None,
+            hw_backend: Some(backend),
+            current_personality: None,
+        })
+    }
+
+    /// Allocate a chip-readable DMA buffer via the active HwBackend. Returns
+    /// `MpiError::Io` if no backend is attached (RealIoc opened via direct
+    /// sysfs mmap, or test-mode).
+    #[cfg(target_os = "linux")]
+    pub fn alloc_dma(&mut self, len: usize) -> Result<DmaBuffer, MpiError> {
+        let backend = self.hw_backend.as_mut().ok_or_else(|| {
+            MpiError::Io(
+                "alloc_dma requires HwBackend — use RealIoc::from_backend instead of ::open".into(),
+            )
+        })?;
+        backend
+            .alloc_dma(len)
+            .map_err(|e| MpiError::Io(format!("alloc_dma: {}", e)))
+    }
+
+    /// Release a DMA buffer previously returned by `alloc_dma`.
+    #[cfg(target_os = "linux")]
+    pub fn free_dma(&mut self, buf: DmaBuffer) -> Result<(), MpiError> {
+        let backend = self
+            .hw_backend
+            .as_mut()
+            .ok_or_else(|| MpiError::Io("free_dma: no HwBackend attached".into()))?;
+        backend
+            .free_dma(buf)
+            .map_err(|e| MpiError::Io(format!("free_dma: {}", e)))
     }
 
     /// Test-only constructor: builds a `RealIoc` with no live BAR1 mmap.
@@ -126,6 +187,8 @@ impl<P: Platform> RealIoc<P> {
             bar1_path,
             #[cfg(target_os = "linux")]
             bar1_mmap: None,
+            #[cfg(target_os = "linux")]
+            hw_backend: None,
             current_personality: None,
         }
     }
@@ -149,8 +212,14 @@ impl<P: Platform> RealIoc<P> {
     /// Read-only access to the BAR1 mmap region. Returns None if no live
     /// mapping (test mode or non-Linux). Cycle 2b's `IocBackend` impls use
     /// this to read chip registers (DOORBELL, DIAG, etc. per `doorbell.rs`).
+    ///
+    /// Prefers the HwBackend's BAR1 slice when one is attached; falls back
+    /// to the direct sysfs mmap.
     #[cfg(target_os = "linux")]
     pub fn bar1(&self) -> Option<&[u8]> {
+        // HwBackend's bar1() needs &mut self, so this read-only accessor
+        // can only see the legacy mmap. Callers needing read-only on a
+        // backend-attached RealIoc should use bar1_mut() and freeze it.
         self.bar1_mmap.as_ref().map(|m| m.as_slice())
     }
 
@@ -162,8 +231,14 @@ impl<P: Platform> RealIoc<P> {
 
     /// Mutable access to the BAR1 mmap. Required to write doorbell registers.
     /// Returns None if no live mapping (non-Linux or not initialized).
+    ///
+    /// Prefers the HwBackend's BAR1 slice when one is attached; falls back
+    /// to the direct sysfs mmap.
     #[cfg(target_os = "linux")]
     pub fn bar1_mut(&mut self) -> Option<&mut [u8]> {
+        if let Some(be) = self.hw_backend.as_mut() {
+            return Some(be.bar1());
+        }
         self.bar1_mmap.as_mut().map(|m| m.as_mut_slice())
     }
 
