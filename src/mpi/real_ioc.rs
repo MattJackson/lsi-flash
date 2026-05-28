@@ -461,13 +461,15 @@ impl<P: Platform> IocBackend for RealIoc<P> {
             return Err(MpiError::IocStatus(IocStatus::InvalidState));
         }
 
-        // Step 3: Serialize IOC_FACTS request to wire format (16 bytes header only)
-        // Cites: messages.rs:1087-1109 (IocFactsRequest::serialize_to)
+        // Step 3: Serialize IOC_FACTS request to wire format. MPI_IOC_FACTS_REQUEST
+        // per mpi2_ioc.h is 12 bytes (3 dwords) — Reserved/ChainOffset/Function/
+        // Reserved/Reserved/MsgFlags/VP_ID/VF_ID/Reserved. The freshman cycle
+        // claimed 16 bytes by mistake; caught on dev-1 today.
         let request_bytes = IocFactsRequest::serialize_to(2); // SMID=2 for this call
 
-        if request_bytes.len() < 16 {
+        if request_bytes.len() < 12 {
             return Err(MpiError::Io(format!(
-                "IOC_FACTS request too small: {} bytes, need at least 16",
+                "IOC_FACTS request too small: {} bytes, need at least 12",
                 request_bytes.len()
             )));
         }
