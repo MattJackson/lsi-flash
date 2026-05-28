@@ -172,13 +172,17 @@ mod tests {
 mod cross_cohort_tests {
     use super::*;
 
-    /// Path to a firmware fixture in the lsi-flash-notes sibling repo.
-    /// These files are NOT in the lsi-flash repo (we don't ship firmware in public code).
-    /// Tests gated by env var so they don't run in CI without the notes repo present.
+    /// Resolve a fixture file from the private notes repo, which is not
+    /// shipped here. `LSI_FLASH_FIXTURES` overrides the directory; otherwise
+    /// fall back to the maintainer's local path. Tests that depend on
+    /// fixtures call `load_fixture()` and skip cleanly when the file is
+    /// missing — CI runners and contributors without the notes repo see
+    /// passing-but-skipped tests rather than panics.
     fn fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from("/Users/mjackson/Developer/lsi-flash-notes")
-            .join("09-research-archive/upstream/lsi_sas_hba_crossflash_guide")
-            .join(name)
+        let base = std::env::var("LSI_FLASH_FIXTURES").unwrap_or_else(|_| {
+            "/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide".to_string()
+        });
+        std::path::PathBuf::from(base).join(name)
     }
 
     fn load_fixture(name: &str) -> Option<Vec<u8>> {

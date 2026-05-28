@@ -197,12 +197,15 @@ mod tests {
 
     #[test]
     fn test_parse_2118it_bin() {
-        // Fixture lives in the sibling lsi-flash-notes repo (not shipped here);
-        // skip cleanly when it isn't present (CI runners, contributors, etc.).
-        let fixture =
-            "/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide/2118it.bin";
-        let Ok(data) = std::fs::read(fixture) else {
-            eprintln!("skipping: fixture {fixture} not present");
+        // Fixture lives in the sibling lsi-flash-notes repo (not shipped here).
+        // LSI_FLASH_FIXTURES overrides the directory; otherwise fall back to
+        // the maintainer's local path. Skip cleanly when absent.
+        let base = std::env::var("LSI_FLASH_FIXTURES").unwrap_or_else(|_| {
+            "/Users/mjackson/Developer/lsi-flash-notes/09-research-archive/upstream/lsi_sas_hba_crossflash_guide".to_string()
+        });
+        let fixture = std::path::PathBuf::from(base).join("2118it.bin");
+        let Ok(data) = std::fs::read(&fixture) else {
+            eprintln!("skipping: fixture {} not present", fixture.display());
             return;
         };
         let header = parse_fw_header(&data).unwrap();
