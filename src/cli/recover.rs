@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::cli::backup::BackupManifest;
-use crate::mpi::messages::{ImageType, IocInitRequest, MpiError};
-use crate::mpi::mock_ioc::MockIoc;
-use crate::mpi::session::{Personality, Session};
+use crate::mpi::messages::MpiError;
 
 #[derive(Debug, Error)]
 pub enum RecoverError {
@@ -42,7 +40,13 @@ pub enum RecoverError {
     Declined,
 }
 
-pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error> {
+pub fn run(
+    backup_dir: String,
+    yes: bool,
+    json: bool,
+    pci: Option<String>,
+    dry_run: bool,
+) -> Result<(), crate::Error> {
     let dir = PathBuf::from(&backup_dir);
     if !dir.exists() {
         return Err(RecoverError::BackupDirNotFound(dir).into());
@@ -77,7 +81,7 @@ pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error
     }
 
     // 3. User confirmation (unless --yes)
-    if !yes {
+    if !yes && !dry_run {
         eprintln!(
             "About to restore {} artifacts from {} — proceed? [y/N]",
             manifest.artifacts.len(),
@@ -90,58 +94,94 @@ pub fn run(backup_dir: String, yes: bool, json: bool) -> Result<(), crate::Error
         }
     }
 
-    // 4. Build session (MockIoc default)
-    let mock_ioc = MockIoc::new(Personality::It);
-    let mut session = Session::new(mock_ioc);
-    let init_req = IocInitRequest {
-        who_init: 0x04,
-        host_msix_vectors: 0,
-        reply_descriptor_post_queue_depth: 16,
-        system_request_frame_base_address: 0,
-        reply_descriptor_post_queue_address: 0,
-    };
-    session.raw_ioc_init(&init_req)?;
-
-    // 5. For each artifact, read bytes + FW_DOWNLOAD via verified helper
-    let mut restored = Vec::new();
-    for artifact in &manifest.artifacts {
-        let path = dir.join(&artifact.path);
-        let bytes = std::fs::read(&path)?;
-
-        // Determine image type from manifest
-        let image_type = match artifact.image_type.as_str() {
-            "Fw" => ImageType::Fw,
-            "Bios" => ImageType::Bios,
-            "NvData" => ImageType::NvData,
-            _ => {
-                eprintln!(
-                    "Skipping unsupported image type: {} (only Fw/Bios/NvData supported)",
-                    artifact.image_type
-                );
-                continue;
+    // 4. Resolve bdf (mirror backup::run)
+    let bdf = match pci {
+        Some(b) => b,
+        None => {
+            // In dry-run mode without PCI specified, use a placeholder since we won't touch hardware
+            if dry_run {
+                "0000:00:00.0".to_string()
+            } else {
+                let devices = crate::pci::discover_sas2008_devices_linux().map_err(|e| {
+                    crate::Error::Other(format!("recover: failed to enumerate PCI devices: {}", e))
+                })?;
+                match devices.first() {
+                    Some(first) => first.bdf.clone(),
+                    None => {
+                        return Err(crate::Error::Other(
+                            "recover: no SAS2008 card found — specify --pci".to_string(),
+                        ))
+                    }
+                }
             }
-        };
+        }
+    };
 
-        // Rule 1: verify personality match before write via fw_download_verified helper
-        let target_personality = Personality::It; // Assume IT for now (matches backup default)
+    // 5. Dry-run path: print plan, touch no hardware
+    if dry_run {
+        let firmware_artifacts: Vec<_> = manifest
+            .artifacts
+            .iter()
+            .filter(|a| a.path == "firmware.bin" || a.path == "bios.rom")
+            .collect();
 
-        session.fw_download_verified(image_type, target_personality, &bytes)?;
-        restored.push(artifact.path.clone());
+        if json {
+            let output = serde_json::json!({
+                "status": "dry-run",
+                "regions_planned": firmware_artifacts.len(),
+                "regions": firmware_artifacts.iter().map(|a| serde_json::json!({
+                    "path": a.path,
+                    "size": a.size,
+                    "sha256": a.sha256
+                })).collect::<Vec<_>>(),
+                "source_dir": backup_dir,
+                "pci_bdf": bdf
+            });
+            println!("{}", serde_json::to_string(&output)?);
+        } else {
+            eprintln!(
+                "[dry-run] would restore {} regions from {} to {}:",
+                firmware_artifacts.len(),
+                backup_dir,
+                bdf
+            );
+            for artifact in &firmware_artifacts {
+                eprintln!(
+                    "  {} ({} bytes, sha256={})",
+                    artifact.path,
+                    artifact.size,
+                    &artifact.sha256[..16]
+                );
+            }
+            eprintln!("(nvdata.bin skipped: IT asymmetry per R0 doc)");
+        }
+        return Ok(());
     }
 
-    // 6. Output
+    // 6. Real path: dispatch through Card trait (same as backup)
+    let mut card = crate::card::discover_one(&bdf)
+        .map_err(|e| crate::Error::Other(format!("recover: discover_one({}): {}", bdf, e)))?;
+
+    let report = card
+        .restore(std::path::Path::new(&backup_dir))
+        .map_err(|e| crate::Error::Other(format!("recover: card.restore: {}", e)))?;
+
+    // 7. Output (honest about which regions were actually written)
     if json {
         let output = serde_json::json!({
             "status": "success",
-            "artifacts_restored": restored.len(),
-            "artifacts": restored,
+            "regions_restored": report.regions_written,
+            "regions": report.regions,
             "source_dir": backup_dir
         });
         println!("{}", serde_json::to_string(&output)?);
     } else {
-        println!("recovered {} artifacts from {}", restored.len(), backup_dir);
-        for r in &restored {
-            println!("  ✓ {}", r);
+        println!(
+            "restored {} regions from {}",
+            report.regions_written, backup_dir
+        );
+        for region in &report.regions {
+            println!("  ✓ {}", region);
         }
     }
 
@@ -158,7 +198,6 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::cli::backup::BackupArtifact;
-    use crate::mpi::messages::IocStatus;
     use tempfile::TempDir;
 
     fn create_test_backup(dir: &std::path::Path) -> BackupManifest {
@@ -204,7 +243,13 @@ mod tests {
 
     #[test]
     fn recover_refuses_missing_backup_dir() {
-        let result = run("/nonexistent/path/foo".to_string(), true, false);
+        let result = run(
+            "/nonexistent/path/foo".to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::BackupDirNotFound(_)))
@@ -214,7 +259,13 @@ mod tests {
     #[test]
     fn recover_refuses_missing_manifest() {
         let tmp = TempDir::new().unwrap();
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::ManifestNotFound(_)))
@@ -231,7 +282,13 @@ mod tests {
         data[0] ^= 0xFF;
         std::fs::write(tmp.path().join("firmware.bin"), &data).unwrap();
 
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::Sha256Mismatch { .. }))
@@ -246,40 +303,16 @@ mod tests {
         // Delete firmware.bin but leave manifest
         std::fs::remove_file(tmp.path().join("firmware.bin")).unwrap();
 
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::ArtifactMissing(_)))
-        ));
-    }
-
-    #[test]
-    fn recover_propagates_iocstatus_failure() {
-        let tmp = TempDir::new().unwrap();
-        create_test_backup(tmp.path());
-
-        // Create a mock with failure injection
-        let mut mock_ioc = MockIoc::new(Personality::It);
-        mock_ioc.inject.next_fw_download_error = Some(IocStatus::InternalError);
-
-        let _manifest_str = std::fs::read_to_string(tmp.path().join("manifest.toml")).unwrap();
-        let mut session = Session::new(mock_ioc);
-        let init_req = IocInitRequest {
-            who_init: 0x04,
-            host_msix_vectors: 0,
-            reply_descriptor_post_queue_depth: 16,
-            system_request_frame_base_address: 0,
-            reply_descriptor_post_queue_address: 0,
-        };
-        session.raw_ioc_init(&init_req).unwrap();
-
-        // Manually test the download path with injected failure
-        let bytes = std::fs::read(tmp.path().join("firmware.bin")).unwrap();
-        let result = session.fw_download_verified(ImageType::Fw, Personality::It, &bytes);
-
-        assert!(matches!(
-            result,
-            Err(MpiError::IocStatus(IocStatus::InternalError))
         ));
     }
 
@@ -288,20 +321,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_test_backup(tmp.path());
 
-        // Create a fresh session for this test
-        let mock_ioc = MockIoc::new(Personality::It);
-        let mut session = Session::new(mock_ioc);
-        let init_req = IocInitRequest {
-            who_init: 0x04,
-            host_msix_vectors: 0,
-            reply_descriptor_post_queue_depth: 16,
-            system_request_frame_base_address: 0,
-            reply_descriptor_post_queue_address: 0,
-        };
-        session.raw_ioc_init(&init_req).unwrap();
-
         // This should not panic or block on stdin when yes=true
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
 
         // Should succeed (or at least not fail with Declined)
         assert!(!matches!(
@@ -321,12 +348,52 @@ mod tests {
         std::fs::write(tmp.path().join("bios.rom"), &data).unwrap();
 
         // Should fail on bios validation before any download happens
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, false);
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            false,
+        );
 
         assert!(matches!(
             result,
             Err(crate::Error::Recover(RecoverError::Sha256Mismatch { .. }))
         ));
+    }
+
+    #[test]
+    fn recover_dry_run_touches_no_hardware() {
+        let tmp = TempDir::new().unwrap();
+        create_test_backup(tmp.path());
+
+        // Dry-run with valid backup should succeed without calling discover_one
+        // (which would fail without hardware)
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            false,
+            None,
+            true,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn recover_dry_run_json_output() {
+        let tmp = TempDir::new().unwrap();
+        create_test_backup(tmp.path());
+
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            true,
+            None,
+            true,
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -343,19 +410,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         create_test_backup(tmp.path());
 
-        // Create a fresh session for this test
-        let mock_ioc = MockIoc::new(Personality::It);
-        let mut session = Session::new(mock_ioc);
-        let init_req = IocInitRequest {
-            who_init: 0x04,
-            host_msix_vectors: 0,
-            reply_descriptor_post_queue_depth: 16,
-            system_request_frame_base_address: 0,
-            reply_descriptor_post_queue_address: 0,
-        };
-        session.raw_ioc_init(&init_req).unwrap();
-
-        let result = run(tmp.path().to_str().unwrap().to_string(), true, true);
+        // Use dry_run since we don't have hardware in test environment
+        let result = run(
+            tmp.path().to_str().unwrap().to_string(),
+            true,
+            true,
+            None,
+            true,
+        );
 
         // Should succeed with JSON output (no panic)
         assert!(result.is_ok());

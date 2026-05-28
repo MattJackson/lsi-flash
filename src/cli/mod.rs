@@ -102,6 +102,10 @@ pub enum Command {
         /// Skip interactive confirmations.
         #[arg(long)]
         yes: bool,
+
+        /// Show what would happen; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// SBR (Subsystem Boot Record) operations. Per ADR-014.
@@ -179,7 +183,11 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             wipe_mfg_pages,
             cli.json,
         ),
-        Command::Recover { backup_dir, yes } => recover::run(backup_dir, yes, cli.json),
+        Command::Recover {
+            backup_dir,
+            yes,
+            dry_run,
+        } => recover::run(backup_dir, yes, cli.json, cli.pci.clone(), dry_run),
         Command::Sbr { sub } => sbr::run(sub),
         Command::Firmware { sub } => match sub {
             FirmwareCommand::ReversePhy { input, output } => {

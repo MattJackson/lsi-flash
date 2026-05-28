@@ -171,3 +171,13 @@ companion `lsi-flash-firmware` repo and (privately) `lsi-flash-notes`.
 
 The first tagged release will be v0.1.0 once Stage 2 closes (`sbr` hardware-bound
 verbs land + `detect` extended fields surface what `sas2flash -list` does).
+
+## Unreleased (Cycle R2)
+
+### Recover
+- Rewire `recover` to dispatch through `MptCard::restore()` on real hardware via the `Card` trait.
+  - Added `--dry-run` flag to `Recover` subcommand; dry-run prints restore plan without touching hardware.
+  - Removed MockIoc/Session write path; recover now uses `crate::card::discover_one(&bdf)` + `card.restore()`.
+  - Up-front SHA256 validation of all artifacts preserved (Rule 5), but actual writes go through MptCard.
+- Output now honest about regions written: FW + BIOS only (nvdata skipped per IT asymmetry).
+- Tests updated: dry-run test verifies no hardware is touched; validation tests still cover pre-write gates.
