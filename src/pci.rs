@@ -121,7 +121,7 @@ impl MockPlatform {
         let bdf_path = PathBuf::from(bdf);
         self.dirs
             .entry(PathBuf::from("/sys/bus/pci/devices"))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(bdf_path);
     }
 }
@@ -321,7 +321,7 @@ impl PciHandle {
         let unbind_path = format!("/sys/bus/pci/devices/{}/driver/unbind", self.device.bdf);
 
         match plat.write(
-            &PathBuf::from(&unbind_path).as_path(),
+            PathBuf::from(&unbind_path).as_path(),
             self.device.bdf.as_bytes(),
         ) {
             Ok(_) => {

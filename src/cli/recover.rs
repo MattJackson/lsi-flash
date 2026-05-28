@@ -262,7 +262,7 @@ mod tests {
         let mut mock_ioc = MockIoc::new(Personality::It);
         mock_ioc.inject.next_fw_download_error = Some(IocStatus::InternalError);
 
-        let manifest_str = std::fs::read_to_string(tmp.path().join("manifest.toml")).unwrap();
+        let _manifest_str = std::fs::read_to_string(tmp.path().join("manifest.toml")).unwrap();
         let mut session = Session::new(mock_ioc);
         let init_req = IocInitRequest {
             who_init: 0x04,

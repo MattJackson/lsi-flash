@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn build_rejects_invalid_template_size() {
-        assert!(build_sbr(&vec![0u8; 100], &lsi_id()).is_err());
+        assert!(build_sbr(&[0u8; 100], &lsi_id()).is_err());
     }
 
     #[test]

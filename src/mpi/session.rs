@@ -7,7 +7,7 @@ use crate::mpi::messages::{
 use crate::mpi::messages::{
     ConfigRequest, FwDownloadRequest, FwUploadRequest, IocInitRequest, ToolboxCleanRequest,
 };
-use crate::mpi::messages::{ImageType, IocStatus, MpiError};
+use crate::mpi::messages::{ImageType, MpiError};
 
 /// Personality of the running MPT firmware. Per ADR-015 Rule 1, the
 /// chip's CURRENTLY RUNNING firmware MUST match the personality of
@@ -74,16 +74,16 @@ impl PersonalityMatched {
 /// - `MockIoc` (test + `--dry-run` backend) — see `mock_ioc.rs`
 /// - `RealIoc` (production; needs real BAR1) — future cycle, hardware-gated
 pub trait IocBackend {
-    fn send_fw_download<'a>(
+    fn send_fw_download(
         &mut self,
-        req: &FwDownloadRequest<'a>,
+        req: &FwDownloadRequest<'_>,
     ) -> Result<FwDownloadReply, MpiError>;
     fn send_fw_upload<'a>(
         &mut self,
         req: &'a mut FwUploadRequest<'a>,
     ) -> Result<FwUploadReply, MpiError>;
     fn send_toolbox_clean(&mut self, req: &ToolboxCleanRequest) -> Result<ToolboxReply, MpiError>;
-    fn send_config<'a>(&mut self, req: &ConfigRequest<'a>) -> Result<ConfigReply, MpiError>;
+    fn send_config(&mut self, req: &ConfigRequest<'_>) -> Result<ConfigReply, MpiError>;
     fn send_ioc_init(&mut self, req: &IocInitRequest) -> Result<IocInitReply, MpiError>;
     fn current_personality(&self) -> Result<Personality, MpiError>;
 }
@@ -240,6 +240,7 @@ impl<B: IocBackend> Session<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mpi::messages::IocStatus;
     use crate::mpi::mock_ioc::MockIoc;
 
     #[test]

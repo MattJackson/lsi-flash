@@ -83,6 +83,12 @@ impl From<&str> for Quirk {
 
 /// One card identity. Fields mirror the TOML schema in
 /// `resources/card-database.toml`.
+///
+/// Several fields below are not yet consumed by any code path (Stage 2 detect
+/// surfaces the IDs and personality; Stage 3 flash will read the rest). They
+/// are populated by the TOML loader and exposed publicly so downstream verbs
+/// can pick them up without round-tripping through serde again.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CardInfo {
     /// Stable slug (TOML table key, e.g. `dell-h200-adapter`).
@@ -193,6 +199,10 @@ pub fn load_embedded() -> Result<Vec<CardInfo>, CardDatabaseError> {
 
 /// Load with user-override fallback. If `override_path` exists, parse it
 /// instead of the embedded database. Per ADR-014 §3.
+///
+/// Not wired in yet — Stage 2 `detect` uses the embedded `load()` only.
+/// Kept exported so the override path is ready for Stage 3 `flash`.
+#[allow(dead_code)]
 pub fn load_with_fallback(
     override_path: Option<&std::path::Path>,
 ) -> Result<Vec<CardInfo>, CardDatabaseError> {

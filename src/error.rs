@@ -58,6 +58,9 @@ pub enum MpiRegisterError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Used by future RealIoc / BAR1 mmap callers once they propagate
+    /// register-layer errors up through the IocBackend trait.
+    #[allow(dead_code)]
     #[error("Invalid BAR1 mapping size (expected 4096 bytes)")]
     InvalidBarSize,
 }

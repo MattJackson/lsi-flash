@@ -215,7 +215,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("backup-test");
 
-        let session = setup_mock_with_data();
+        let _session = setup_mock_with_data();
 
         // Run backup logic inline since run() is not exposed for test
         ensure_dir_empty(&out).unwrap();

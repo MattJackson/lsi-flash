@@ -114,6 +114,13 @@ pub enum Phase {
 }
 
 /// The orchestrator driver. Generic over any IocBackend implementation.
+///
+/// `identity` and `keep_sas_address` aren't consumed yet — they flow in
+/// through `new()` and will be picked up once the OEM-identity rewrite
+/// path (cli/flash.rs step_synthesize) and the WWN-preservation path
+/// (step_sbr_write) are wired in. Both are valid `--identity` /
+/// `--keep-sas-address` CLI flags today.
+#[allow(dead_code)]
 pub struct Orchestrator<B: IocBackend> {
     session: Session<B>,
     mode: Mode,

@@ -65,6 +65,12 @@ pub(crate) fn write32(bar1: &mut [u8], offset: u32, data: u32) {
     unsafe { std::ptr::write_volatile(ptr, data) }
 }
 
+// chip_*/dcr_* helpers below mirror lsirec.c's indirect register access
+// path. Not used yet — preserved for the upcoming HCB hostboot path
+// (cycle 3+) which needs DIAG_RW + DCR indirect reads/writes to drive
+// the chip during boot. Allow dead_code until the orchestrator picks
+// them up; do NOT delete (every line cites lsirec.c verbatim).
+#[allow(dead_code)]
 /// Chip-indirect read via DIAG_RW registers. Cites lsirec.c:99-104.
 #[inline]
 fn chip_read32(
@@ -80,6 +86,7 @@ fn chip_read32(
     read32(&bar1_mut, r_rw_data)
 }
 
+#[allow(dead_code)]
 /// Chip-indirect write via DIAG_RW registers. Cites lsirec.c:106-111.
 #[inline]
 fn chip_write32(
@@ -95,6 +102,7 @@ fn chip_write32(
     write32(bar1, r_rw_data, data);
 }
 
+#[allow(dead_code)]
 /// DCR-indirect read. Cites lsirec.c:113-117.
 #[inline]
 fn dcr_read32(bar1: &mut [u8], dcr_address: u32, dcr_data: u32, offset: u32) -> u32 {
@@ -102,6 +110,7 @@ fn dcr_read32(bar1: &mut [u8], dcr_address: u32, dcr_data: u32, offset: u32) -> 
     read32(bar1, dcr_data)
 }
 
+#[allow(dead_code)]
 /// DCR-indirect write. Cites lsirec.c:119-123.
 #[inline]
 fn dcr_write32(bar1: &mut [u8], dcr_address: u32, dcr_data: u32, offset: u32, data: u32) {

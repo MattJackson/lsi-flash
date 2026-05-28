@@ -582,13 +582,11 @@ mod tests {
     #[test]
     fn check_all_returns_multiple_concerns_when_present() {
         // Verify that multiple concerns can be returned (structure test)
-        let mut concerns = Vec::new();
-
-        concerns.push(SafetyConcern::MountedFilesystem {
+        let mut concerns = vec![SafetyConcern::MountedFilesystem {
             device: "/dev/sdb1".into(),
             mountpoint: "/mnt/data".into(),
             fstype: "ext4".into(),
-        });
+        }];
 
         concerns.push(SafetyConcern::LvmPhysicalVolume {
             device: "/dev/sdc".into(),

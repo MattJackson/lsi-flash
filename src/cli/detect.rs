@@ -11,7 +11,7 @@ pub fn run(json: bool) -> Result<(), crate::Error> {
         .map_err(|e| crate::Error::Other(format!("PCI discovery failed: {}", e)))?;
 
     if json {
-        return print_json(&devices).map_err(|e| crate::Error::Io(e));
+        return print_json(&devices).map_err(crate::Error::Io);
     }
 
     print_human_readable(&devices)?;

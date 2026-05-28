@@ -318,8 +318,8 @@ pub fn i2c_read_sbr(ctx: &mut I2cContext, offset: usize, len: usize) -> Result<V
     }
 
     // Read bytes. Cites lsirec.c:578-586.
-    for i in 0..len {
-        buf[i] = i2c_getbyte(&mut ctx.bar1);
+    for (i, slot) in buf.iter_mut().enumerate().take(len) {
+        *slot = i2c_getbyte(&mut ctx.bar1);
         i2c_sendbit(&mut ctx.bar1, i == len - 1); // NACK on last byte
     }
 

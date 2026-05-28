@@ -27,3 +27,11 @@ tempfile = "3"
 lto = true
 codegen-units = 1
 strip = true
+
+# HBA / IMR / RAID / NVData / DMA / etc. are domain terms across MPI 2.0,
+# Broadcom datasheets, and Linux kernel headers — keeping them uppercase
+# matches the references. Orchestrator state functions in cli/flash.rs
+# legitimately take many parameters (phase + safety guards + flags).
+[lints.clippy]
+upper_case_acronyms = "allow"
+too_many_arguments = "allow"
