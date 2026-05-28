@@ -51,6 +51,195 @@ pub const MR_DIAG_RW_ADDRESS_HIGH: u32 = 0x2c;
 pub const MPI2_DCR_DATA: u32 = 0x38;
 pub const MPI2_DCR_ADDRESS: u32 = 0x3c;
 
+// HOST_INTERRUPT_STATUS register and bit definitions.
+// Cites: references/upstream/lsiutil/lsi/mpi2.h:236-242
+pub const MPI2_HISTATUS: u32 = 0x30;
+
+/// Set by the IOC when it has posted a reply dword to DOORBELL — host polls
+/// this to know a reply word is available to read. Cites mpi2.h:241-242.
+pub const MPI2_HIS_IOC2SYS_DB_STATUS: u32 = 0x00000001;
+
+/// Set while the host's doorbell write is still being processed by the IOC —
+/// host polls for this to CLEAR before sending the next dword. Cites mpi2.h:237-238.
+pub const MPI2_HIS_SYS2IOC_DB_STATUS: u32 = 0x80000000;
+
+/// DOORBELL register bit indicating a handshake is already in progress.
+/// Host must NOT initiate a new handshake while this is set. Cites mpi2.h:181.
+pub const MPI2_DOORBELL_USED: u32 = 0x08000000;
+
+/// MPI2 doorbell function code shift — bits 24-31 of the doorbell register
+/// hold the function code; bits 16-23 hold (dword_count - 2). Cites
+/// mpi2.h:178-193 + lsiutil/mpt.c:819-820.
+pub const MPI2_DOORBELL_FUNCTION_SHIFT: u32 = 24;
+pub const MPI2_DOORBELL_ADD_DWORDS_SHIFT: u32 = 16;
+
+/// Poll-spin until `HISTATUS & MPI2_HIS_IOC2SYS_DB_STATUS != 0` (IOC has
+/// posted a reply word). Returns timeout error if the deadline elapses.
+/// Cites lsiutil/mpt.c:691-733 (mpt_wait_for_doorbell).
+pub(crate) fn wait_doorbell_int(
+    bar1: &[u8],
+    timeout: std::time::Duration,
+) -> Result<(), &'static str> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let histatus = read32(bar1, MPI2_HISTATUS);
+        if histatus & MPI2_HIS_IOC2SYS_DB_STATUS != 0 {
+            return Ok(());
+        }
+        // Check for IOC fault between polls so we bail fast on a wedged chip.
+        let doorbell = read32(bar1, MPI2_DOORBELL);
+        if doorbell & MPI2_DOORBELL_STATE_MASK == MPI2_DOORBELL_FAULT {
+            return Err("wait_doorbell_int: IOC fault");
+        }
+        std::thread::sleep(std::time::Duration::from_micros(5));
+    }
+    Err("wait_doorbell_int: timeout")
+}
+
+/// Poll-spin until `HISTATUS & MPI2_HIS_SYS2IOC_DB_STATUS == 0` (IOC has
+/// consumed the previous host-side doorbell write). Required between every
+/// dword we write to DOORBELL during a send. Cites lsiutil/mpt.c:736-777
+/// (mpt_wait_for_response).
+pub(crate) fn wait_doorbell_consumed(
+    bar1: &[u8],
+    timeout: std::time::Duration,
+) -> Result<(), &'static str> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let histatus = read32(bar1, MPI2_HISTATUS);
+        if histatus & MPI2_HIS_SYS2IOC_DB_STATUS == 0 {
+            return Ok(());
+        }
+        let doorbell = read32(bar1, MPI2_DOORBELL);
+        if doorbell & MPI2_DOORBELL_STATE_MASK == MPI2_DOORBELL_FAULT {
+            return Err("wait_doorbell_consumed: IOC fault");
+        }
+        std::thread::sleep(std::time::Duration::from_micros(5));
+    }
+    Err("wait_doorbell_consumed: timeout")
+}
+
+/// Acknowledge a doorbell event by clearing HISTATUS (write 0). The IOC
+/// uses this as a signal that the host has consumed the posted word and is
+/// ready for the next one. Cites lsiutil/mpt.c:818,823,858,862.
+#[inline]
+pub(crate) fn clear_histatus(bar1: &mut [u8]) {
+    write32(bar1, MPI2_HISTATUS, 0);
+}
+
+/// Full doorbell handshake send: write function-code header, then each
+/// request dword with proper IOC sync between every step. Cites the
+/// canonical pattern at lsiutil/mpt.c:781-834.
+///
+/// `request` is the wire-format request body (header included). Must be
+/// dword-aligned (`request.len() % 4 == 0`); caller is responsible for
+/// padding.
+///
+/// `function` is the MPI function code byte (e.g. 0x03 for IOC_FACTS).
+///
+/// Returns the negotiated doorbell — DOORBELL_USED check passes, function +
+/// dword-count is written and ACK'd, payload dwords are streamed with
+/// per-dword ack. Subsequent caller invokes `doorbell_handshake_recv` to
+/// fetch the reply.
+pub(crate) fn doorbell_handshake_send(
+    bar1: &mut [u8],
+    function: u8,
+    request: &[u8],
+    timeout: std::time::Duration,
+) -> Result<(), &'static str> {
+    if request.len() % 4 != 0 {
+        return Err("doorbell_handshake_send: request not dword-aligned");
+    }
+    let dword_count = request.len() / 4;
+    if dword_count < 2 {
+        return Err("doorbell_handshake_send: request too small (< 2 dwords)");
+    }
+
+    // Step 1: refuse to start if a previous handshake is still active.
+    let doorbell = read32(bar1, MPI2_DOORBELL);
+    if doorbell & MPI2_DOORBELL_USED != 0 {
+        return Err("doorbell_handshake_send: doorbell already in use");
+    }
+    if doorbell & MPI2_DOORBELL_STATE_MASK == MPI2_DOORBELL_FAULT {
+        return Err("doorbell_handshake_send: IOC fault before send");
+    }
+
+    // Step 2: clear stale HISTATUS, kick the handshake with function-code header.
+    // Per mpi2.h:178-193 / mpt.c:819-820 the header dword encodes function in bits
+    // 24-31 and (dword_count - 2) in bits 16-23. The "-2" is the MPI 2.0 quirk
+    // where the chip subtracts the 2-dword header that's always present.
+    clear_histatus(bar1);
+    let header = (u32::from(function) << MPI2_DOORBELL_FUNCTION_SHIFT)
+        | ((dword_count as u32 - 2) << MPI2_DOORBELL_ADD_DWORDS_SHIFT);
+    write32(bar1, MPI2_DOORBELL, header);
+
+    // Step 3: wait for IOC to ack the header (DOORBELL_INT set).
+    wait_doorbell_int(bar1, timeout)?;
+    clear_histatus(bar1);
+
+    // Step 4: wait for IOC's busy bit to clear so we can post the first payload dword.
+    wait_doorbell_consumed(bar1, timeout)?;
+
+    // Step 5: stream each request dword with per-dword sync.
+    for chunk_start in (0..request.len()).step_by(4) {
+        let dword = u32::from_le_bytes([
+            request[chunk_start],
+            request[chunk_start + 1],
+            request[chunk_start + 2],
+            request[chunk_start + 3],
+        ]);
+        write32(bar1, MPI2_DOORBELL, dword);
+        wait_doorbell_consumed(bar1, timeout)?;
+    }
+
+    Ok(())
+}
+
+/// Full doorbell handshake receive: read MPI reply via DOORBELL register
+/// 16 bits at a time, per lsiutil/mpt.c:837-872 (mpt_receive_data). The IOC
+/// dynamically tells us how long the reply is via MsgLength in the 2nd U16
+/// of the reply, so we ignore `max_bytes` past that and only read what the
+/// chip actually sends.
+///
+/// Returns the reply bytes (length determined by MsgLength * 4).
+pub(crate) fn doorbell_handshake_recv(
+    bar1: &mut [u8],
+    max_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, &'static str> {
+    // Per mpt.c the reply is read U16 at a time from the low 16 bits of DOORBELL.
+    // Start by assuming 4 bytes (2 U16 words) until we learn the actual MsgLength.
+    let mut real_length_bytes: usize = 4;
+    let mut out = Vec::with_capacity(max_bytes);
+    let mut i = 0usize;
+    while i < real_length_bytes / 2 {
+        wait_doorbell_int(bar1, timeout)?;
+        let value = (read32(bar1, MPI2_DOORBELL) & 0xFFFF) as u16;
+        if i == 1 {
+            // Per mpt.c:855 — MsgLength is in the upper byte of the 2nd U16,
+            // expressed in dwords. The lower byte holds Function (already
+            // validated by the caller). real_length = MsgLength_in_dwords * 4.
+            // (mpt.c uses `value & ~0xff00`; we mirror that exactly.)
+            real_length_bytes = ((value & !0xff00) as usize) * 4;
+            if real_length_bytes < 4 {
+                return Err("doorbell_handshake_recv: chip reported zero-length reply");
+            }
+        }
+        // Store as little-endian bytes — caller's parse() expects raw wire bytes.
+        if (i * 2) + 2 <= max_bytes {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        clear_histatus(bar1);
+        i += 1;
+    }
+
+    // Final wait + ACK so the chip knows we consumed the last word.
+    wait_doorbell_int(bar1, timeout)?;
+    clear_histatus(bar1);
+
+    Ok(out)
+}
+
 /// Read 32-bit value from BAR1 offset with volatile semantics. Cites lsirec.c:89-92.
 #[inline]
 pub(crate) fn read32(bar1: &[u8], offset: u32) -> u32 {
