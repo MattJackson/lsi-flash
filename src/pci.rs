@@ -116,7 +116,9 @@ impl MockPlatform {
             &format!("{base}/subsystem_device"),
             &format!("0x{:04x}", ssdid),
         );
-        self.add_file(&format!("{base}/class"), &format!("{:06x}", class));
+        // Match real sysfs: "0x010700\n" — without the "0x" prefix, the
+        // discovery path used to swallow the error and report 0 cards.
+        self.add_file(&format!("{base}/class"), &format!("0x{:06x}", class));
 
         let bdf_path = PathBuf::from(bdf);
         self.dirs
@@ -189,9 +191,12 @@ impl PciDevice {
         let ssid_did_str = plat.read_to_string(&base.join("subsystem_device"))?;
         let ssid_did = u16::from_str_radix(ssid_did_str.trim().trim_start_matches("0x"), 16)?;
 
-        // Read class code (lsirec.c:205 pattern)
+        // Read class code (lsirec.c:205 pattern). Real sysfs writes "0x010700\n";
+        // MockPlatform now matches that format. Without trim_start_matches("0x"),
+        // u32::from_str_radix fails silently and the whole device is dropped from
+        // discovery (caught 2026-05-28 on dev-1 — detect returned 0 cards).
         let class_str = plat.read_to_string(&base.join("class"))?;
-        let class_code = u32::from_str_radix(class_str.trim(), 16)?;
+        let class_code = u32::from_str_radix(class_str.trim().trim_start_matches("0x"), 16)?;
 
         Ok(Self {
             bdf: bdf.to_string(),
