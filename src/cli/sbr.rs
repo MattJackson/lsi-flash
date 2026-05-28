@@ -484,7 +484,7 @@ mod tests {
         for &b in &canned_sbr[0..75] {
             mfg_sum += b as u16;
         }
-        let checksum = (0x5b as u16).wrapping_sub(mfg_sum) & 0xff;
+        let checksum = 0x5b_u16.wrapping_sub(mfg_sum) & 0xff;
         canned_sbr[75] = checksum as u8;
 
         // Duplicate MFG block at offset 0x4C-0x97
@@ -494,11 +494,11 @@ mod tests {
         }
 
         // Compute duplicate checksum
-        let mut dup_sum: u16 = 0;
-        for i in mid_point..(mid_point + 75) {
-            dup_sum += canned_sbr[i] as u16;
-        }
-        canned_sbr[mid_point + 75] = ((0x5b as u16).wrapping_sub(dup_sum) & 0xff) as u8;
+        let dup_sum: u16 = canned_sbr[mid_point..mid_point + 75]
+            .iter()
+            .map(|&b| b as u16)
+            .sum();
+        canned_sbr[mid_point + 75] = (0x5b_u16.wrapping_sub(dup_sum) & 0xff) as u8;
 
         // Verify the parsing works with canned data
         let parsed = crate::sbr::parse::parse_sbr(&canned_sbr).unwrap();
@@ -513,7 +513,7 @@ mod tests {
 
         // Verify SHA256 computation
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&canned_sbr);
+        hasher.update(canned_sbr);
         let sha256_hex = format!("{:x}", hasher.finalize());
         assert_eq!(sha256_hex.len(), 64);
     }
@@ -543,28 +543,25 @@ mod tests {
         for &b in &canned_sbr[0..75] {
             mfg_sum += b as u16;
         }
-        canned_sbr[75] = ((0x5b as u16).wrapping_sub(mfg_sum) & 0xff) as u8;
+        canned_sbr[75] = (0x5b_u16.wrapping_sub(mfg_sum) & 0xff) as u8;
 
         let mid_point = 0x4c;
         for i in 0..mid_point {
             canned_sbr[mid_point + i] = canned_sbr[i];
         }
-        let mut dup_sum: u16 = 0;
-        for i in mid_point..(mid_point + 75) {
-            dup_sum += canned_sbr[i] as u16;
-        }
-        canned_sbr[mid_point + 75] = ((0x5b as u16).wrapping_sub(dup_sum) & 0xff) as u8;
+        let dup_sum: u16 = canned_sbr[mid_point..mid_point + 75]
+            .iter()
+            .map(|&b| b as u16)
+            .sum();
+        canned_sbr[mid_point + 75] = (0x5b_u16.wrapping_sub(dup_sum) & 0xff) as u8;
 
         // Add SAS address at offset 0xD8-0xDF (big-endian)
         let sas_addr: u64 = 0x0014380b00000001;
         canned_sbr[216..224].copy_from_slice(&sas_addr.to_be_bytes());
 
         // WWID checksum at offset 0xEF
-        let mut wwid_sum: u16 = 0;
-        for i in 216..239 {
-            wwid_sum += canned_sbr[i] as u16;
-        }
-        canned_sbr[239] = ((0x5b as u16).wrapping_sub(wwid_sum) & 0xff) as u8;
+        let wwid_sum: u16 = canned_sbr[216..239].iter().map(|&b| b as u16).sum();
+        canned_sbr[239] = (0x5b_u16.wrapping_sub(wwid_sum) & 0xff) as u8;
 
         // Parse and verify JSON round-trip
         let parsed = crate::sbr::parse::parse_sbr(&canned_sbr).unwrap();
