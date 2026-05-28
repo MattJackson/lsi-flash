@@ -24,14 +24,23 @@ use std::path::PathBuf;
 // VFIO_TYPE is ';' (0x3B), VFIO_BASE is 100. The kernel _IO(type, nr) macro
 // expands to `(type << 8) | nr` for the no-data-transfer ioctls used here.
 // Pre-computed at compile time since these never change.
-const VFIO_GET_API_VERSION: libc::c_ulong = 0x3B64;
+//
+// Note: libc::ioctl's request type differs per libc — glibc takes c_ulong,
+// musl takes c_int. Alias keeps the constants and wrappers portable so the
+// musl static-binary CI build doesn't fail.
+#[cfg(target_env = "musl")]
+type IoctlReq = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlReq = libc::c_ulong;
+
+const VFIO_GET_API_VERSION: IoctlReq = 0x3B64;
 #[allow(dead_code)]
-const VFIO_CHECK_EXTENSION: libc::c_ulong = 0x3B65;
-const VFIO_SET_IOMMU: libc::c_ulong = 0x3B66;
-const VFIO_GROUP_GET_STATUS: libc::c_ulong = 0x3B67;
-const VFIO_GROUP_SET_CONTAINER: libc::c_ulong = 0x3B68;
-const VFIO_GROUP_GET_DEVICE_FD: libc::c_ulong = 0x3B6A;
-const VFIO_DEVICE_GET_REGION_INFO: libc::c_ulong = 0x3B6C;
+const VFIO_CHECK_EXTENSION: IoctlReq = 0x3B65;
+const VFIO_SET_IOMMU: IoctlReq = 0x3B66;
+const VFIO_GROUP_GET_STATUS: IoctlReq = 0x3B67;
+const VFIO_GROUP_SET_CONTAINER: IoctlReq = 0x3B68;
+const VFIO_GROUP_GET_DEVICE_FD: IoctlReq = 0x3B6A;
+const VFIO_DEVICE_GET_REGION_INFO: IoctlReq = 0x3B6C;
 
 const VFIO_API_VERSION: i32 = 0;
 const VFIO_TYPE1_IOMMU: i32 = 1;
@@ -157,10 +166,10 @@ impl VfioBackend {
 
         // 9. set IOMMU type on the container. noiommu-mode container accepts
         //    only VFIO_NOIOMMU_IOMMU; real-IOMMU container accepts VFIO_TYPE1.
-        let iommu_type: libc::c_ulong = if is_noiommu_mode() {
-            VFIO_NOIOMMU_IOMMU as libc::c_ulong
+        let iommu_type: IoctlReq = if is_noiommu_mode() {
+            VFIO_NOIOMMU_IOMMU as IoctlReq
         } else {
-            VFIO_TYPE1_IOMMU as libc::c_ulong
+            VFIO_TYPE1_IOMMU as IoctlReq
         };
         ioctl_value(container_fd.as_raw_fd(), VFIO_SET_IOMMU, iommu_type)
             .map_err(|e| HwError::Preflight(format!("VFIO_SET_IOMMU: {}", e)))?;
@@ -407,7 +416,7 @@ fn restore_driver(bdf: &str, original: Option<&str>) -> Result<(), HwError> {
 
 // === thin ioctl wrappers (libc binding is verbose) =========================
 
-fn ioctl_get(fd: RawFd, request: libc::c_ulong) -> std::io::Result<i32> {
+fn ioctl_get(fd: RawFd, request: IoctlReq) -> std::io::Result<i32> {
     let rc = unsafe { libc::ioctl(fd, request) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
@@ -416,7 +425,7 @@ fn ioctl_get(fd: RawFd, request: libc::c_ulong) -> std::io::Result<i32> {
     }
 }
 
-fn ioctl_ref(fd: RawFd, request: libc::c_ulong, arg: *mut libc::c_void) -> std::io::Result<i32> {
+fn ioctl_ref(fd: RawFd, request: IoctlReq, arg: *mut libc::c_void) -> std::io::Result<i32> {
     let rc = unsafe { libc::ioctl(fd, request, arg) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
@@ -425,7 +434,7 @@ fn ioctl_ref(fd: RawFd, request: libc::c_ulong, arg: *mut libc::c_void) -> std::
     }
 }
 
-fn ioctl_value(fd: RawFd, request: libc::c_ulong, arg: libc::c_ulong) -> std::io::Result<i32> {
+fn ioctl_value(fd: RawFd, request: IoctlReq, arg: IoctlReq) -> std::io::Result<i32> {
     let rc = unsafe { libc::ioctl(fd, request, arg) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
