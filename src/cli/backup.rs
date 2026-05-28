@@ -81,6 +81,20 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
     };
 
     if let Some(bdf) = pci {
+        // ADR-017 transport selection: try Mpt3CtlTransport first (kernel
+        // handles SRFQ/RPQ/DMA, /dev/sdb stays mounted, no driver flip-flop).
+        // If mpt3sas isn't loaded or no IOC manages this BDF, fall back to
+        // VFIO+doorbell (which has the 885-KB-of-zeros bug we're working
+        // around, but at least produces SOMETHING for offline testing).
+        #[cfg(target_os = "linux")]
+        if let Ok(transport) = crate::mpt::Mpt3CtlTransport::open(&bdf) {
+            eprintln!(
+                "backup: using Mpt3CtlTransport (kernel-mediated, ioc_number={})",
+                transport.ioc_number()
+            );
+            return run_backup_via_mpt3ctl(transport, &out_dir, json);
+        }
+
         let platform = crate::pci::LinuxSysfs;
         // Prefer the HwBackend path (VFIO) — it does the driver bind dance
         // and provides chip-readable DMA buffers, so FW_UPLOAD returns real
@@ -117,6 +131,119 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
     let mut session = Session::new(mock_ioc);
     session.raw_ioc_init(&init_req)?;
     run_backup_with_session(&mut session, &out_dir, json)
+}
+
+/// Run backup via Mpt3CtlTransport — kernel-mediated MPI flow per ADR-017.
+/// Bypasses Session/RealIoc entirely (those drive doorbell mode which can't
+/// SGE-DMA). Builds FwUploadRequest, strips its SGE off, hands the header
+/// to the transport which inserts a real kernel-allocated SGE.
+///
+/// This is the intentional shortcut until the senior MptCard refactor lands
+/// (which will replace Session for the hardware path entirely).
+#[cfg(target_os = "linux")]
+fn run_backup_via_mpt3ctl(
+    mut transport: crate::mpt::Mpt3CtlTransport,
+    out_dir: &Path,
+    json: bool,
+) -> Result<(), crate::Error> {
+    use crate::mpi::messages::FwUploadReply;
+    use crate::mpt::MptTransport;
+
+    let mut manifest = BackupManifest {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        sas_wwn: None,
+        artifacts: Vec::new(),
+        source_card: None,
+    };
+
+    for image_type in [ImageType::Fw, ImageType::Bios, ImageType::FlashLayout] {
+        const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
+        let mut data_in = vec![0u8; UPLOAD_BUF_SIZE];
+
+        // Build FwUploadRequest. Serialize_to includes a SGE; we strip it
+        // off because the kernel inserts the real (DMA-mapped) SGE at
+        // data_sge_offset=5. Request bytes = header[0x00..0x14], 20 bytes.
+        let mut throwaway = vec![0u8; 0];
+        let req = FwUploadRequest {
+            image_type,
+            image_offset: 0,
+            image_size: UPLOAD_BUF_SIZE as u32,
+            payload_buffer: &mut throwaway,
+        };
+        let req_bytes_with_sge = req.serialize_to(0);
+        let req_bytes = &req_bytes_with_sge[..0x14];
+
+        let mut reply_buf = vec![0u8; 64];
+        let bytes_written = transport
+            .send(req_bytes, &mut reply_buf, Some(&mut data_in), None)
+            .map_err(|e| {
+                crate::Error::Other(format!(
+                    "mpt3ctl FW_UPLOAD type={:?} send: {}",
+                    image_type, e
+                ))
+            })?;
+
+        let reply = FwUploadReply::parse(&reply_buf[..bytes_written.min(reply_buf.len())])
+            .map_err(|e| {
+                crate::Error::Other(format!(
+                    "mpt3ctl FW_UPLOAD type={:?} reply parse: {}",
+                    image_type, e
+                ))
+            })?;
+        eprintln!(
+            "mpt3ctl FW_UPLOAD type={:?} actual_image_size={} ioc_status={:?}",
+            image_type, reply.actual_image_size, reply.ioc_status
+        );
+        if reply.ioc_status != IocStatus::Success {
+            return Err(BackupError::PartialUpload {
+                image_type,
+                ioc_status: reply.ioc_status,
+            }
+            .into());
+        }
+
+        let actual_size = (reply.actual_image_size as usize).min(data_in.len());
+        let data = &data_in[..actual_size];
+
+        let file_name = match image_type {
+            ImageType::Fw => "firmware.bin",
+            ImageType::Bios => "bios.rom",
+            ImageType::FlashLayout => "nvdata.bin",
+            _ => continue,
+        };
+
+        let path = out_dir.join(file_name);
+        std::fs::write(&path, data)?;
+
+        let sha256 = sha256_hex(data);
+        manifest.artifacts.push(BackupArtifact {
+            path: file_name.to_string(),
+            image_type: format!("{:?}", image_type),
+            sha256,
+            size: actual_size as u64,
+        });
+    }
+
+    let manifest_path = out_dir.join("manifest.toml");
+    let toml_str = toml::to_string_pretty(&manifest)?;
+    std::fs::write(manifest_path, toml_str)?;
+
+    if json {
+        let json_output = serde_json::to_string_pretty(&manifest)?;
+        println!("{}", json_output);
+    } else {
+        println!("backup written to: {}", out_dir.display());
+        println!("artifacts:");
+        for a in &manifest.artifacts {
+            let sha_short = if a.sha256.len() >= 16 {
+                &a.sha256[..16]
+            } else {
+                &a.sha256
+            };
+            println!("  {} ({} bytes, sha256: {})", a.path, a.size, sha_short);
+        }
+    }
+    Ok(())
 }
 
 fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
