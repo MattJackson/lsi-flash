@@ -248,7 +248,7 @@ fn try_fetch_via_mpt3ctl(bdf: &str) -> Result<ExtendedCardInfo, crate::Error> {
         .send_with_sge_offset(&req, 3, &mut reply_buf, None, None)
         .map_err(|e| crate::Error::Other(format!("mpt3ctl IOC_FACTS: {}", e)))?;
 
-    let mut facts = IocFactsReply::parse(&reply_buf[..n.min(reply_buf.len())])
+    let facts = IocFactsReply::parse(&reply_buf[..n.min(reply_buf.len())])
         .map_err(|e| crate::Error::Other(format!("IOC_FACTS reply parse: {}", e)))?;
 
     if facts.ioc_status != IocStatus::Success {
@@ -258,14 +258,13 @@ fn try_fetch_via_mpt3ctl(bdf: &str) -> Result<ExtendedCardInfo, crate::Error> {
         )));
     }
 
-    // Best-effort: also fetch Manufacturing Page 0 for NVDATA vendor/product
-    // ID + Board Name + Tracer. If this fails we still return the IOC_FACTS
-    // half — operator gets identity + firmware version even if Mfg Page is
-    // unreadable for some reason.
-    let mut mfg_buf = vec![0u8; 256];
-    if let Ok(mfg_bytes) = mpt3ctl_read_config(&mut transport, 0x09, 0x00, &mut mfg_buf) {
-        parse_mfg_page_0(&mfg_buf[..mfg_bytes], &mut facts);
-    }
+    // TODO(MptCard refactor): also fetch Manufacturing Page 0 (Board Name,
+    // NVDATA vendor/product) via Mpt3CtlTransport CONFIG ioctl. My first
+    // attempt had off-by-2 in the request length (MPI generic header vs
+    // CONFIG-request-as-its-own-header confusion). Folding into MptCard's
+    // send_config so the wire format is in one place.
+
+    let _ = transport; // suppress unused-mut warning once Mfg Page returns
 
     Ok(ExtendedCardInfo {
         pci_name: String::new(),
@@ -273,68 +272,6 @@ fn try_fetch_via_mpt3ctl(bdf: &str) -> Result<ExtendedCardInfo, crate::Error> {
         quirks: vec![],
         ioc_facts: Some(facts),
     })
-}
-
-/// Send a CONFIG READ_CURRENT for a single page via Mpt3CtlTransport.
-/// Returns the number of bytes the chip wrote into `out`. Returns an error
-/// on any failure (transport, parse, non-Success IOCStatus).
-///
-/// Wire format (toolbox-and-config.md §6.1): 10-byte MPI header +
-/// 22-byte CONFIG body = 32 bytes total, then data_sge_offset = 8 (= 32/4).
-/// Kernel inserts the data-in SGE pointing at `out`.
-#[cfg(target_os = "linux")]
-fn mpt3ctl_read_config(
-    transport: &mut crate::mpt::Mpt3CtlTransport,
-    page_type: u8,
-    page_number: u8,
-    out: &mut [u8],
-) -> Result<usize, String> {
-    use crate::mpi::messages::MpiFunction;
-    use crate::mpt::MptTransport;
-
-    let mut req = Vec::with_capacity(32);
-    // MPI header (10 bytes)
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x00 FunctionDependent1
-    req.push(0x00); // 0x02 ChainOffset
-    req.push(MpiFunction::Config.as_u8()); // 0x03 Function = 0x04
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x04 SMID
-    req.push(0x00); // 0x06 FunctionDependent3
-    req.push(0x00); // 0x07 MsgFlags
-    req.push(0x00); // 0x08 VP_ID
-    req.push(0x00); // 0x09 VF_ID
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved1
-                                                // CONFIG body (22 bytes)
-    req.push(0x06); // 0x0C Action = PAGE_READ_NVRAM
-    req.push(0xC0); // 0x0D SGLFlags = IOC_TO_HOST | END_OF_LIST (informational; kernel inserts SGE)
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x0E ExtPageLength
-    req.push(0x00); // 0x10 ExtPageType (none)
-    req.push(0x00); // 0x11 MsgFlags
-    req.push(0x00); // 0x12 VP_ID
-    req.push(0x00); // 0x13 VF_ID
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x14 Reserved1
-    req.push(0x00); // 0x16 Reserved2
-    req.push(0x00); // 0x17 ProxyVF_ID
-    req.extend_from_slice(&0u16.to_le_bytes()); // 0x18 Reserved4
-                                                // Page header (4 bytes)
-    req.push(0x00); // 0x1A PageVersion (IOC fills on reply)
-    req.push((out.len() / 4) as u8); // 0x1B PageLength (in 4-byte words; max)
-    req.push(page_number); // 0x1C PageNumber
-    req.push(page_type); // 0x1D PageType
-                         // PageAddress (4 bytes)
-    let page_address = ((page_type as u32) << 24) | ((page_number as u32) << 16);
-    req.extend_from_slice(&page_address.to_le_bytes()); // 0x1E PageAddress
-    debug_assert_eq!(req.len(), 0x22); // 34 bytes? recount needed
-
-    let mut reply_buf = vec![0u8; 64];
-    let _ = transport
-        .send_with_sge_offset(&req, 8, &mut reply_buf, Some(out), None)
-        .map_err(|e| format!("CONFIG send: {}", e))?;
-
-    let reply = ConfigReply::parse(&reply_buf).map_err(|e| format!("CONFIG reply: {}", e))?;
-    if reply.ioc_status != IocStatus::Success {
-        return Err(format!("CONFIG ioc_status={:?}", reply.ioc_status));
-    }
-    Ok(out.len())
 }
 
 /// Parse Manufacturing Page 0 to extract NVDATA vendor/product ID and other fields.
