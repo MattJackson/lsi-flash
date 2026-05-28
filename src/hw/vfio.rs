@@ -41,11 +41,25 @@ const VFIO_GROUP_GET_STATUS: IoctlReq = 0x3B67;
 const VFIO_GROUP_SET_CONTAINER: IoctlReq = 0x3B68;
 const VFIO_GROUP_GET_DEVICE_FD: IoctlReq = 0x3B6A;
 const VFIO_DEVICE_GET_REGION_INFO: IoctlReq = 0x3B6C;
+const VFIO_IOMMU_MAP_DMA: IoctlReq = 0x3B71;
+const VFIO_IOMMU_UNMAP_DMA: IoctlReq = 0x3B72;
 
 const VFIO_API_VERSION: i32 = 0;
 const VFIO_TYPE1_IOMMU: i32 = 1;
 const VFIO_NOIOMMU_IOMMU: i32 = 8;
 const VFIO_GROUP_FLAGS_VIABLE: u32 = 1 << 0;
+const VFIO_DMA_MAP_FLAG_READ: u32 = 1 << 0;
+const VFIO_DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
+
+/// Starting IOVA for our DMA allocations. Picked well above conventional
+/// PCI MMIO ranges (4 GB - 256 GB) so we don't collide with anything the
+/// kernel or firmware might reserve. Bumped per allocation.
+const IOVA_BASE: u64 = 0x10_0000_0000;
+
+/// Page size for DMA alignment. Use a hugepage size (2 MB) so a single
+/// MAP_DMA covers most FW_UPLOAD buffers in one go. The kernel will pin
+/// these pages for the lifetime of the mapping.
+const DMA_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// PCI BAR index — BAR1 is what holds the MPI doorbell registers on SAS2008.
 const VFIO_PCI_BAR1_REGION_INDEX: u32 = 1;
@@ -70,6 +84,36 @@ struct VfioRegionInfo {
     offset: u64,
 }
 
+/// VFIO_IOMMU_MAP_DMA arg — pin pages and install IOVA->VA translation
+/// in the container's IOMMU domain.
+#[repr(C)]
+#[derive(Default, Debug)]
+struct VfioDmaMap {
+    argsz: u32,
+    flags: u32,
+    vaddr: u64,
+    iova: u64,
+    size: u64,
+}
+
+/// VFIO_IOMMU_UNMAP_DMA arg — release IOMMU mapping + unpin pages.
+#[repr(C)]
+#[derive(Default, Debug)]
+struct VfioDmaUnmap {
+    argsz: u32,
+    flags: u32,
+    iova: u64,
+    size: u64,
+}
+
+/// Tracks one outstanding DMA allocation so Drop can free everything
+/// even if the caller forgot to call `free_dma`.
+struct DmaAlloc {
+    va: *mut u8,
+    iova: u64,
+    len: usize,
+}
+
 /// `VfioBackend` — owns the bind state + open VFIO fds + BAR1 mmap. Drop
 /// closes everything and rebinds the original driver.
 pub struct VfioBackend {
@@ -85,6 +129,15 @@ pub struct VfioBackend {
     bar1_ptr: *mut u8,
     bar1_len: usize,
     original_driver: Option<String>,
+    /// True when host runs noiommu mode (iommu=off in cmdline). DMA paths
+    /// diverge — TYPE1 hosts go through VFIO_IOMMU_MAP_DMA; noiommu hosts
+    /// would need a hugepage+pagemap fallback (step 3b, not yet implemented).
+    is_noiommu: bool,
+    /// Next IOVA to hand out. Bumped by DMA_PAGE_SIZE per alloc. Only used
+    /// in TYPE1 mode where IOMMU translates these to physical addresses.
+    next_iova: u64,
+    /// Live DMA allocations — used by Drop to free anything the caller leaked.
+    dma_allocs: Vec<DmaAlloc>,
 }
 
 // Safety: VfioBackend's resources (fds + mmap) are all process-wide. Raw
@@ -234,6 +287,9 @@ impl VfioBackend {
             bar1_ptr: bar1_ptr as *mut u8,
             bar1_len,
             original_driver,
+            is_noiommu: is_noiommu_mode(),
+            next_iova: IOVA_BASE,
+            dma_allocs: Vec::new(),
         })
     }
 
@@ -270,16 +326,97 @@ impl HwBackend for VfioBackend {
         unsafe { std::slice::from_raw_parts_mut(self.bar1_ptr, self.bar1_len) }
     }
 
-    fn alloc_dma(&mut self, _len: usize) -> Result<DmaBuffer, HwError> {
-        Err(HwError::DmaAlloc(
-            "vfio step 3 — VFIO_IOMMU_MAP_DMA not yet implemented".into(),
-        ))
+    fn alloc_dma(&mut self, len: usize) -> Result<DmaBuffer, HwError> {
+        if self.is_noiommu {
+            // Step 3b will add a hugepage + pagemap fallback for lab hosts
+            // with iommu=off. Production hosts have IOMMU on.
+            return Err(HwError::DmaAlloc(
+                "noiommu mode: DMA fallback not yet implemented (step 3b). \
+                 Reboot host with iommu=on (intel_iommu=on / amd_iommu=on) \
+                 for production DMA path."
+                    .into(),
+            ));
+        }
+
+        let mapped_len = len.div_ceil(DMA_PAGE_SIZE) * DMA_PAGE_SIZE;
+        let container_raw = self.container_fd.as_raw_fd();
+
+        // Anonymous mmap — backing pages for the buffer. The kernel will pin
+        // these on VFIO_IOMMU_MAP_DMA, so they cannot be paged out while the
+        // mapping is live.
+        let va = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if va == libc::MAP_FAILED {
+            return Err(HwError::DmaAlloc(format!(
+                "mmap anon {} bytes: {}",
+                mapped_len,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let iova = self.next_iova;
+        let mut map = VfioDmaMap {
+            argsz: std::mem::size_of::<VfioDmaMap>() as u32,
+            flags: VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+            vaddr: va as u64,
+            iova,
+            size: mapped_len as u64,
+        };
+        if let Err(e) = ioctl_ref(
+            container_raw,
+            VFIO_IOMMU_MAP_DMA,
+            &mut map as *mut _ as *mut libc::c_void,
+        ) {
+            unsafe {
+                libc::munmap(va, mapped_len);
+            }
+            return Err(HwError::DmaAlloc(format!(
+                "VFIO_IOMMU_MAP_DMA iova=0x{:x} size={}: {}",
+                iova, mapped_len, e
+            )));
+        }
+        self.next_iova += mapped_len as u64;
+        self.dma_allocs.push(DmaAlloc {
+            va: va as *mut u8,
+            iova,
+            len: mapped_len,
+        });
+
+        Ok(DmaBuffer {
+            va: va as *mut u8,
+            iova,
+            len: mapped_len,
+            handle: iova, // IOVA is unique per live mapping — use as opaque id.
+        })
     }
 
-    fn free_dma(&mut self, _buf: DmaBuffer) -> Result<(), HwError> {
-        Err(HwError::DmaAlloc(
-            "vfio step 3 — VFIO_IOMMU_UNMAP_DMA not yet implemented".into(),
-        ))
+    fn free_dma(&mut self, buf: DmaBuffer) -> Result<(), HwError> {
+        if self.is_noiommu {
+            return Err(HwError::DmaAlloc(
+                "noiommu mode: free_dma not applicable (DMA path not implemented)".into(),
+            ));
+        }
+        let pos = self
+            .dma_allocs
+            .iter()
+            .position(|a| a.iova == buf.handle)
+            .ok_or_else(|| {
+                HwError::DmaAlloc(format!(
+                    "free_dma: handle 0x{:x} not in alloc table",
+                    buf.handle
+                ))
+            })?;
+        let alloc = self.dma_allocs.swap_remove(pos);
+        unmap_dma_one(self.container_fd.as_raw_fd(), &alloc)?;
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -293,7 +430,13 @@ impl HwBackend for VfioBackend {
 
 impl Drop for VfioBackend {
     fn drop(&mut self) {
-        // Unmap BAR1. Best-effort — Drop runs even on panic so don't propagate.
+        // Free outstanding DMA allocations the caller leaked. Order matters:
+        // UNMAP_DMA before closing the container_fd, BAR1 munmap before
+        // closing device_fd. Best-effort — Drop runs even on panic.
+        let container_raw = self.container_fd.as_raw_fd();
+        for alloc in self.dma_allocs.drain(..) {
+            let _ = unmap_dma_one(container_raw, &alloc);
+        }
         unsafe {
             libc::munmap(self.bar1_ptr as *mut libc::c_void, self.bar1_len);
             libc::close(self.device_fd);
@@ -302,6 +445,32 @@ impl Drop for VfioBackend {
         // Rebind original driver.
         let _ = restore_driver(&self.bdf, self.original_driver.as_deref());
     }
+}
+
+/// UNMAP_DMA + munmap a single allocation. Factored out because both
+/// `free_dma` and the Drop sweep need it.
+fn unmap_dma_one(container_fd: RawFd, alloc: &DmaAlloc) -> Result<(), HwError> {
+    let mut unmap = VfioDmaUnmap {
+        argsz: std::mem::size_of::<VfioDmaUnmap>() as u32,
+        flags: 0,
+        iova: alloc.iova,
+        size: alloc.len as u64,
+    };
+    let ioctl_err = ioctl_ref(
+        container_fd,
+        VFIO_IOMMU_UNMAP_DMA,
+        &mut unmap as *mut _ as *mut libc::c_void,
+    );
+    unsafe {
+        libc::munmap(alloc.va as *mut libc::c_void, alloc.len);
+    }
+    ioctl_err.map_err(|e| {
+        HwError::DmaAlloc(format!(
+            "VFIO_IOMMU_UNMAP_DMA iova=0x{:x}: {}",
+            alloc.iova, e
+        ))
+    })?;
+    Ok(())
 }
 
 // === free helpers =========================================================
