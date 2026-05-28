@@ -11,7 +11,8 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 
 ### Changed
 - MptCard `Card` impl — concrete implementation for Fusion-MPT chips (SAS2008/SAS2208/SAS3008)
-  - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub, plus `sbr_read()` via TOOLBOX_ISTWI
+  - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub, plus `sbr_read()` via pluggable `SbrTransport` trait (VFIO+I²C bit-bang today; ISTWI stubbed for future)
+  - Cites ADR-017 (`lsi-flash-notes/01-architecture/adr/017-card-trait-and-pluggable-transport.md`)
   - `discover_one(bdf)` now routes through chip-family dispatch in `src/card/mod.rs` — reads VID:DID from sysfs, maps to `ChipFamily` via `chip_family_from_pci()`, then constructs `MptCard` for known families or returns `UnsupportedCard(vid, did)` cleanly
   - `backup()` implements FW_UPLOAD for [Fw, Bios, FlashLayout] image types using MPI 2.0 wire format (cites `src/cli/backup.rs:185-209` for byte layout)
   - Writes firmware.bin, bios.rom, nvdata.bin + manifest.toml with SHA256 hashes per ADR-015 Rule 10
@@ -24,10 +25,10 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
   - Added `print_backup_report()` helper for unified output formatting (human-readable + JSON modes)
 
 ### Changed
-- `cli/sbr.rs::Read` verb — migrated from I2C bit-bang via `RealIoc::bar1_mut()` to Card trait + TOOLBOX_ISTWI transport
-  - Removed direct `RealIoc`, `I2cContext`, `i2c_init()`, `i2c_read_sbr()` calls from read path
-  - Now uses `crate::card::discover_one(&bdf)?` then `card.sbr_read()` to read SBR bytes
-  - Kernel-mediated via Mpt3CtlTransport: mpt3sas stays bound, /dev/sdb stays mounted (per ADR-017 hybrid-transport)
+- `src/sbr/transport.rs` — new `SbrTransport` trait with two implementations per ADR-017 pluggability principle:
+  - `VfioI2cSbrTransport`: VFIO+BAR1 I²C bit-bang path (works on dev-1); temporarily evicts mpt3sas during operation, restores on Drop
+  - `IstwiSbrTransport`: MPI TOOLBOX_ISTWI stub; currently returns `NotImplemented` due to IOCStatus 0x8004 INTERNAL_ERROR on SAS2008 with DevIndex=0, Action=READ_DATA(0x01) — wire-format research preserved from commit 8fd35ff for future enablement
+- `src/card/mpt.rs::MptCard::sbr_read` — reduced to ~5 lines calling `VfioI2cSbrTransport`; when ISTWI is solved, one-line change swaps to ISTWI first with VFIO fallback
   - Wire format per mpi2_tool.h:171-200 (`MPI2_TOOLBOX_ISTWI_READ_WRITE_REQUEST`): Tool=0x03, Function=0x17, Action=0x01 (READ_DATA), TxDataLength=0, RxDataLength=256
   - Reply parsing per mpi2_tool.h:214-228: checks IOCStatus at offset 0x0E for SUCCESS
   - Output handling (raw bytes / JSON / SHA256 to stderr) unchanged from original implementation
