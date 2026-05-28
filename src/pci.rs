@@ -58,10 +58,10 @@ impl Platform for LinuxSysfs {
                 offset as i64,
             );
             if ptr == libc::MAP_FAILED {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("mmap failed: {}", io::Error::last_os_error()),
-                ));
+                return Err(io::Error::other(format!(
+                    "mmap failed: {}",
+                    io::Error::last_os_error()
+                )));
             }
             let slice = std::slice::from_raw_parts(ptr as *const u8, len);
             let vec: Vec<u8> = slice.to_vec();

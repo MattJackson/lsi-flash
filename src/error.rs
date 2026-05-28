@@ -53,14 +53,15 @@ pub enum PciError {
 }
 
 /// MPI register error type (defined in mpi/doorbell.rs). Cites thiserror usage from scoping doc §1.
+///
+/// Currently unused — register-layer ops bubble io::Error directly. Reserved
+/// for the IocBackend trait once it grows a typed register-error variant.
+#[allow(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum MpiRegisterError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Used by future RealIoc / BAR1 mmap callers once they propagate
-    /// register-layer errors up through the IocBackend trait.
-    #[allow(dead_code)]
     #[error("Invalid BAR1 mapping size (expected 4096 bytes)")]
     InvalidBarSize,
 }
