@@ -96,6 +96,21 @@ fn print_human_readable(devices: &[pci::PciDevice]) -> io::Result<()> {
 /// Try to fetch MPI IOC_FACTS + Mfg Page 0 fields for a given BDF.
 /// Returns ExtendedCardInfo with populated fields, or None if hardware not available.
 fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Error> {
+    // Refuse to talk MPI to a device currently bound to mpt3sas — the kernel
+    // driver owns the doorbell and shares the chip state machine with us. Any
+    // doorbell write we make races mpt3sas's own commands, which on dev-1
+    // 2026-05-28 manifested as IOC_INIT replies with garbage lengths (panic
+    // post-fix; IocStatus errors pre-panic-fix). Surface a clear message
+    // instead of pretending to fetch.
+    let driver_link = format!("/sys/bus/pci/devices/{}/driver", bdf);
+    if let Ok(target) = std::fs::read_link(&driver_link) {
+        if target.to_string_lossy().contains("mpt3sas") {
+            return Err(crate::Error::Other(format!(
+                "card bound to mpt3sas — `sudo sh -c 'echo {bdf} > /sys/bus/pci/drivers/mpt3sas/unbind'` to free BAR1 first"
+            )));
+        }
+    }
+
     // Open RealIoc against the device — graceful skip if open fails (no real card present)
     let platform = pci::LinuxSysfs;
     match RealIoc::open(platform, bdf) {

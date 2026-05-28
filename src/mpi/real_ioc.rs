@@ -247,22 +247,20 @@ impl<P: Platform> IocBackend for RealIoc<P> {
         write32(bar1, doorbell_offset, doorbell_value);
 
         // Step 5: Write request payload to DOORBELL register
-        let mut offset = 0usize;
-        while offset < request_bytes.len() {
-            let dword = u32::from_le_bytes([
-                request_bytes[offset],
-                request_bytes[offset + 1],
-                request_bytes[offset + 2],
-                request_bytes[offset + 3],
-            ]);
-
+        // Safe dword iteration: zero-pad partial trailing chunk so a
+        // non-dword-aligned request_bytes length (caught on dev-1 2026-05-28
+        // with an IOC_INIT/IOC_FACTS request that ended on a 78-byte odd
+        // boundary) doesn't index past the end.
+        for chunk in request_bytes.chunks(4) {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let dword = u32::from_le_bytes(padded);
             write32(bar1, doorbell_offset, dword);
-            offset += 4;
         }
 
         // Step 6: Read reply from DOORBELL register
         let mut reply_bytes = Vec::with_capacity(22);
-        offset = 0;
+        let mut offset = 0usize;
 
         while offset < 22 {
             let dword = read32(bar1, doorbell_offset);
@@ -329,23 +327,20 @@ impl<P: Platform> IocBackend for RealIoc<P> {
 
         // Step 6: Write request payload dword-by-dword to DOORBELL register
         // Each dwords (4 bytes) written sequentially per lsirec.c pattern
-        let mut offset = 0usize;
-        while offset < request_bytes.len() {
-            let dword = u32::from_le_bytes([
-                request_bytes[offset],
-                request_bytes[offset + 1],
-                request_bytes[offset + 2],
-                request_bytes[offset + 3],
-            ]);
-
+        // Safe dword iteration: zero-pad partial trailing chunk (caught on
+        // dev-1 2026-05-28 when a 78-byte request indexed past the end of
+        // the buffer at offset+1).
+        for chunk in request_bytes.chunks(4) {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let dword = u32::from_le_bytes(padded);
             crate::mpi::doorbell::write32(bar1, doorbell_offset, dword);
-            offset += 4;
         }
 
         // Step 7: Read reply from DOORBELL register
         // Cites: messages.rs:1019-1043 (ConfigReply::parse expects at least 26 bytes)
         let mut reply_bytes = Vec::with_capacity(26);
-        offset = 0;
+        let mut offset = 0usize;
 
         while offset < 26 {
             let dword = crate::mpi::doorbell::read32(bar1, doorbell_offset);
@@ -406,20 +401,14 @@ impl<P: Platform> IocBackend for RealIoc<P> {
         // Step 2: Wait for IOC_DOORBELL_INT bit in HISTATUS (interrupt posted by IOC)
         // Per mpi-overview.md §9 initialization pattern
 
-        // Step 3: Write request payload to DOORBELL register byte-by-byte
-        // Each dword (4 bytes) written sequentially
-        let mut offset = 0usize;
-        while offset < request_bytes.len() {
-            let dword = u32::from_le_bytes([
-                request_bytes[offset],
-                request_bytes[offset + 1],
-                request_bytes[offset + 2],
-                request_bytes[offset + 3],
-            ]);
-
-            // Write dword to DOORBELL register (BAR1+0x00)
+        // Step 3: Write request payload dword-by-dword to DOORBELL register.
+        // Safe chunk iteration zero-pads any partial trailing chunk — caught
+        // on dev-1 2026-05-28 when a 78-byte request panicked at offset+2.
+        for chunk in request_bytes.chunks(4) {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let dword = u32::from_le_bytes(padded);
             crate::mpi::doorbell::write32(bar1, doorbell_offset, dword);
-            offset += 4;
         }
 
         // Step 4: Read reply from DOORBELL register
@@ -427,7 +416,7 @@ impl<P: Platform> IocBackend for RealIoc<P> {
         // IOC writes reply back to doorbell register after processing
 
         let mut reply_bytes = Vec::with_capacity(18); // Minimum reply is 18 bytes
-        offset = 0;
+        let mut offset = 0usize;
 
         while offset < 18 {
             let dword = crate::mpi::doorbell::read32(bar1, doorbell_offset);
@@ -500,23 +489,20 @@ impl<P: Platform> IocBackend for RealIoc<P> {
 
         // Step 6: Write request payload dword-by-dword to DOORBELL register
         // Each dwords (4 bytes) written sequentially per lsirec.c pattern
-        let mut offset = 0usize;
-        while offset < request_bytes.len() {
-            let dword = u32::from_le_bytes([
-                request_bytes[offset],
-                request_bytes[offset + 1],
-                request_bytes[offset + 2],
-                request_bytes[offset + 3],
-            ]);
-
+        // Safe dword iteration: zero-pad partial trailing chunk (caught on
+        // dev-1 2026-05-28 when a 78-byte request indexed past the end of
+        // the buffer at offset+1).
+        for chunk in request_bytes.chunks(4) {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let dword = u32::from_le_bytes(padded);
             crate::mpi::doorbell::write32(bar1, doorbell_offset, dword);
-            offset += 4;
         }
 
         // Step 7: Read reply from DOORBELL register
         // Cites: messages.rs:1180-1250 (IocFactsReply::parse expects at least 96 bytes)
         let mut reply_bytes = Vec::with_capacity(96); // Min reply is 96 bytes per mpi2_ioc.h:231-281
-        offset = 0;
+        let mut offset = 0usize;
 
         while offset < 96 {
             let dword = crate::mpi::doorbell::read32(bar1, doorbell_offset);
