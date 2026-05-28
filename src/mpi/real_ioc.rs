@@ -277,7 +277,7 @@ impl<P: Platform> IocBackend for RealIoc<P> {
             doorbell_handshake_recv, doorbell_handshake_send, get_ioc_state, IocState,
         };
 
-        // Step 1: payload buffer guard (testable without BAR1 on non-Linux).
+        // Payload buffer guard — testable without BAR1.
         if req.image_size as usize > req.payload_buffer.len() {
             return Err(MpiError::Io(format!(
                 "upload buffer too small: chip says {} bytes, buffer is {}",
@@ -286,27 +286,67 @@ impl<P: Platform> IocBackend for RealIoc<P> {
             )));
         }
 
+        // Allocate a chip-readable DMA buffer when a HwBackend is attached.
+        // Without it, the SGE iova falls back to the user-space VA — which
+        // the chip cannot translate. That path returns the 885-KB-of-zeros
+        // bug (kept for graceful degradation in test/legacy callers, with
+        // a clear error if there's neither backend nor BAR1).
+        #[cfg(target_os = "linux")]
+        let dma_buf = if self.hw_backend.is_some() {
+            Some(self.alloc_dma(req.image_size as usize)?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _dma_buf: Option<()> = None;
+
+        #[cfg(target_os = "linux")]
+        let iova = match &dma_buf {
+            Some(b) => b.iova,
+            None => req.payload_buffer.as_ptr() as u64,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let iova: u64 = req.payload_buffer.as_ptr() as u64;
+
         let bar1 = self
             .bar1_mut()
             .ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
 
         let ioc_state = get_ioc_state(bar1, MPI2_DOORBELL);
         if !matches!(ioc_state, IocState::Ready | IocState::Operational) {
+            // Avoid leaking the DMA buffer on early-return.
+            #[cfg(target_os = "linux")]
+            if let Some(b) = dma_buf {
+                let _ = self.free_dma(b);
+            }
             return Err(MpiError::IocStatus(IocStatus::InvalidState));
         }
 
-        let mut request_bytes = req.serialize_to(2);
+        let mut request_bytes = req.serialize_to(iova);
         while request_bytes.len() % 4 != 0 {
             request_bytes.push(0);
         }
 
         let timeout = std::time::Duration::from_secs(10); // longer for big payloads
-        doorbell_handshake_send(bar1, MpiFunction::FwUpload.as_u8(), &request_bytes, timeout)
-            .map_err(|e| MpiError::Io(format!("FW_UPLOAD send: {}", e)))?;
+        let send_result =
+            doorbell_handshake_send(bar1, MpiFunction::FwUpload.as_u8(), &request_bytes, timeout);
+        let recv_result = send_result.and_then(|_| doorbell_handshake_recv(bar1, 64, timeout));
 
-        let reply_bytes = doorbell_handshake_recv(bar1, 64, timeout)
-            .map_err(|e| MpiError::Io(format!("FW_UPLOAD recv: {}", e)))?;
+        // Copy DMA buffer back into the caller's payload_buffer before freeing.
+        // Order matters: copy before free, free before returning Err.
+        #[cfg(target_os = "linux")]
+        if let Some(b) = &dma_buf {
+            let copy_len = req.payload_buffer.len().min(b.len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.va, req.payload_buffer.as_mut_ptr(), copy_len);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(b) = dma_buf {
+            let _ = self.free_dma(b);
+        }
 
+        let reply_bytes = recv_result.map_err(|e| MpiError::Io(format!("FW_UPLOAD: {}", e)))?;
         let reply = FwUploadReply::parse(&reply_bytes)?;
         if reply.ioc_status != IocStatus::Success {
             return Err(MpiError::IocStatus(reply.ioc_status));

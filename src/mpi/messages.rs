@@ -608,7 +608,13 @@ impl FwUploadRequest<'_> {
     /// Caught on dev-1 2026-05-28: the earlier freshman version wrote a
     /// duplicate 10-byte header which made the chip read ImageType=0 for all
     /// calls — backup.bin / bios.rom / nvdata.bin all came out byte-identical.
-    pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
+    ///
+    /// `iova` is the chip-readable address the SGE points at. The chip
+    /// DMA-writes the firmware bytes there. Production callers get this
+    /// from `RealIoc::alloc_dma()` (VFIO-mapped IOVA). Passing a user-space
+    /// VA produces 885 KB of zeros (see ADR-016) — the chip cannot translate
+    /// host page-table addresses.
+    pub fn serialize_to(&self, iova: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
 
         // 0x00 ImageType
@@ -639,7 +645,7 @@ impl FwUploadRequest<'_> {
         // 0x14 SGL — IEEE_SIMPLE_64 (12 bytes). IOC writes data here, so
         // direction is IOC_TO_HOST (END_OF_LIST + IOC_TO_HOST flags).
         let sge = IeeeSgeSimple64::with_flags(
-            self.payload_buffer.as_ptr() as u64,
+            iova,
             self.payload_buffer.len().min(self.image_size as usize) as u32,
             0xC0,
         );
@@ -1913,12 +1919,30 @@ mod tests {
             payload_buffer: &mut buf,
         };
 
-        let bytes = req.serialize_to(1);
+        let iova: u64 = 0xdead_beef_0000;
+        let bytes = req.serialize_to(iova);
 
         // ImageType at offset 0x00 — corrected per mpi2_ioc.h:1228
         assert_eq!(bytes[0], ImageType::Fw.as_u8());
         // Function at offset 0x03 should be 0x12 (FW_UPLOAD) per mpi2_ioc.h:1231
         assert_eq!(bytes[3], MpiFunction::FwUpload.as_u8());
+        // SGE address at offset 0x14 (12-byte IEEE_SGE_SIMPLE_64) — should be
+        // the iova we passed in, NOT the payload_buffer VA. This regression
+        // would mean we're back to the 885-KB-of-zeros bug.
+        let sge_addr = u64::from_le_bytes([
+            bytes[0x14],
+            bytes[0x15],
+            bytes[0x16],
+            bytes[0x17],
+            bytes[0x18],
+            bytes[0x19],
+            bytes[0x1a],
+            bytes[0x1b],
+        ]);
+        assert_eq!(
+            sge_addr, iova,
+            "SGE address must be the iova arg (chip-readable), not a host VA"
+        );
     }
 
     // ========================================================================
