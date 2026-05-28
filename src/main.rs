@@ -5,6 +5,7 @@ pub mod pci;
 
 pub mod firmware;
 pub mod hcb;
+pub mod hw;
 pub mod mpi;
 pub mod sbr;
 
