@@ -62,17 +62,16 @@ pub struct SourceCardInfo {
     pub friendly_name: Option<String>,
 }
 
-pub fn run(out: Option<String>, json: bool) -> Result<(), crate::Error> {
+pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), crate::Error> {
     let out_dir = resolve_out_dir(out.as_deref())?;
 
     ensure_dir_empty(&out_dir)?;
     std::fs::create_dir_all(&out_dir)?;
 
-    // Default backend: MockIoc (no real hardware available; RealIoc is Step 2 part 3).
-    // Production code does NOT preload sample data — partitions are read as-is via
-    // FW_UPLOAD. Empty partitions produce 0-byte artifacts, which is honest behavior.
-    let mock_ioc = MockIoc::new(Personality::It);
-    let mut session = Session::new(mock_ioc);
+    // Pick backend: `--pci <bdf>` → real hardware via RealIoc; otherwise MockIoc
+    // (for tests / docs / no-hardware development). Both speak IocBackend; we
+    // keep the rest of the function generic by routing through a single
+    // run_backup_with_session helper below.
     let init_req = crate::mpi::messages::IocInitRequest {
         who_init: 0x04,
         host_msix_vectors: 0,
@@ -80,8 +79,27 @@ pub fn run(out: Option<String>, json: bool) -> Result<(), crate::Error> {
         system_request_frame_base_address: 0,
         reply_descriptor_post_queue_address: 0,
     };
-    session.raw_ioc_init(&init_req)?;
 
+    if let Some(bdf) = pci {
+        let platform = crate::pci::LinuxSysfs;
+        let real_ioc = crate::mpi::real_ioc::RealIoc::open(platform, &bdf)
+            .map_err(|e| crate::Error::Other(format!("RealIoc::open({}) failed: {}", bdf, e)))?;
+        let mut session = Session::new(real_ioc);
+        let _ = session.raw_ioc_init(&init_req);
+        return run_backup_with_session(&mut session, &out_dir, json);
+    }
+
+    let mock_ioc = MockIoc::new(Personality::It);
+    let mut session = Session::new(mock_ioc);
+    session.raw_ioc_init(&init_req)?;
+    run_backup_with_session(&mut session, &out_dir, json)
+}
+
+fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
+    session: &mut Session<B>,
+    out_dir: &Path,
+    json: bool,
+) -> Result<(), crate::Error> {
     let mut manifest = BackupManifest {
         timestamp: chrono::Utc::now().to_rfc3339(),
         sas_wwn: None,
@@ -131,7 +149,7 @@ pub fn run(out: Option<String>, json: bool) -> Result<(), crate::Error> {
 
     let manifest_path = out_dir.join("manifest.toml");
     let toml_str = toml::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, toml_str)?;
+    std::fs::write(manifest_path, toml_str)?;
 
     if json {
         let json_output = serde_json::to_string_pretty(&manifest)?;

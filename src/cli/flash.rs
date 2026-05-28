@@ -247,7 +247,7 @@ impl<B: IocBackend> Orchestrator<B> {
         } else {
             // Call backup::run with this dir — real implementation per scoping doc §5
             let backup_path = backup_dir.to_str().unwrap_or("/tmp/backup").to_string();
-            if let Err(e) = backup::run(Some(backup_path), false) {
+            if let Err(e) = backup::run(Some(backup_path), false, None) {
                 return Err(FlashError::BackupModule(format!(
                     "backup module error: {}",
                     e

@@ -156,7 +156,7 @@ pub enum FirmwareCommand {
 pub fn run(cli: Cli) -> Result<(), crate::Error> {
     match cli.command {
         Command::Detect => detect::run(cli.json),
-        Command::Backup { out } => backup::run(out, cli.json),
+        Command::Backup { out } => backup::run(out, cli.json, cli.pci.clone()),
         Command::Flash {
             mode,
             identity,
