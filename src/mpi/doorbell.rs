@@ -67,11 +67,16 @@ pub const MPI2_HIS_SYS2IOC_DB_STATUS: u32 = 0x80000000;
 /// Host must NOT initiate a new handshake while this is set. Cites mpi2.h:181.
 pub const MPI2_DOORBELL_USED: u32 = 0x08000000;
 
-/// MPI2 doorbell function code shift — bits 24-31 of the doorbell register
-/// hold the function code; bits 16-23 hold (dword_count - 2). Cites
-/// mpi2.h:178-193 + lsiutil/mpt.c:819-820.
+/// MPI2 doorbell encoding shifts. Bits 24-31 hold the function code (always
+/// `MPI2_FUNCTION_HANDSHAKE` = 0x42 for the doorbell exchange — the *actual*
+/// MPI function like IOC_FACTS lives at byte 3 of the request body). Bits
+/// 16-23 hold the request length in dwords (full count, no -2 adjustment;
+/// the -2 documented in mpi2.h:178-193 refers to the MsgLength field
+/// *inside* the request, not the doorbell-register encoding). Cites
+/// mpi2.h:188-191 + lsiutil/mpt.c:819-820 (mpt_send_message).
 pub const MPI2_DOORBELL_FUNCTION_SHIFT: u32 = 24;
 pub const MPI2_DOORBELL_ADD_DWORDS_SHIFT: u32 = 16;
+pub const MPI2_FUNCTION_HANDSHAKE: u8 = 0x42;
 
 /// Poll-spin until `HISTATUS & MPI2_HIS_IOC2SYS_DB_STATUS != 0` (IOC has
 /// posted a reply word). Returns timeout error if the deadline elapses.
@@ -143,7 +148,7 @@ pub(crate) fn clear_histatus(bar1: &mut [u8]) {
 /// fetch the reply.
 pub(crate) fn doorbell_handshake_send(
     bar1: &mut [u8],
-    function: u8,
+    _function: u8, // informational — actual function code lives in request[3]
     request: &[u8],
     timeout: std::time::Duration,
 ) -> Result<(), &'static str> {
@@ -151,8 +156,8 @@ pub(crate) fn doorbell_handshake_send(
         return Err("doorbell_handshake_send: request not dword-aligned");
     }
     let dword_count = request.len() / 4;
-    if dword_count < 2 {
-        return Err("doorbell_handshake_send: request too small (< 2 dwords)");
+    if dword_count == 0 {
+        return Err("doorbell_handshake_send: empty request");
     }
 
     // Step 1: refuse to start if a previous handshake is still active.
@@ -164,13 +169,13 @@ pub(crate) fn doorbell_handshake_send(
         return Err("doorbell_handshake_send: IOC fault before send");
     }
 
-    // Step 2: clear stale HISTATUS, kick the handshake with function-code header.
-    // Per mpi2.h:178-193 / mpt.c:819-820 the header dword encodes function in bits
-    // 24-31 and (dword_count - 2) in bits 16-23. The "-2" is the MPI 2.0 quirk
-    // where the chip subtracts the 2-dword header that's always present.
+    // Step 2: clear stale HISTATUS, then write the doorbell-init header.
+    // Cites lsiutil/mpt.c:818-820 exactly: function = HANDSHAKE (0x42), dword
+    // count is the FULL request length / 4 (no -2 adjustment — that's the
+    // MsgLength field *inside* the request, not the doorbell encoding).
     clear_histatus(bar1);
-    let header = (u32::from(function) << MPI2_DOORBELL_FUNCTION_SHIFT)
-        | ((dword_count as u32 - 2) << MPI2_DOORBELL_ADD_DWORDS_SHIFT);
+    let header = (u32::from(MPI2_FUNCTION_HANDSHAKE) << MPI2_DOORBELL_FUNCTION_SHIFT)
+        | ((dword_count as u32) << MPI2_DOORBELL_ADD_DWORDS_SHIFT);
     write32(bar1, MPI2_DOORBELL, header);
 
     // Step 3: wait for IOC to ack the header (DOORBELL_INT set).
