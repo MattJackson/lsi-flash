@@ -466,6 +466,97 @@ impl IeeeSgeSimple64 {
     }
 }
 
+/// MPI 2.0 (NON-IEEE) 64-bit Simple SGE — `MPI2_SGE_SIMPLE_UNION` per
+/// `mpi2.h:932-955`. Different byte layout from `IeeeSgeSimple64`: the
+/// `FlagsLength` u32 comes FIRST (flags in high byte, length in low 24 bits),
+/// then the 64-bit address. Total 12 bytes.
+///
+/// SAS2008 (chip family `MPI_MFGPAGE_DEVID_SAS2008`) implements MPI 2.0, not
+/// MPI 2.5. Sending an IEEE SGE causes the chip to misparse the first 4 bytes
+/// of our address as `FlagsLength` — garbage flags + a wildly wrong address.
+/// The chip then "DMAs" to that wrong address (typically a kernel-reserved
+/// region behind the IOMMU/root-complex DMA mask), so the host buffer stays
+/// zero and the chip still reports Success.
+///
+/// Caught on dev-1 2026-05-28 when every other prerequisite (BME, IOVA,
+/// hugepage, IOC state) was verified but Tier 2 backup still returned zeros.
+#[derive(Debug, Copy, Clone)]
+pub struct MpiSgeSimple64 {
+    pub address: u64,
+    pub length: u32,
+    /// High byte of `FlagsLength`. See `MPI2_SGE_FLAGS_*` constants for the
+    /// bit layout. For a typical FW_UPLOAD final element, use 0xD3 (SIMPLE
+    /// | LAST | END_OF_BUFFER | 64-BIT | END_OF_LIST, IOC->host direction).
+    pub flags: u8,
+}
+
+/// MPI 2.0 SGE flags — per `mpi2.h:932-955`. These live in the **high byte**
+/// of the `FlagsLength` u32 (i.e., bits 24-31 when read LE).
+pub mod mpi_sge_flags {
+    /// SIMPLE element type — `MPI2_SGE_FLAGS_SIMPLE_ELEMENT`.
+    pub const SIMPLE_ELEMENT: u8 = 0x10;
+    /// LAST element in the SG list — `MPI2_SGE_FLAGS_LAST_ELEMENT`.
+    pub const LAST_ELEMENT: u8 = 0x80;
+    /// End of buffer — `MPI2_SGE_FLAGS_END_OF_BUFFER`.
+    pub const END_OF_BUFFER: u8 = 0x40;
+    /// End of list — `MPI2_SGE_FLAGS_END_OF_LIST`.
+    pub const END_OF_LIST: u8 = 0x01;
+    /// 64-bit address (vs 32-bit) — `MPI2_SGE_FLAGS_64_BIT_ADDRESSING`.
+    pub const ADDR_64BIT: u8 = 0x02;
+    /// Direction = host→IOC (FW_DOWNLOAD). Cleared = IOC→host (FW_UPLOAD).
+    pub const HOST_TO_IOC: u8 = 0x04;
+}
+
+impl MpiSgeSimple64 {
+    /// SGE for a single buffer the **IOC writes into** (i.e., FW_UPLOAD).
+    /// Flags = SIMPLE | LAST | END_OF_BUFFER | 64-BIT | END_OF_LIST = 0xD3.
+    pub fn ioc_to_host_one_shot(address: u64, length: u32) -> Self {
+        use mpi_sge_flags::*;
+        Self {
+            address,
+            length,
+            flags: SIMPLE_ELEMENT | LAST_ELEMENT | END_OF_BUFFER | ADDR_64BIT | END_OF_LIST,
+        }
+    }
+
+    /// SGE for a single buffer the **host writes** (i.e., FW_DOWNLOAD).
+    /// Same as ioc_to_host but with HOST_TO_IOC bit set.
+    #[allow(dead_code)]
+    pub fn host_to_ioc_one_shot(address: u64, length: u32) -> Self {
+        use mpi_sge_flags::*;
+        Self {
+            address,
+            length,
+            flags: SIMPLE_ELEMENT
+                | LAST_ELEMENT
+                | END_OF_BUFFER
+                | ADDR_64BIT
+                | END_OF_LIST
+                | HOST_TO_IOC,
+        }
+    }
+
+    /// Serialize to 12 bytes: FlagsLength (4B LE) + Address (8B LE).
+    ///
+    /// FlagsLength packs as: (flags << 24) | (length & 0x00FFFFFF). Length
+    /// is 24-bit per MPI 2.0 — caller must ensure < 16 MB; this asserts.
+    pub fn serialize_to(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.length <= 0x00FF_FFFF,
+            "MPI 2.0 SGE length is 24-bit; got {}",
+            self.length
+        );
+        let flags_length: u32 = ((self.flags as u32) << 24) | (self.length & 0x00FF_FFFF);
+        buf.extend_from_slice(&flags_length.to_le_bytes());
+        buf.extend_from_slice(&self.address.to_le_bytes());
+    }
+
+    /// Total serialized size in bytes.
+    pub fn serialized_size() -> usize {
+        12 // 4 (FlagsLength) + 8 (Address)
+    }
+}
+
 // ============================================================================
 // Request Structs — serialize to MPI message wire format
 // ============================================================================
@@ -642,13 +733,14 @@ impl FwUploadRequest<'_> {
         // 0x10 Reserved6 (U32)
         buf.extend_from_slice(&0u32.to_le_bytes());
 
-        // 0x14 SGL — IEEE_SIMPLE_64 (12 bytes). IOC writes data here, so
-        // direction is IOC_TO_HOST (END_OF_LIST + IOC_TO_HOST flags).
-        let sge = IeeeSgeSimple64::with_flags(
-            iova,
-            self.payload_buffer.len().min(self.image_size as usize) as u32,
-            0xC0,
-        );
+        // 0x14 SGL — MPI 2.0 SIMPLE_64 (12 bytes; FlagsLength prefix + 64-bit
+        // address). Was IeeeSgeSimple64 — wrong for SAS2008 (MPI 2.0 chip;
+        // IEEE format is MPI 2.5+). The IEEE wire format put address bytes
+        // where the chip expected FlagsLength, so it parsed garbage flags +
+        // wrong address and DMA'd into the void while reporting Success.
+        // Dev-1 finding 2026-05-28; see ADR-016 + 2026-05-28-vfio-dev1-hardware-test session note.
+        let sge_len = self.payload_buffer.len().min(self.image_size as usize) as u32;
+        let sge = MpiSgeSimple64::ioc_to_host_one_shot(iova, sge_len);
         sge.serialize_to(&mut buf);
 
         buf
@@ -1926,18 +2018,28 @@ mod tests {
         assert_eq!(bytes[0], ImageType::Fw.as_u8());
         // Function at offset 0x03 should be 0x12 (FW_UPLOAD) per mpi2_ioc.h:1231
         assert_eq!(bytes[3], MpiFunction::FwUpload.as_u8());
-        // SGE address at offset 0x14 (12-byte IEEE_SGE_SIMPLE_64) — should be
-        // the iova we passed in, NOT the payload_buffer VA. This regression
-        // would mean we're back to the 885-KB-of-zeros bug.
+        // SGE is MPI 2.0 SIMPLE_64 format (FlagsLength at 0x14-0x17, Address at 0x18-0x1F).
+        // The dev-1 2026-05-28 finding: SAS2008 is MPI 2.0 not 2.5 — wrong SGE format
+        // = chip reads garbage flags + wrong address = silent DMA to wrong place.
+        let flags_length = u32::from_le_bytes([bytes[0x14], bytes[0x15], bytes[0x16], bytes[0x17]]);
+        let flags = (flags_length >> 24) as u8;
+        let length = flags_length & 0x00FF_FFFF;
+        // Flags must include SIMPLE | LAST | END_OF_BUFFER | 64-BIT | END_OF_LIST = 0xD3
+        // (and clear HOST_TO_IOC bit since FW_UPLOAD is IOC→host).
+        assert_eq!(
+            flags, 0xD3,
+            "MPI 2.0 SGE flags must be 0xD3 for FW_UPLOAD (IOC→host one-shot)"
+        );
+        assert_eq!(length, 256, "SGE length must be the buffer size");
         let sge_addr = u64::from_le_bytes([
-            bytes[0x14],
-            bytes[0x15],
-            bytes[0x16],
-            bytes[0x17],
             bytes[0x18],
             bytes[0x19],
             bytes[0x1a],
             bytes[0x1b],
+            bytes[0x1c],
+            bytes[0x1d],
+            bytes[0x1e],
+            bytes[0x1f],
         ]);
         assert_eq!(
             sge_addr, iova,
