@@ -802,72 +802,62 @@ pub struct IocInitRequest {
 }
 
 impl IocInitRequest {
-    /// Serialize IOC_INIT request to wire format.
+    /// Serialize IOC_INIT request per `MPI2_IOC_INIT_REQUEST` at
+    /// mpi2_ioc.h:135-164. The struct IS the wire message (no separate
+    /// REQUEST_HEADER prefix). Total: 0x48 = 72 bytes.
     ///
-    /// Returns 72 bytes: header + full MPI2_IOC_INIT_REQUEST body (mpi-overview.md §9).
-    pub fn serialize_to(&self, smid: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(80);
+    /// Audit caught: previous freshman version wrote a 10-byte duplicate
+    /// header before the body, shifting WhoInit from offset 0x00 to 0x0A
+    /// and dropping the ReplyFreeQueueAddress field entirely.
+    pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(72);
 
-        // MPI2_REQUEST_HEADER (10 bytes) — mpi-overview.md §1.2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // FunctionDependent1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::IocInit.as_u8()); // Function = 0x02
-        buf.extend_from_slice(&smid.to_le_bytes()); // FunctionDependent2 (SMID)
-        buf.push(0x00); // FunctionDependent3
-
-        let msg_flags = 0x00;
-        buf.push(msg_flags);
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
-
-        // MPI2_IOC_INIT_REQUEST body (62 bytes) — mpi-overview.md §9.1
-        buf.push(self.who_init); // WhoInit (MPI2_WHOINIT_HOST_DRIVER = 0x04)
-        buf.push(0x00); // Reserved1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::IocInit.as_u8()); // Function
-
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-        buf.push(0x00); // Reserved3
-        buf.push(msg_flags); // MsgFlags
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved4
-
-        // Version fields (not critical for init, set to 0)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // MsgVersion
-        buf.extend_from_slice(&0u16.to_le_bytes()); // HeaderVersion
-
-        buf.extend_from_slice(&[0x00; 4]); // Reserved5 (4 bytes)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved6
-
-        buf.push(0x00); // Reserved7
-        buf.push(self.host_msix_vectors); // HostMSIxVectors
-
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved8
-        buf.extend_from_slice(&0u16.to_le_bytes()); // SystemRequestFrameSize (IOC sets this)
-
-        // Queue depths — mpi-overview.md §9.2 (RDPQ depth min = 16)
+        // 0x00 WhoInit (MPI2_WHOINIT_HOST_DRIVER = 0x04)
+        buf.push(self.who_init);
+        // 0x01 Reserved1 / 0x02 ChainOffset
+        buf.push(0x00);
+        buf.push(0x00);
+        // 0x03 Function = 0x02
+        buf.push(MpiFunction::IocInit.as_u8());
+        // 0x04 Reserved2 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x06 Reserved3 / 0x07 MsgFlags / 0x08 VP_ID / 0x09 VF_ID
+        buf.extend_from_slice(&[0u8; 4]);
+        // 0x0A Reserved4 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x0C MsgVersion (U16) / 0x0E HeaderVersion (U16) — IOC sets these in reply
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x10 Reserved5 (U32)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // 0x14 Reserved6 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x16 Reserved7
+        buf.push(0x00);
+        // 0x17 HostMSIxVectors
+        buf.push(self.host_msix_vectors);
+        // 0x18 Reserved8 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x1A SystemRequestFrameSize (U16) — set by host or IOC depending on direction
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x1C ReplyDescriptorPostQueueDepth (U16)
         buf.extend_from_slice(&self.reply_descriptor_post_queue_depth.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // ReplyFreeQueueDepth
+        // 0x1E ReplyFreeQueueDepth (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x20 SenseBufferAddressHigh (U32)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // 0x24 SystemReplyAddressHigh (U32)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // 0x28 SystemRequestFrameBaseAddress (U64)
+        buf.extend_from_slice(&self.system_request_frame_base_address.to_le_bytes());
+        // 0x30 ReplyDescriptorPostQueueAddress (U64)
+        buf.extend_from_slice(&self.reply_descriptor_post_queue_address.to_le_bytes());
+        // 0x38 ReplyFreeQueueAddress (U64) — was MISSING before; required for post-queue mode
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // 0x40 TimeStamp (U64)
+        buf.extend_from_slice(&0u64.to_le_bytes());
 
-        // Address fields (DMA-visible host memory addresses) — mpi-overview.md §9.2
-        let _sense_buffer = 0u32; // Not used in our simple model
-        buf.extend_from_slice(&_sense_buffer.to_le_bytes()); // SenseBufferAddressHigh
-
-        let _system_reply = 0u32;
-        buf.extend_from_slice(&_system_reply.to_le_bytes()); // SystemReplyAddressHigh
-
-        buf.extend_from_slice(&self.system_request_frame_base_address.to_le_bytes()); // SystemRequestFrameBaseAddress (64-bit)
-
-        buf.extend_from_slice(&[0x00, 0x00]); // Reserved padding for alignment
-
-        buf.extend_from_slice(&self.reply_descriptor_post_queue_address.to_le_bytes()); // ReplyDescriptorPostQueueAddress (64-bit)
-
-        // TimeStamp field (not critical) — mpi-overview.md §9
-        buf.extend_from_slice(&[0x00; 8]); // TimeStamp (8 bytes, zeroed)
-
+        debug_assert_eq!(buf.len(), 0x48);
         buf
     }
 }
@@ -1998,15 +1988,14 @@ mod tests {
 
         let bytes = req.serialize_to(1);
 
-        // Function at offset 0x03 should be 0x02 (IOC_INIT)
-        assert_eq!(bytes[3], MpiFunction::IocInit.as_u8());
-
-        // WhoInit at body start (offset 12 per mpi-overview.md §9.1)
-        assert_eq!(bytes[12], 0x04);
-
-        // Reply queue depth at offset 40-41
-        let rdq_depth = u16::from_le_bytes([bytes[40], bytes[41]]);
+        // Per mpi2_ioc.h:135-164 — corrected offsets after struct fix:
+        // 0x00 WhoInit, 0x03 Function, 0x1C ReplyDescriptorPostQueueDepth.
+        assert_eq!(bytes[0], 0x04); // WhoInit
+        assert_eq!(bytes[3], MpiFunction::IocInit.as_u8()); // Function
+        let rdq_depth = u16::from_le_bytes([bytes[0x1C], bytes[0x1D]]);
         assert_eq!(rdq_depth, 16);
+        // Struct is now 0x48 = 72 bytes per spec.
+        assert_eq!(bytes.len(), 0x48);
     }
 
     // ========================================================================
