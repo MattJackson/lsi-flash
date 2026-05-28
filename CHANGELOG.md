@@ -11,17 +11,26 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 
 ### Changed
 - MptCard `Card` impl — concrete implementation for Fusion-MPT chips (SAS2008/SAS2208/SAS3008)
-  - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub
-  - `discover_one(bdf)` now routes through `MptCard::discover_one()` which opens `Mpt3CtlTransport` (kernel-mediated via `/dev/mpt3ctl`)
+  - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub, plus `sbr_read()` via TOOLBOX_ISTWI
+  - `discover_one(bdf)` now routes through chip-family dispatch in `src/card/mod.rs` — reads VID:DID from sysfs, maps to `ChipFamily` via `chip_family_from_pci()`, then constructs `MptCard` for known families or returns `UnsupportedCard(vid, did)` cleanly
   - `backup()` implements FW_UPLOAD for [Fw, Bios, FlashLayout] image types using MPI 2.0 wire format (cites `src/cli/backup.rs:185-209` for byte layout)
   - Writes firmware.bin, bios.rom, nvdata.bin + manifest.toml with SHA256 hashes per ADR-015 Rule 10
-  - Tests: `identity()` returns correct values; `current_personality()` returns NotImplemented; `detect()` via mock transport; `backup_writes_artifacts` verifies file output
+  - Tests: `identity()` returns correct values; `current_personality()` returns NotImplemented; `detect()` via mock transport; `backup_writes_artifacts` verifies file output; new tests for `sbr_read()` via MockTransport, `chip_family_from_pci()` table lookup
   - Cites ADR-017 (`lsi-flash-notes/01-architecture/adr/017-card-trait-and-pluggable-transport.md`)
 - `cli/backup.rs` — refactor to use Card trait instead of inline Mpt3CtlTransport path
   - Removed `run_backup_via_mpt3ctl()` function (lines ~144-278) — functionality now in `MptCard::backup()`
   - `--pci <bdf>` branch calls `crate::card::discover_one(&bdf)?` then `card.backup(&out_dir)`
   - Kept VFIO+legacy doorbell fallback chain for operators when mpt3sas isn't loaded
   - Added `print_backup_report()` helper for unified output formatting (human-readable + JSON modes)
+
+### Changed
+- `cli/sbr.rs::Read` verb — migrated from I2C bit-bang via `RealIoc::bar1_mut()` to Card trait + TOOLBOX_ISTWI transport
+  - Removed direct `RealIoc`, `I2cContext`, `i2c_init()`, `i2c_read_sbr()` calls from read path
+  - Now uses `crate::card::discover_one(&bdf)?` then `card.sbr_read()` to read SBR bytes
+  - Kernel-mediated via Mpt3CtlTransport: mpt3sas stays bound, /dev/sdb stays mounted (per ADR-017 hybrid-transport)
+  - Wire format per mpi2_tool.h:171-200 (`MPI2_TOOLBOX_ISTWI_READ_WRITE_REQUEST`): Tool=0x03, Function=0x17, Action=0x01 (READ_DATA), TxDataLength=0, RxDataLength=256
+  - Reply parsing per mpi2_tool.h:214-228: checks IOCStatus at offset 0x0E for SUCCESS
+  - Output handling (raw bytes / JSON / SHA256 to stderr) unchanged from original implementation
 
 ### Added
 - MPI2_FLASH_LAYOUT struct + parser (ADR-015 Rule 11a)
@@ -47,6 +56,15 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
   - Computes SHA256 hash of SBR bytes and prints to stderr in all modes
 - `src/sbr/parse.rs` serde Serialize/Deserialize derives on MfgFields and Sbr structs
 - src/cli/sbr.rs test module with canned SBR byte tests for JSON serialization round-trip
+- `src/card/mod.rs`: extend `Card` trait with `sbr_read()` method (NotImplemented default)
+  - Added `chip_family_from_pci(vid, did)` helper function with VID:DID → ChipFamily table lookup
+  - Rewrote `discover_one(bdf)` to read sysfs vendor/device IDs, dispatch by chip family
+  - Returns `UnsupportedCard(vid, did)` cleanly for unknown devices instead of misleading "no IOC" errors
+- `src/card/mpt.rs`: implement `MptCard::sbr_read()` using TOOLBOX_ISTWI via Mpt3CtlTransport
+  - Wire format per mpi2_tool.h:171-200; reply parsing per mpi2_tool.h:214-228
+  - DevIndex = 0x00 (SBR EEPROM on SAS2008); Action = READ_DATA (0x01); RxDataLength = 256
+  - Tests: `test_mptcard_sbr_read_via_mock_transport()` verifies wire format + canned payload
+- `src/card/mpt.rs`: unit tests for chip_family_from_pci table lookup (known + Unknown cases)
 - `src/mpi/real_ioc.rs` `RealIoc` backend scaffolding (cycle 1) — `IocBackend`
   trait impl with `todo!()` bodies; tests against `MockPlatform`
 - `src/mpi/mmap_region.rs` — persistent read-write BAR1 mmap (cycle 2a). Holds

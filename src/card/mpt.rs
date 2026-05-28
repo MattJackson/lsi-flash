@@ -259,31 +259,112 @@ impl Card for MptCard {
         // via CONFIG ioctl which has its own off-by-N (see TODO in cli/detect.rs:265-269).
         Err(CardError::NotImplemented("current_personality"))
     }
-}
 
-// ============================================================================
-// BackupManifest and SourceCardInfo for manifest writing (not returned in report)
-// ============================================================================
+    /// Read the 256-byte SBR from the chip's I2C EEPROM via TOOLBOX_ISTWI.
+    ///
+    /// Wire format per `mpi2_tool.h:171-200` (`MPI2_TOOLBOX_ISTWI_READ_WRITE_REQUEST`):
+    /// - Tool = 0x03 (MPI2_TOOLBOX_ISTWI_READ_WRITE_TOOL) at offset 0x00
+    /// - Function = 0x17 (MPI_FUNCTION_TOOLBOX) at offset 0x03
+    /// - DevIndex at offset 0x14 — SBR EEPROM is typically 0x00 on SAS2008 (first ISTWI device)
+    /// - Action = 0x01 (MPI2_TOOL_ISTWI_ACTION_READ_DATA) at offset 0x15
+    /// - TxDataLength = 0 at offset 0x18 (pure read)
+    /// - RxDataLength = 256 at offset 0x1A (full SBR)
+    /// - Total header/body size = 48 bytes (0x30), SGL at offset 0x30
+    ///
+    /// Reply format per `mpi2_tool.h:214-228` (`MPI2_TOOLBOX_ISTWI_REPLY`):
+    /// - IOCStatus at offset 0x0E (U16 LE) — 0 = SUCCESS
+    /// - IstwiStatus at offset 0x16 (U8)
+    ///
+    /// Transport: uses Mpt3CtlTransport's send_with_sge_offset with data_sge_offset_words=12.
+    fn sbr_read(&mut self) -> Result<[u8; 256], CardError> {
+        // Build 48-byte TOOLBOX_ISTWI request per mpi2_tool.h:171-196 (struct size before SGL).
+        let mut req = Vec::with_capacity(48);
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BackupManifest {
-    timestamp: String,
-    sas_wwn: Option<String>,
-    artifacts: Vec<crate::card::BackupArtifact>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_card: Option<SourceCardInfo>,
-}
+        // Offset 0x00: Tool = MPI2_TOOLBOX_ISTWI_READ_WRITE_TOOL = 0x03
+        req.push(0x03);
+        // Offset 0x01: Reserved1
+        req.push(0x00);
+        // Offset 0x02: ChainOffset
+        req.push(0x00);
+        // Offset 0x03: Function = MPI_FUNCTION_TOOLBOX = 0x17
+        req.push(MpiFunction::Toolbox.as_u8());
+        // Offset 0x04-0x05: Reserved2 (U16)
+        req.extend_from_slice(&0u16.to_le_bytes());
+        // Offset 0x06: Reserved3
+        req.push(0x00);
+        // Offset 0x07: MsgFlags
+        req.push(0x00);
+        // Offset 0x08: VP_ID
+        req.push(0x00);
+        // Offset 0x09: VF_ID
+        req.push(0x00);
+        // Offset 0x0A-0x0B: Reserved4 (U16)
+        req.extend_from_slice(&0u16.to_le_bytes());
+        // Offset 0x0C-0x0F: Reserved5, Reserved6 (U32 each)
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        // Offset 0x14: DevIndex = 0x00 (SBR EEPROM on SAS2008; first ISTWI device)
+        req.push(0x00);
+        // Offset 0x15: Action = MPI2_TOOL_ISTWI_ACTION_READ_DATA = 0x01
+        req.push(0x01);
+        // Offset 0x16: SGLFlags (kernel inserts real SGE, this is informational)
+        req.push(0x00);
+        // Offset 0x17: Reserved7
+        req.push(0x00);
+        // Offset 0x18-0x19: TxDataLength = 0 (pure read operation)
+        req.extend_from_slice(&0u16.to_le_bytes());
+        // Offset 0x1A-0x1B: RxDataLength = 256 (full SBR size)
+        req.extend_from_slice(&256u16.to_le_bytes());
+        // Offset 0x1C-0x2F: Reserved8..Reserved12 (U32 each, 5 x 4 bytes = 20 bytes)
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SourceCardInfo {
-    pci_vid: u16,
-    pci_did: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    subsystem_vid: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    subsystem_did: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    friendly_name: Option<String>,
+        debug_assert_eq!(
+            req.len(),
+            48,
+            "TOOLBOX_ISTWI request must be exactly 48 bytes"
+        );
+
+        let mut sbr = [0u8; 256];
+        let mut reply_buf = vec![0u8; 64];
+
+        // Send via transport with SGL offset at word 12 (48 bytes / 4 = 12)
+        // Kernel will insert the SGE pointing at our sbr buffer.
+        self.transport
+            .send_with_sge_offset(&req, 12, &mut reply_buf, Some(&mut sbr), None)
+            .map_err(|e| CardError::Transport(format!("TOOLBOX_ISTWI send: {}", e)))?;
+
+        // Parse reply for IOCStatus per mpi2_tool.h:214-228 (MPI2_TOOLBOX_ISTWI_REPLY).
+        // IOCStatus is at offset 0x0E (U16 LE).
+        if reply_buf.len() < 16 {
+            return Err(CardError::Transport(format!(
+                "TOOLBOX_ISTWI reply too short: {} bytes",
+                reply_buf.len()
+            )));
+        }
+
+        let ioc_status_raw = u16::from_le_bytes([reply_buf[0x0E], reply_buf[0x0F]]);
+        match IocStatus::from_u16(ioc_status_raw) {
+            Ok(IocStatus::Success) => {}
+            Ok(status) => {
+                return Err(CardError::Transport(format!(
+                    "TOOLBOX_ISTWI IOCStatus={:?} (raw 0x{:04x})",
+                    status, ioc_status_raw
+                )));
+            }
+            Err(e) => {
+                return Err(CardError::Transport(format!(
+                    "TOOLBOX_ISTWI invalid IOCStatus {:?}: {}",
+                    ioc_status_raw, e
+                )));
+            }
+        }
+
+        Ok(sbr)
+    }
 }
 
 // ============================================================================
@@ -293,9 +374,10 @@ struct SourceCardInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::card::{Card, ChipFamily};
+    use crate::card::{chip_family_from_pci, Card, ChipFamily};
 
-    /// Mock transport for testing MptCard without real hardware
+    /// Mock transport for testing MptCard without real hardware.
+    /// Captures requests and returns canned responses for various MPI operations.
     struct MockTransport {
         _phantom: (),
     }
@@ -304,18 +386,16 @@ mod tests {
         fn send_with_sge_offset(
             &mut self,
             request: &[u8],
-            _data_sge_offset_words: u32,
+            data_sge_offset_words: u32,
             reply: &mut [u8],
             data_in: Option<&mut [u8]>,
-            _data_out: Option<&[u8]>,
+            _data_out: Option<&mut [u8]>,
         ) -> Result<usize, crate::mpt::TransportError> {
-            // Mock IOC_FACTS reply (12 bytes)
+            // Mock IOC_FACTS reply - per detect() expects IOCStatus at offset 2-3 in 12-byte request
             if request.len() == 12 && request[3] == MpiFunction::IocFacts.as_u8() {
-                reply[0] = 0x00; // Version
-                reply[1] = 0x02; // MPI Version High
-                reply[2] = 0x00; // IOC Status (Success)
+                reply[2] = 0x00; // IOC Status Success (offset 2-3 per detect() read)
                 reply[3] = 0x00;
-                return Ok(12);
+                return Ok(16);
             }
 
             // Mock FW_UPLOAD reply for each image_type
@@ -323,11 +403,11 @@ mod tests {
                 let image_type_byte = request[0];
                 let img_type = ImageType::from_u8(image_type_byte).unwrap_or(ImageType::Fw);
 
-                // Write success status to reply
-                reply[2] = 0x00; // IOC Status Success
-                reply[3] = 0x00;
+                // Write success status to reply (offset 14-15 for IOCStatus)
+                reply[14] = 0x00; // IOC Status Success low byte
+                reply[15] = 0x00; // IOC Status Success high byte
 
-                // Write actual_image_size to offset 16-19 of reply (per FwUploadReply layout)
+                // Write actual_image_size to offset 20-23 of reply (per FwUploadReply layout)
                 let image_size = match img_type {
                     ImageType::Fw => 885000u32,         // ~885 KB from dev-1 measurement
                     ImageType::Bios => 65536u32,        // 64 KB BIOS ROM
@@ -335,9 +415,9 @@ mod tests {
                     _ => 0,
                 };
 
-                reply[16..20].copy_from_slice(&image_size.to_le_bytes());
+                reply[20..24].copy_from_slice(&image_size.to_le_bytes());
 
-                // Fill data_in with dummy image data
+                // Fill data_in with dummy image data if provided
                 if let Some(buf) = data_in {
                     for (i, byte) in buf.iter_mut().enumerate() {
                         *byte = (i % 256) as u8;
@@ -347,10 +427,114 @@ mod tests {
                 return Ok(32); // Reply size
             }
 
+            // Mock TOOLBOX_ISTWI reply - captures request bytes for verification
+            if request.len() == 48 && request[0] == 0x03 {
+                // Verify it's a TOOLBOX_ISTWI_READ_WRITE_TOOL request (Tool=0x03)
+                assert_eq!(
+                    request[3],
+                    MpiFunction::Toolbox.as_u8(),
+                    "Function must be Toolbox"
+                );
+                assert_eq!(
+                    data_sge_offset_words, 12,
+                    "SGL offset must be 12 words (48 bytes)"
+                );
+
+                // Check Action field at offset 0x15 = READ_DATA (0x01)
+                if request.len() > 0x15 {
+                    assert_eq!(request[0x15], 0x01, "Action must be READ_DATA");
+                }
+
+                // Check RxDataLength at offset 0x1A-0x1B = 256
+                if request.len() > 0x1C {
+                    let rx_len = u16::from_le_bytes([request[0x1A], request[0x1B]]);
+                    assert_eq!(rx_len, 256, "RxDataLength must be 256");
+                }
+
+                // Fill data_in (the sbr buffer) with a canned 256-byte payload.
+                // Note: TOOLBOX_ISTWI reads flow IOC→host via data_in parameter per mpt3ctl semantics.
+                if let Some(buf) = data_in {
+                    for (i, byte) in buf.iter_mut().enumerate() {
+                        *byte = (i % 256) as u8;
+                    }
+                }
+
+                // Write success status to reply at offset 0x0E-0x0F (IOCStatus)
+                reply[0x0E] = 0x00; // IOC Status Success low byte
+                reply[0x0F] = 0x00; // IOC Status Success high byte
+
+                return Ok(16); // Reply size for TOOLBOX_ISTWI_REPLY header
+            }
+
             Err(crate::mpt::TransportError::Other(
                 "unexpected request".into(),
             ))
         }
+    }
+
+    /// Test chip_family_from_pci mapping for known SAS2008 VID:DID pairs.
+    #[test]
+    fn test_chip_family_from_pci_known_mappings() {
+        // LSI 9211-8i IT/IR (Dell H200 Adapter) - confirmed in card-database.toml
+        assert_eq!(chip_family_from_pci(0x1000, 0x0072), ChipFamily::Sas2008);
+
+        // LSI 9211-8i IMR (Dell H310 Mini Mono) - confirmed in card-database.toml
+        assert_eq!(chip_family_from_pci(0x1000, 0x0073), ChipFamily::Sas2008);
+
+        // Sas2208 single confirmed entry (Lenovo ServeRAID M5110)
+        assert_eq!(chip_family_from_pci(0x1000, 0x0084), ChipFamily::Sas2208);
+
+        // Sas3008 single confirmed entry (LSI 9300 series)
+        assert_eq!(chip_family_from_pci(0x1000, 0x00C0), ChipFamily::Sas3008);
+    }
+
+    /// Test chip_family_from_pci returns Unknown for unknown VID:DID pairs.
+    #[test]
+    fn test_chip_family_from_pci_unknown() {
+        // Completely unknown device
+        assert_eq!(chip_family_from_pci(0x1234, 0x5678), ChipFamily::Unknown);
+
+        // LSI VID but unknown DID in Sas2208 range marked Unknown
+        assert_eq!(chip_family_from_pci(0x1000, 0x0085), ChipFamily::Unknown);
+
+        // LSI VID but unknown DID in Sas3008 range marked Unknown
+        assert_eq!(chip_family_from_pci(0x1000, 0x00C1), ChipFamily::Unknown);
+    }
+
+    /// Test MptCard::sbr_read via MockTransport - verifies wire format and canned response.
+    #[test]
+    fn test_mptcard_sbr_read_via_mock_transport() {
+        let transport = Box::new(MockTransport { _phantom: () });
+
+        let mut card = MptCard {
+            identity: CardIdentity {
+                bdf: "0000:03:00.0".to_string(),
+                vendor_id: 0x1000,
+                device_id: 0x0072,
+                subsystem_vid: Some(0x1028),
+                subsystem_did: Some(0x1F1D),
+                chip_family: ChipFamily::Sas2008,
+                friendly_name: None,
+            },
+            transport,
+        };
+
+        let sbr_bytes = card.sbr_read().expect("sbr_read should succeed with mock");
+
+        // Verify the returned bytes match the canned payload (i % 256)
+        for (i, &byte) in sbr_bytes.iter().enumerate() {
+            assert_eq!(
+                byte,
+                (i % 256) as u8,
+                "SBR byte at offset {} should match canned payload",
+                i
+            );
+        }
+
+        // Verify first few bytes are predictable
+        assert_eq!(sbr_bytes[0], 0x00);
+        assert_eq!(sbr_bytes[1], 0x01);
+        assert_eq!(sbr_bytes[255], 0xFF);
     }
 
     /// MptCard::identity() returns its identity — construct an MptCard using a MockTransport
@@ -475,3 +659,30 @@ mod tests {
         assert_send::<MptCard>();
     }
 }
+
+// ============================================================================
+// BackupManifest and SourceCardInfo for manifest writing (not returned in report)
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupManifest {
+    timestamp: String,
+    sas_wwn: Option<String>,
+    artifacts: Vec<crate::card::BackupArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_card: Option<SourceCardInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SourceCardInfo {
+    pci_vid: u16,
+    pci_did: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subsystem_vid: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subsystem_did: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    friendly_name: Option<String>,
+}
+
+// ============================================================================

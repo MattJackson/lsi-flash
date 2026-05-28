@@ -102,7 +102,7 @@ pub trait MptTransport: Send {
         request: &[u8],
         reply: &mut [u8],
         data_in: Option<&mut [u8]>,
-        data_out: Option<&[u8]>,
+        data_out: Option<&mut [u8]>,
     ) -> Result<usize, TransportError> {
         self.send_with_sge_offset(request, 5, reply, data_in, data_out)
     }
@@ -116,7 +116,7 @@ pub trait MptTransport: Send {
         data_sge_offset_words: u32,
         reply: &mut [u8],
         data_in: Option<&mut [u8]>,
-        data_out: Option<&[u8]>,
+        data_out: Option<&mut [u8]>,
     ) -> Result<usize, TransportError>;
 }
 

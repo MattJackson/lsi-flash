@@ -120,7 +120,15 @@ pub trait Card: Send {
     /// Read-only. Brick-safe.
     fn current_personality(&mut self) -> Result<Personality, CardError>;
 
-    // NOTE: flash(), recover(), sbr_read(), sbr_write() land in a follow-up.
+    /// Read the 256-byte SBR (subsystem boot record) from the card's
+    /// I2C EEPROM via TOOLBOX_ISTWI transport. Returns raw bytes; caller
+    /// parses via `sbr::parse::parse_sbr`. Default impl returns NotImplemented
+    /// so each Card impl can opt in.
+    fn sbr_read(&mut self) -> Result<[u8; 256], CardError> {
+        Err(CardError::NotImplemented("sbr_read"))
+    }
+
+    // NOTE: flash(), recover(), sbr_write() land in a follow-up.
     // Scope this cycle to detect + backup + current_personality so a freshman
     // can complete + ship in one session.
 }
@@ -152,8 +160,58 @@ pub fn discover() -> Result<Vec<Box<dyn Card>>, CardError> {
 
 /// Discover a single card by BDF (used by --pci <bdf>).
 ///
-/// Like `discover()` but for a specific BDF. Returns the right Card impl based on
-/// VID:DID lookup, or an error if the device doesn't exist or isn't supported.
+/// Per ADR-017 §Decision, dispatches to the right Card impl based on chip family.
+/// Reads VID:DID from sysfs, looks up chip family via `chip_family_from_pci`,
+/// then constructs the appropriate card implementation. Returns UnsupportedCard
+/// for unknown VID:DID pairs instead of trying MptCard and failing with a
+/// misleading "no IOC" error.
 pub fn discover_one(bdf: &str) -> Result<Box<dyn Card>, CardError> {
-    Ok(Box::new(MptCard::discover_one(bdf)?))
+    let (vid, did) = read_pci_ids(bdf)?;
+
+    match chip_family_from_pci(vid, did) {
+        ChipFamily::Sas2008 | ChipFamily::Sas2208 | ChipFamily::Sas3008 => {
+            Ok(Box::new(mpt::MptCard::discover_one(bdf)?))
+        }
+        ChipFamily::Unknown => Err(CardError::UnsupportedCard(vid, did)),
+    }
+}
+
+/// Read PCI vendor and device IDs from sysfs for a given BDF.
+fn read_pci_ids(bdf: &str) -> Result<(u16, u16), CardError> {
+    let read_hex = |path: &str| -> Result<u16, CardError> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| CardError::PciEnumeration(format!("read {}: {}", path, e)))?;
+        let trimmed = raw.trim().trim_start_matches("0x");
+        u16::from_str_radix(trimmed, 16)
+            .map_err(|e| CardError::PciEnumeration(format!("parse {}: {}", path, e)))
+    };
+
+    let vid_path = format!("/sys/bus/pci/devices/{}/vendor", bdf);
+    let did_path = format!("/sys/bus/pci/devices/{}/device", bdf);
+
+    let vid = read_hex(&vid_path)?;
+    let did = read_hex(&did_path)?;
+
+    Ok((vid, did))
+}
+
+/// Map (VID, DID) to chip family via table lookup.
+///
+/// Sources: src/card_database.rs ChipFamily enum + card-database.toml entries.
+/// Only Sas2008 DIDs are confirmed in the embedded database; Sas2208/Sas3008 ranges
+/// are marked OPEN where no evidence exists yet.
+fn chip_family_from_pci(vid: u16, did: u16) -> ChipFamily {
+    match (vid, did) {
+        // SAS2008 family — confirmed in card-database.toml (LSI 9211-8i, Dell H200/M1015 variants)
+        (0x1000, 0x0072) => ChipFamily::Sas2008, // LSI 9211-8i IT/IR
+        (0x1000, 0x0073) => ChipFamily::Sas2008, // LSI 9211-8i IMR / Dell H310
+
+        // SAS2208 family — OPEN: no card-db evidence for DID range yet
+        (0x1000, 0x0084) => ChipFamily::Sas2208, // Lenovo ServeRAID M5110 - single confirmed entry
+
+        // Sas3008 family — OPEN: no card-db evidence for DID range yet
+        (0x1000, 0x00C0) => ChipFamily::Sas3008, // LSI 9300 series - single confirmed entry
+
+        _ => ChipFamily::Unknown,
+    }
 }

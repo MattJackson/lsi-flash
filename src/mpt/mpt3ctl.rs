@@ -439,7 +439,7 @@ impl super::MptTransport for Mpt3CtlTransport {
         data_sge_offset_words: u32,
         reply: &mut [u8],
         data_in: Option<&mut [u8]>,
-        data_out: Option<&[u8]>,
+        data_out: Option<&mut [u8]>,
     ) -> Result<usize, super::TransportError> {
         // The kernel reads the MPI request from offset `MF_OFFSET` (68) within
         // our user-space buffer, not from `sizeof(struct)` (72) — the trailing
