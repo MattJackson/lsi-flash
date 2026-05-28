@@ -183,34 +183,80 @@ fn ioc_info_ioctl_number(size: usize) -> IoctlReq {
     (dir | size_field | type_ | nr) as IoctlReq
 }
 
-/// PCI information union from kernel header.
+/// PCI information returned by MPT3IOCINFO. Layout verified against
+/// `linux-source-6.8.0/.../mpt3sas_ctl.h:154-163`:
+///
+/// ```c
+/// struct mpt3_ioctl_pci_info {
+///     union {
+///         struct {
+///             uint32_t device:5;
+///             uint32_t function:3;
+///             uint32_t bus:24;
+///         } bits;
+///         uint32_t  word;
+///     } u;
+///     uint32_t segment_id;
+/// };
+/// ```
+///
+/// 8 bytes total. Freshman's earlier 4-byte version was missing `segment_id`
+/// and threw off every offset in the parent `Mpt3IoctlIocinfo` struct.
 #[repr(C)]
+#[derive(Default, Copy, Clone)]
 struct Mpt3PciInformation {
+    /// The bus/device/function bitfield, accessed as a u32 word.
+    /// Layout (little-endian): bits 0-4=device, 5-7=function, 8-31=bus.
     word: u32,
+    segment_id: u32,
 }
 
-/// IOC information structure returned by MPT3IOCINFO ioctl.
+/// IOC information structure returned by MPT3IOCINFO ioctl. Layout verified
+/// against `linux-source-6.8.0/.../mpt3sas_ctl.h:198-216`:
+///
+/// ```c
+/// struct mpt3_ioctl_iocinfo {
+///     struct mpt3_ioctl_header hdr;        /* 12 */
+///     uint32_t adapter_type;               /* 12+4=16 */
+///     uint32_t port_number;                /* 20 */
+///     uint32_t pci_id;                     /* 24 */
+///     uint32_t hw_rev;                     /* 28 */
+///     uint32_t subsystem_device;           /* 32 */
+///     uint32_t subsystem_vendor;           /* 36 */
+///     uint32_t rsvd0;                      /* 40 */
+///     uint32_t firmware_version;           /* 44 */
+///     uint32_t bios_version;               /* 48 */
+///     uint8_t driver_version[32];          /* 52..84 */
+///     uint8_t rsvd1;                       /* 84 */
+///     uint8_t scsi_id;                     /* 85 */
+///     uint16_t rsvd2;                      /* 86 */
+///     struct mpt3_ioctl_pci_info pci_information;  /* 88..96 (8 bytes) */
+/// };
+/// ```
+///
+/// Total: 96 bytes. Freshman's first version invented fields (`max_sge`,
+/// `ioc_state`, `product_id`) that don't exist — caused the ioctl to write
+/// the real data into our buffer but at offsets we then read as garbage.
+/// Dev-1 finding 2026-05-28: `find_ioc_number` returned NotFound because
+/// `pci_information.word` was reading the wrong bytes.
 #[repr(C)]
+#[derive(Default)]
 struct Mpt3IoctlIocinfo {
     hdr: Mpt3IoctlHeader,
-    max_sge: u32,
-    ioc_state: u32,
-    product_id: [u8; 16],
+    adapter_type: u32,
+    port_number: u32,
+    pci_id: u32,
+    hw_rev: u32,
+    subsystem_device: u32,
+    subsystem_vendor: u32,
+    rsvd0: u32,
+    firmware_version: u32,
+    bios_version: u32,
+    driver_version: [u8; 32],
+    rsvd1: u8,
+    scsi_id: u8,
+    rsvd2: u16,
     pci_information: Mpt3PciInformation,
-    _reserved: [u8; 60],
-}
-
-impl Default for Mpt3IoctlIocinfo {
-    fn default() -> Self {
-        Self {
-            hdr: Default::default(),
-            max_sge: 0,
-            ioc_state: 0,
-            product_id: [0; 16],
-            pci_information: Mpt3PciInformation { word: 0 },
-            _reserved: [0; 60],
-        }
-    }
 }
 
 /// Header structure for ioctl commands.
@@ -311,38 +357,46 @@ fn find_ioc_number(
     target_dev: u8,
     target_fn: u8,
 ) -> Result<u32, super::TransportError> {
-    // Segment ID is in bits 15-31 of the word. On little-endian x86_64, we pack it as:
-    // bits 0-4 = device, 5-7 = function, 8-31 = bus (bus already includes segment in kernel layout)
-    // Actually, looking at kernel header more carefully: pci_information.word encodes
-    // just bus/device/function; segment is stored separately elsewhere. For simplicity,
-    // we'll match on bus/device/function only since that's what the kernel exposes.
+    // Bitfield layout per mpt3sas_ctl.h:154-163:
+    //   bits 0-4 = device, 5-7 = function, 8-31 = bus
+    // Pack our target the same way for direct word-compare against the kernel's reply.
+    let target_word = ((target_bus as u32 & 0xff_ffff) << 8)
+        | ((target_fn as u32 & 0x7) << 5)
+        | (target_dev as u32 & 0x1f);
+    let target_seg_u32 = target_seg as u32;
 
-    let target_word = ((target_bus as u32) << 8) | ((target_fn as u32) << 5) | (target_dev as u32);
-
-    for candidate in 0..16 {
+    let mut tried = Vec::with_capacity(8);
+    for candidate in 0..16u32 {
         let mut info: Mpt3IoctlIocinfo = Default::default();
         info.hdr.ioc_number = candidate;
+        info.hdr.max_data_size = std::mem::size_of::<Mpt3IoctlIocinfo>() as u32;
 
         let size = std::mem::size_of::<Mpt3IoctlIocinfo>();
         let ioctl_num = ioc_info_ioctl_number(size);
 
-        // Safety: we're passing a valid pointer to our struct, and the kernel only writes to it
+        // Safety: we're passing a valid pointer to our struct, and the kernel only writes to it.
         let result =
             unsafe { libc::ioctl(fd.as_raw_fd(), ioctl_num, &mut info as *mut _ as *mut _) };
 
         if result < 0 {
-            continue; // No IOC with this number or permission denied
+            continue; // No IOC with this number or permission denied.
         }
 
-        let pci = info.pci_information;
-        if pci.word == target_word {
+        let pci = &info.pci_information;
+        tried.push(format!(
+            "ioc{}: seg=0x{:04x} word=0x{:08x}",
+            candidate, pci.segment_id, pci.word
+        ));
+        if pci.segment_id == target_seg_u32 && pci.word == target_word {
             return Ok(candidate);
         }
     }
 
     Err(super::TransportError::NotFound(format!(
-        "no mpt3sas IOC found for BDF {}:0.{}.{}",
-        target_seg, target_bus, target_dev
+        "no mpt3sas IOC found for BDF {:04x}:{:02x}:{:02x}.{} (looking for seg=0x{:04x} word=0x{:08x}); enumerated [{}]",
+        target_seg, target_bus, target_dev, target_fn,
+        target_seg_u32, target_word,
+        tried.join(", ")
     )))
 }
 
