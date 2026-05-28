@@ -6,6 +6,11 @@
 //! ioctl, VFIO+doorbell). The `lsi-flash` binary is one consumer of this
 //! library. See ADR-017 (Card + transport) and ADR-018 (this extraction).
 
+// ADR-018 Phase 2: surface every over-exposed `pub` so it can be demoted to
+// `pub(crate)`. See 01-architecture/adr/018-liblsi-library-extraction.md.
+#![deny(unreachable_pub)]
+
+#[allow(unused_imports)]
 pub mod card;
 pub mod card_database;
 pub mod cli;

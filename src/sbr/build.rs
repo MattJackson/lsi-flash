@@ -1,10 +1,11 @@
 //! SBR builder — synthesize a 256-byte SBR from a base template + identity.
+#![allow(dead_code)]
 
 use crate::sbr::parse::{MFG_OFFSET_BACKUP, MFG_OFFSET_PRIMARY};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum BuildError {
+pub(crate) enum BuildError {
     #[error("unknown identity {0:?} — not in card-database.toml")]
     UnknownIdentity(String),
     #[error("invalid SAS WWN: {reason}")]
@@ -16,7 +17,7 @@ pub enum BuildError {
 }
 
 #[derive(Debug, Clone)]
-pub struct IdentityPayload {
+pub(crate) struct IdentityPayload {
     pub pci_vid: u16,
     pub pci_did: u16,
     pub subsys_vid: u16,
@@ -25,7 +26,10 @@ pub struct IdentityPayload {
     pub board_name: String,
 }
 
-pub fn build_sbr(template: &[u8], identity: &IdentityPayload) -> Result<[u8; 256], BuildError> {
+pub(crate) fn build_sbr(
+    template: &[u8],
+    identity: &IdentityPayload,
+) -> Result<[u8; 256], BuildError> {
     if template.len() != 256 {
         return Err(BuildError::InvalidTemplate(format!(
             "template must be 256 bytes, got {}",

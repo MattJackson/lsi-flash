@@ -10,6 +10,7 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 ## [Unreleased]
 
 ### Changed
+- Tightened library public surface: demoted internal items to `pub(crate)` (ADR-018 Phase 2). Added `#![deny(unreachable_pub)]` in `src/lib.rs`; demoted `BuildError`, `IdentityPayload`, and `build_sbr()` in `src/sbr/build.rs` from `pub` to `pub(crate)` as these are internal implementation details not part of the public API contract.
 - ADR-018 Phase 1: library extraction — split monolithic binary into `liblsi` crate; created `src/lib.rs` with public modules + curated re-exports, moved CLI entry to `src/bin/lsi-flash.rs`, renamed package from `lsi-flash` to `liblsi` while preserving `lsi-flash` binary name; `cargo build --release` still produces `target/release/lsi-flash` (mechanical refactor, no behavior change)
 - MptCard `Card` impl — concrete implementation for Fusion-MPT chips (SAS2008/SAS2208/SAS3008)
   - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub, plus `sbr_read()` via pluggable `SbrTransport` trait (VFIO+I²C bit-bang today; ISTWI stubbed for future)

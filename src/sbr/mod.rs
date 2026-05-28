@@ -1,7 +1,7 @@
 //! SBR (Subsystem Boot Record) module for lsi-flash.
 //! Port of sbrtool.py: parse/build/checksum operations.
 
-pub mod build;
+mod build;
 pub mod i2c;
 pub mod parse;
 pub mod transport;
