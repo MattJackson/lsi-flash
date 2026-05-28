@@ -10,7 +10,6 @@
 // `pub(crate)`. See 01-architecture/adr/018-liblsi-library-extraction.md.
 #![deny(unreachable_pub)]
 
-#[allow(unused_imports)]
 pub mod card;
 pub mod card_database;
 pub mod cli;

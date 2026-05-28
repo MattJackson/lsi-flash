@@ -1,4 +1,11 @@
 //! SBR builder — synthesize a 256-byte SBR from a base template + identity.
+//!
+//! Wired ahead of its consumer: the only caller is `sbr build`
+//! (`crate::cli::sbr::run_build`), which is currently a deliberate stub
+//! pending SBR template resources (`resources/sbr/<vendor>.sbr`). Until that
+//! lands, every item here is dead in non-test builds — hence the
+//! module-level allow. This is intentional, not forgotten; remove the allow
+//! once `run_build` calls `build_sbr`.
 #![allow(dead_code)]
 
 use crate::sbr::parse::{MFG_OFFSET_BACKUP, MFG_OFFSET_PRIMARY};
