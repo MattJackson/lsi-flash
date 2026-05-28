@@ -67,6 +67,14 @@ const MAP_HUGETLB: libc::c_int = 0x40000;
 
 /// PCI BAR index — BAR1 is what holds the MPI doorbell registers on SAS2008.
 const VFIO_PCI_BAR1_REGION_INDEX: u32 = 1;
+/// PCI config-space region index per kernel vfio-pci. Used to enable bus
+/// master (BME) after bind — vfio-pci leaves BME=0 for security; the
+/// chip can't DMA until we set it.
+const VFIO_PCI_CONFIG_REGION_INDEX: u32 = 7;
+/// Offset of PCI Command register within config space (2 bytes, LE).
+const PCI_COMMAND_OFFSET: u64 = 0x04;
+/// Bus Master Enable bit in PCI Command register.
+const PCI_COMMAND_MASTER: u16 = 0x0004;
 
 /// VFIO group status reply.
 #[repr(C)]
@@ -376,6 +384,15 @@ impl VfioBackend {
                 std::io::Error::last_os_error()
             )));
         }
+
+        // 12. enable PCI bus master. vfio-pci leaves BME=0 by default for
+        //     security — without this, the chip parses our FW_UPLOAD doorbell
+        //     request, attempts DMA writes, but the PCIe root complex silently
+        //     drops them. Chip returns Success because from its perspective it
+        //     issued the writes. We discover the missing data only when we
+        //     read the supposedly-DMA'd buffer and find zeros.
+        //     Caught on dev-1 first-real-DMA attempt 2026-05-28.
+        enable_bus_master(device_fd)?;
 
         // Commit the bind guard — from here on, Self's own Drop owns the
         // restore_driver responsibility.
@@ -731,6 +748,53 @@ fn restore_driver(bdf: &str, original: Option<&str>) -> Result<(), HwError> {
             "warning: restore_driver({}) ended bound to {:?}, original was {:?}",
             bdf, now, original
         );
+    }
+    Ok(())
+}
+
+/// Enable PCI bus master on the device via VFIO config-space region. The
+/// device fd's config-space region (index 7) is accessible via pread/pwrite
+/// at the region's reported offset. Sets the BME bit in the Command register
+/// while preserving every other bit (MEM, I/O, INTx etc.) the kernel chose
+/// when it bound vfio-pci.
+fn enable_bus_master(device_fd: RawFd) -> Result<(), HwError> {
+    use std::os::unix::io::FromRawFd;
+    // Query config region for its offset within device_fd.
+    let mut region = VfioRegionInfo {
+        argsz: std::mem::size_of::<VfioRegionInfo>() as u32,
+        index: VFIO_PCI_CONFIG_REGION_INDEX,
+        ..Default::default()
+    };
+    ioctl_ref(
+        device_fd,
+        VFIO_DEVICE_GET_REGION_INFO,
+        &mut region as *mut _ as *mut libc::c_void,
+    )
+    .map_err(|e| HwError::Preflight(format!("config region info: {}", e)))?;
+
+    // Borrow the device fd as a File for pread/pwrite — but DON'T let the
+    // File's Drop close it (we still own device_fd via VfioBackend).
+    let cfg_offset = region.offset + PCI_COMMAND_OFFSET;
+    let dup = unsafe { libc::dup(device_fd) };
+    if dup < 0 {
+        return Err(HwError::Preflight(format!(
+            "dup(device_fd) for config rw: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let cfg_file = unsafe { File::from_raw_fd(dup) };
+
+    use std::os::unix::fs::FileExt;
+    let mut cmd_bytes = [0u8; 2];
+    cfg_file
+        .read_exact_at(&mut cmd_bytes, cfg_offset)
+        .map_err(|e| HwError::Preflight(format!("read PCI Command: {}", e)))?;
+    let cur = u16::from_le_bytes(cmd_bytes);
+    let new = cur | PCI_COMMAND_MASTER;
+    if new != cur {
+        cfg_file
+            .write_all_at(&new.to_le_bytes(), cfg_offset)
+            .map_err(|e| HwError::Preflight(format!("write PCI Command: {}", e)))?;
     }
     Ok(())
 }
