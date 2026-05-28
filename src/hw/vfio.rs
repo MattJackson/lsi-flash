@@ -632,9 +632,13 @@ fn group_info_for(bdf: &str) -> Result<VfioGroupInfo, HwError> {
             reason: format!("iommu_group target has no basename: {:?}", target),
         })?
         .to_string();
-    // The `noiommu` marker is a 0-byte file inside the group's sysfs dir,
-    // created by the kernel when vfio-pci binds a device in noiommu mode.
-    let is_noiommu = target.join("noiommu").exists();
+    // noiommu detection: the kernel sets <group>/name to "vfio-noiommu" when
+    // vfio-pci binds a device in noiommu mode. (Verified on dev-1 Ubuntu
+    // 24.04 / kernel 6.8: no marker FILE exists; the indicator is the name
+    // sysfs attribute.) Real-IOMMU groups have name absent or empty.
+    let name_path = target.join("name");
+    let name = std::fs::read_to_string(&name_path).unwrap_or_default();
+    let is_noiommu = name.trim() == "vfio-noiommu";
     let dev_path = if is_noiommu {
         PathBuf::from(format!("/dev/vfio/noiommu-{}", group_num))
     } else {
