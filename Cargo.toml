@@ -1,5 +1,5 @@
 [package]
-name = "lsi-flash"
+name = "liblsi"
 version = "0.0.1"
 edition = "2021"
 description = "Cross-flash LSI SAS2008-based HBAs (Dell PERC H200/H310, IBM M1015, LSI 9211-8i) between IT and IR firmware modes."
@@ -7,6 +7,14 @@ license = "MIT"
 repository = "https://github.com/MattJackson/lsi-flash"
 readme = "README.md"
 rust-version = "1.74"
+
+[lib]
+name = "liblsi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lsi-flash"
+path = "src/bin/lsi-flash.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
