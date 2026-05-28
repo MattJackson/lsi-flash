@@ -233,14 +233,23 @@ impl VfioBackend {
     }
 
     pub fn open(bdf: &str) -> Result<Self, HwError> {
-        // 1. preflight: vfio + vfio-pci modules loaded; noiommu mode enabled.
+        // 1. preflight: vfio + vfio-pci modules loaded; noiommu mode enabled
+        //    in /sys/module/vfio/parameters/enable_unsafe_noiommu_mode.
         Self::preflight()?;
 
-        // 2. save current driver so Drop can restore it.
+        // 2. save current driver so we can restore it on failure or Drop.
         let original_driver = current_driver(bdf);
 
-        // 3. driver_override + unbind from current + bind vfio-pci.
+        // 3. driver_override + unbind from current + bind vfio-pci. From this
+        //    point forward, any early return must NOT leave the card on
+        //    vfio-pci with no live VfioBackend to restore it on Drop. The
+        //    `bind_guard` defers `restore_driver` until we commit at the end.
         bind_to_vfio_pci(bdf, original_driver.as_deref())?;
+        let mut bind_guard = BindGuard {
+            bdf,
+            original_driver: original_driver.clone(),
+            committed: false,
+        };
 
         // 4. open VFIO container.
         let container_fd = OpenOptions::new()
@@ -259,22 +268,19 @@ impl VfioBackend {
             )));
         }
 
-        // 6. open the device's VFIO group. dev-1 runs noiommu mode (iommu=off
-        //    in cmdline), so groups appear as /dev/vfio/noiommu-<N>. With a
-        //    real IOMMU, they're /dev/vfio/<N>.
-        let group_num = group_number_for(bdf)?;
-        let group_path = if is_noiommu_mode() {
-            format!("/dev/vfio/noiommu-{}", group_num)
-        } else {
-            format!("/dev/vfio/{}", group_num)
-        };
+        // 6. inspect the device's iommu_group symlink to determine both the
+        //    /dev/vfio/<...> device-node path AND whether we're in noiommu
+        //    mode (per-group, not a host-wide check — vfio-pci creates either
+        //    real-iommu groups or noiommu-prefixed ones based on the device's
+        //    actual IOMMU exposure).
+        let group_info = group_info_for(bdf)?;
         let group_fd = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&group_path)
+            .open(&group_info.dev_path)
             .map_err(|e| HwError::VfioGroupUnavailable {
                 bdf: bdf.to_string(),
-                reason: format!("open {}: {}", group_path, e),
+                reason: format!("open {}: {}", group_info.dev_path.display(), e),
             })?;
 
         // 7. group must be viable (all devices in it bound to vfio-pci).
@@ -306,7 +312,7 @@ impl VfioBackend {
 
         // 9. set IOMMU type on the container. noiommu-mode container accepts
         //    only VFIO_NOIOMMU_IOMMU; real-IOMMU container accepts VFIO_TYPE1.
-        let iommu_type: IoctlReq = if is_noiommu_mode() {
+        let iommu_type: IoctlReq = if group_info.is_noiommu {
             VFIO_NOIOMMU_IOMMU as IoctlReq
         } else {
             VFIO_TYPE1_IOMMU as IoctlReq
@@ -366,6 +372,10 @@ impl VfioBackend {
             )));
         }
 
+        // Commit the bind guard — from here on, Self's own Drop owns the
+        // restore_driver responsibility.
+        bind_guard.committed = true;
+
         Ok(VfioBackend {
             bdf: bdf.to_string(),
             container_fd,
@@ -374,7 +384,7 @@ impl VfioBackend {
             bar1_ptr: bar1_ptr as *mut u8,
             bar1_len,
             original_driver,
-            is_noiommu: is_noiommu_mode(),
+            is_noiommu: group_info.is_noiommu,
             next_iova: IOVA_BASE,
             dma_allocs: Vec::new(),
         })
@@ -391,8 +401,11 @@ impl VfioBackend {
         if !PathBuf::from("/sys/module/vfio_pci").exists() {
             modprobe("vfio-pci")?;
         }
-        // If IOMMU off, ensure vfio's noiommu mode is enabled.
-        if is_noiommu_mode() {
+        // If IOMMU off in kernel cmdline, ensure vfio's noiommu mode is
+        // enabled so vfio-pci will accept devices without IOMMU domains.
+        // Detection: parse /proc/cmdline for `iommu=off`, `intel_iommu=off`,
+        // or `amd_iommu=off`. Each appears as a standalone token.
+        if iommu_disabled_in_cmdline() {
             let path = "/sys/module/vfio/parameters/enable_unsafe_noiommu_mode";
             let cur = std::fs::read_to_string(path).unwrap_or_default();
             if cur.trim() != "Y" {
@@ -406,6 +419,17 @@ impl VfioBackend {
         }
         Ok(())
     }
+}
+
+/// True when any `iommu=off` / `intel_iommu=off` / `amd_iommu=off` flag is
+/// present in /proc/cmdline. Used by preflight to decide whether to enable
+/// vfio's unsafe-noiommu-mode parameter. The actual per-device noiommu
+/// determination happens in `group_info_for` after bind.
+fn iommu_disabled_in_cmdline() -> bool {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    cmdline
+        .split_whitespace()
+        .any(|tok| tok == "iommu=off" || tok == "intel_iommu=off" || tok == "amd_iommu=off")
 }
 
 impl HwBackend for VfioBackend {
@@ -575,33 +599,69 @@ fn modprobe(name: &str) -> Result<(), HwError> {
     Ok(())
 }
 
-/// True when the host runs without IOMMU translation (iommu=off / amd_iommu=off
-/// in kernel cmdline). VFIO needs different group paths + iommu type in this mode.
-fn is_noiommu_mode() -> bool {
-    // /sys/kernel/iommu_groups/ exists but is empty (or doesn't exist) when
-    // IOMMU is disabled.
-    match std::fs::read_dir("/sys/kernel/iommu_groups") {
-        Ok(iter) => iter.count() == 0,
-        Err(_) => true,
-    }
+/// Per-device VFIO group info — both the /dev/vfio/<...> device-node path
+/// AND whether this group is in noiommu mode. Determined by reading the
+/// device's iommu_group symlink (which only exists AFTER bind to vfio-pci)
+/// and checking for the kernel-created `noiommu` marker file inside the
+/// group's sysfs directory.
+struct VfioGroupInfo {
+    dev_path: PathBuf,
+    is_noiommu: bool,
 }
 
-/// Get the IOMMU group number for a PCI device. Works in both real-IOMMU and
-/// noiommu modes — vfio-pci creates a group either way once bound.
-fn group_number_for(bdf: &str) -> Result<u32, HwError> {
+/// Look up VFIO group info for `bdf` after bind. Returns the right device-node
+/// path (`/dev/vfio/<N>` for real-IOMMU groups, `/dev/vfio/noiommu-<N>` for
+/// noiommu groups) so the caller doesn't have to guess.
+fn group_info_for(bdf: &str) -> Result<VfioGroupInfo, HwError> {
     let link = PathBuf::from(format!("/sys/bus/pci/devices/{}/iommu_group", bdf));
-    let target = std::fs::read_link(&link).map_err(|e| HwError::VfioGroupUnavailable {
+    // canonicalize follows the symlink AND any further symlinks; gives us
+    // the real /sys/kernel/iommu_groups/<N> path.
+    let target = std::fs::canonicalize(&link).map_err(|e| HwError::VfioGroupUnavailable {
         bdf: bdf.to_string(),
-        reason: format!("read_link {}: {}", link.display(), e),
+        reason: format!(
+            "canonicalize {}: {} (device may not be bound to vfio-pci yet)",
+            link.display(),
+            e
+        ),
     })?;
-    target
+    let group_num = target
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(|s| s.parse::<u32>().ok())
         .ok_or_else(|| HwError::VfioGroupUnavailable {
             bdf: bdf.to_string(),
-            reason: format!("iommu_group symlink target unparseable: {:?}", target),
-        })
+            reason: format!("iommu_group target has no basename: {:?}", target),
+        })?
+        .to_string();
+    // The `noiommu` marker is a 0-byte file inside the group's sysfs dir,
+    // created by the kernel when vfio-pci binds a device in noiommu mode.
+    let is_noiommu = target.join("noiommu").exists();
+    let dev_path = if is_noiommu {
+        PathBuf::from(format!("/dev/vfio/noiommu-{}", group_num))
+    } else {
+        PathBuf::from(format!("/dev/vfio/{}", group_num))
+    };
+    Ok(VfioGroupInfo {
+        dev_path,
+        is_noiommu,
+    })
+}
+
+/// RAII guard: if the entire `VfioBackend::open` doesn't complete, restore the
+/// original driver so the card doesn't stay bound to vfio-pci with no live
+/// backend to manage it. Set `committed = true` on success — then `Self`'s
+/// own Drop takes over the restore responsibility.
+struct BindGuard<'a> {
+    bdf: &'a str,
+    original_driver: Option<String>,
+    committed: bool,
+}
+
+impl Drop for BindGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = restore_driver(self.bdf, self.original_driver.as_deref());
+        }
+    }
 }
 
 /// Read /sys/bus/pci/devices/<bdf>/driver to get the currently-bound driver.
