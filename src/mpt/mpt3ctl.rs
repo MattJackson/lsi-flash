@@ -284,7 +284,17 @@ impl Default for Mpt3IoctlHeader {
     }
 }
 
-/// MPT3COMMAND ioctl request structure.
+/// MPT3COMMAND ioctl request structure. Matches the kernel's
+/// `struct mpt3_ioctl_command` in `mpt3sas_ctl.h`.
+///
+/// Important: the kernel declares the struct with a trailing `uint8_t mf[1]`
+/// array. The `mf` FIELD is at offset 68 — the user-space caller writes the
+/// MPI request bytes starting at that offset, **not** at `sizeof(struct)`.
+/// `sizeof(struct)` is 72 because the struct's alignment is 8 (for the u64
+/// pointers), so the trailing 1-byte mf field gets padded to 8. The kernel
+/// reads `mf` via `&uarg->mf` which is `(char*)uarg + 68`, not `+ 72`.
+///
+/// We model `mf` as a zero-sized array so `offset_of!` gives 68 directly.
 #[repr(C)]
 struct Mpt3IoctlCommand {
     hdr: Mpt3IoctlHeader,
@@ -298,7 +308,13 @@ struct Mpt3IoctlCommand {
     data_out_size: u32,
     max_sense_bytes: u32,
     data_sge_offset: u32,
+    mf: [u8; 0],
 }
+
+/// Offset within `Mpt3IoctlCommand` where the MPI request frame starts.
+/// On x86_64 this is 68 (hdr 12 + timeout 4 + 4 ptrs at 8 each = 44 +
+/// 5 u32s at 4 each = 20 → 12+4+32+20 = 68).
+const MF_OFFSET: usize = std::mem::offset_of!(Mpt3IoctlCommand, mf);
 
 /// MPT3COMMAND ioctl number computation.
 ///
@@ -425,12 +441,15 @@ impl super::MptTransport for Mpt3CtlTransport {
         data_in: Option<&mut [u8]>,
         data_out: Option<&[u8]>,
     ) -> Result<usize, super::TransportError> {
-        // Compute the total buffer size needed: struct + request bytes
-        let struct_size = std::mem::size_of::<Mpt3IoctlCommand>();
-
-        // Allocate a heap buffer big enough for struct + flexibly-sized mf[] array
-        let mut buffer_vec = vec![0u8; struct_size + request.len()];
+        // The kernel reads the MPI request from offset `MF_OFFSET` (68) within
+        // our user-space buffer, not from `sizeof(struct)` (72) — the trailing
+        // padding between the last named field and the end of the struct is
+        // part of the buffer the kernel skips over.
+        // Buffer = struct prefix + MPI request bytes.
+        let buffer_len = MF_OFFSET + request.len();
+        let mut buffer_vec = vec![0u8; buffer_len];
         let buffer_ptr = buffer_vec.as_mut_ptr();
+        let struct_size = std::mem::size_of::<Mpt3IoctlCommand>();
 
         // Safety: we're constructing the struct in our own allocated memory
         unsafe {
@@ -479,9 +498,11 @@ impl super::MptTransport for Mpt3CtlTransport {
             // This is the only request type supported in v1 per ADR-017 scope.
             cmd.data_sge_offset = 5;
 
-            // Copy request bytes into the flexibly-sized mf[] array at the end
-            let mf_start = struct_size;
-            buffer_vec[mf_start..].copy_from_slice(request);
+            // Copy request bytes into the buffer starting at mf[] offset (68),
+            // overlapping the trailing padding bytes of the struct. The kernel
+            // reads from `&uarg->mf` = user_arg_ptr + offset_of(mf), so this
+            // is where the FW_UPLOAD header must begin.
+            buffer_vec[MF_OFFSET..MF_OFFSET + request.len()].copy_from_slice(request);
         }
 
         // Compute ioctl number and issue the command
