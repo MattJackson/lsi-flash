@@ -9,6 +9,9 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 
 ## [Unreleased]
 
+### Fixed
+- MptCard::restore() — BUG 1: TotalImageSize now carries full file length on every FW_DOWNLOAD chunk (previously hardcoded to 0u32) per `fw-download-write-sequence.md` §4 and lsiutil.c:34703; line 364 computes `total_size = file_bytes.len() as u32`, line 384 writes it at offset 0x0C via `&total_size.to_le_bytes()`
+- MptCard::restore() — BUG 2: Added manifest integrity validation before any FW_DOWNLOAD (ADR-015 Rule 5); reads `manifest.toml`, verifies each region artifact's size and SHA256 match disk bytes, returns CardError on mismatch to prevent writing corrupted/truncated images; comment updated to clarify interim guard vs. OPEN live FLASH_LAYOUT capacity check (Rule 11a)
 ### Changed
 - Tightened library public surface: demoted internal items to `pub(crate)` (ADR-018 Phase 2). Added `#![deny(unreachable_pub)]` in `src/lib.rs`; demoted `BuildError`, `IdentityPayload`, and `build_sbr()` in `src/sbr/build.rs` from `pub` to `pub(crate)` as these are internal implementation details not part of the public API contract.
 - ADR-018 Phase 1: library extraction — split monolithic binary into `liblsi` crate; created `src/lib.rs` with public modules + curated re-exports, moved CLI entry to `src/bin/lsi-flash.rs`, renamed package from `lsi-flash` to `liblsi` while preserving `lsi-flash` binary name; `cargo build --release` still produces `target/release/lsi-flash` (mechanical refactor, no behavior change)

@@ -301,11 +301,55 @@ impl Card for MptCard {
                 )));
             }
 
-            // Pre-flight size guard (ADR-015 Rule 11a): verify file fits in region.
-            // For R1, use the manifest's recorded size as interim since live FLASH_LAYOUT
-            // read requires CONFIG ioctl implementation. Mark OPEN for future live check.
-            // TODO: OPEN: live FLASH_LAYOUT size guard - query chip via CONFIG page type 0x14
-            let _file_size = file_bytes.len();
+            // Pre-flight integrity guard (ADR-015 Rule 5): verify manifest records match disk.
+            // For R1, validate backup artifacts before any FW_DOWNLOAD to prevent writing
+            // corrupted/truncated images. Live FLASH_LAYOUT capacity guard (Rule 11a) remains OPEN.
+            let backup_manifest_path = backup_dir.join("manifest.toml");
+            let manifest_content = fs::read_to_string(&backup_manifest_path).map_err(|e| {
+                CardError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Backup manifest not found at {:?}: {}",
+                        backup_manifest_path, e
+                    ),
+                ))
+            })?;
+
+            let manifest: BackupManifest = toml::from_str(&manifest_content).map_err(|e| {
+                CardError::Transport(format!("Failed to parse backup manifest: {}", e))
+            })?;
+
+            // Find and verify each region artifact in the manifest
+            let artifact = manifest
+                .artifacts
+                .iter()
+                .find(|a| a.path == file_name)
+                .ok_or(CardError::Transport(format!(
+                    "Region {} not found in backup manifest - refusing to write unverified image",
+                    file_name
+                )))?;
+
+            // Verify size matches
+            if artifact.size as usize != file_bytes.len() {
+                return Err(CardError::Transport(format!(
+                    "Size mismatch for {}: disk={} vs manifest={}",
+                    file_name,
+                    file_bytes.len(),
+                    artifact.size
+                )));
+            }
+
+            // Verify SHA256 matches
+            let mut hasher = Sha256::new();
+            hasher.update(&file_bytes);
+            let result = hasher.finalize();
+            let computed_sha256 = format!("{:x}", result);
+            if computed_sha256 != artifact.sha256 {
+                return Err(CardError::Transport(format!(
+                    "SHA256 mismatch for {}: disk={} vs manifest={}",
+                    file_name, computed_sha256, artifact.sha256
+                )));
+            }
 
             // Build the MPI 2.0 FW_DOWNLOAD request: 36 bytes (20-byte header + 16-byte TCSGE)
             // Per fw-download-write-sequence.md §4 layout:
@@ -317,7 +361,7 @@ impl Card for MptCard {
             // - ImageSize at offset 0x20..0x23 (per-chunk size, =CHUNK_SIZE except final)
 
             let mut offset: usize = 0;
-            let _total_size = file_bytes.len() as u32;
+            let total_size = file_bytes.len() as u32;
 
             while offset < file_bytes.len() {
                 let chunk_size = (file_bytes.len() - offset).min(CHUNK_SIZE);
@@ -337,7 +381,7 @@ impl Card for MptCard {
                 req_bytes[8] = 0x00; // VP_ID
                 req_bytes[9] = 0x00; // VF_ID
                 req_bytes[10..12].copy_from_slice(&0u16.to_le_bytes()); // Reserved4
-                req_bytes[12..16].copy_from_slice(&(0u32).to_le_bytes()); // TotalImageSize at offset 0x0C (full file len)
+                req_bytes[12..16].copy_from_slice(&total_size.to_le_bytes()); // TotalImageSize at offset 0x0C (full file len)
                 req_bytes[16..20].copy_from_slice(&(0u32).to_le_bytes()); // Reserved6
 
                 // TCSGE (16 bytes)
@@ -731,12 +775,9 @@ mod tests {
     /// restore() sends FW_DOWNLOAD for each region with correct function code (0x09)
     #[test]
     fn test_restore_sends_fw_download_per_region() {
-        thread_local! {
-            static FW_DOWNLOAD_CALLS: std::sync::Mutex<Vec<(ImageType, usize)>> =
-                const { std::sync::Mutex::new(Vec::new()) };
+        struct MockTransportWithCapture {
+            captured_requests: Arc<std::sync::Mutex<Vec<(ImageType, usize, u32)>>>,
         }
-
-        struct MockTransportWithCapture;
 
         impl MptTransport for MockTransportWithCapture {
             fn send_with_sge_offset(
@@ -751,13 +792,20 @@ mod tests {
                 if request.len() == 36 && request[3] == MpiFunction::FwDownload.as_u8() {
                     let image_type = ImageType::from_u8(request[0]).unwrap_or(ImageType::Fw);
 
-                    // Capture the call with region and chunk size
+                    // BUG-1 FIX VERIFICATION: Extract TotalImageSize from bytes 0x0C..0x10
+                    let total_image_size =
+                        u32::from_le_bytes([request[12], request[13], request[14], request[15]]);
+
+                    // Capture the call with region, chunk size, and TotalImageSize
                     let chunk_size =
                         u32::from_le_bytes([request[32], request[33], request[34], request[35]])
                             as usize;
-                    FW_DOWNLOAD_CALLS.with(|calls| {
-                        calls.lock().unwrap().push((image_type, chunk_size));
-                    });
+
+                    self.captured_requests.lock().unwrap().push((
+                        image_type,
+                        chunk_size,
+                        total_image_size,
+                    ));
 
                     // Verify data_out carries the file bytes (host→IOC)
                     if let Some(buf) = data_out {
@@ -783,11 +831,53 @@ mod tests {
         let _ = fs::remove_dir_all(&out_dir);
         fs::create_dir_all(&out_dir).unwrap();
 
-        // Create test firmware and bios files
-        fs::write(out_dir.join("firmware.bin"), vec![0xAA; 1000]).unwrap();
-        fs::write(out_dir.join("bios.rom"), vec![0xBB; 500]).unwrap();
+        // Create test firmware and bios files with known sizes
+        let fw_size = 1000usize;
+        let bios_size = 500usize;
+        fs::write(out_dir.join("firmware.bin"), vec![0xAA; fw_size]).unwrap();
+        fs::write(out_dir.join("bios.rom"), vec![0xBB; bios_size]).unwrap();
 
-        let transport = Box::new(MockTransportWithCapture);
+        // Create manifest with correct SHA256 hashes so restore proceeds
+        let mut hasher = Sha256::new();
+        hasher.update(vec![0xAA; fw_size]);
+        let result = hasher.finalize();
+        let fw_sha256 = format!("{:x}", result);
+
+        let mut hasher = Sha256::new();
+        hasher.update(vec![0xBB; bios_size]);
+        let result = hasher.finalize();
+        let bios_sha256 = format!("{:x}", result);
+
+        let manifest = BackupManifest {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            sas_wwn: None,
+            artifacts: vec![
+                BackupArtifact {
+                    path: "firmware.bin".to_string(),
+                    image_type: "Fw".to_string(),
+                    sha256: fw_sha256.clone(),
+                    size: fw_size as u64,
+                },
+                BackupArtifact {
+                    path: "bios.rom".to_string(),
+                    image_type: "Bios".to_string(),
+                    sha256: bios_sha256.clone(),
+                    size: bios_size as u64,
+                },
+            ],
+            source_card: None,
+        };
+
+        let toml_str = toml::to_string_pretty(&manifest).unwrap();
+        fs::write(out_dir.join("manifest.toml"), toml_str).unwrap();
+
+        use crate::card::BackupArtifact;
+        use std::sync::{Arc, Mutex};
+        let captured_requests: Arc<Mutex<Vec<(ImageType, usize, u32)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let transport = Box::new(MockTransportWithCapture {
+            captured_requests: captured_requests.clone(),
+        });
 
         let mut card = MptCard {
             identity: CardIdentity {
@@ -809,7 +899,7 @@ mod tests {
         assert!(report.regions.contains(&"firmware.bin".to_string()));
         assert!(report.regions.contains(&"bios.rom".to_string()));
 
-        let calls = FW_DOWNLOAD_CALLS.with(|c| c.lock().unwrap().clone());
+        let calls = captured_requests.lock().unwrap().clone();
 
         // Should have at least 2 FW_DOWNLOAD calls (one per region)
         assert!(
@@ -817,13 +907,43 @@ mod tests {
             "Should have at least 2 FW_DOWNLOAD calls (one per region)"
         );
 
-        // First call should be for firmware.bin with image_type=Fw
-        let first_call = &calls[0];
-        assert_eq!(first_call.0, ImageType::Fw);
+        // BUG-1 FIX VERIFICATION: TotalImageSize must equal actual file length for each chunk
+        let mut fw_total_size_seen = None;
+        let mut bios_total_size_seen = None;
 
-        // Second call should be for bios.rom with image_type=Bios (or another chunk)
-        let has_bios = calls.iter().any(|(itype, _)| *itype == ImageType::Bios);
-        assert!(has_bios, "Should have at least one BIOS FW_DOWNLOAD call");
+        for (image_type, _chunk_size, total_image_size) in &calls {
+            match image_type {
+                ImageType::Fw => {
+                    fw_total_size_seen = Some(*total_image_size);
+                    // This assertion would FAIL with old 0u32 code and PASS after fix
+                    assert_eq!(
+                        *total_image_size, fw_size as u32,
+                        "TotalImageSize for firmware.bin must equal file length ({})",
+                        fw_size
+                    );
+                }
+                ImageType::Bios => {
+                    bios_total_size_seen = Some(*total_image_size);
+                    // This assertion would FAIL with old 0u32 code and PASS after fix
+                    assert_eq!(
+                        *total_image_size, bios_size as u32,
+                        "TotalImageSize for bios.rom must equal file length ({})",
+                        bios_size
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Verify we saw TotalImageSize for both regions
+        assert!(
+            fw_total_size_seen.is_some(),
+            "Should have seen firmware.bin TotalImageSize"
+        );
+        assert!(
+            bios_total_size_seen.is_some(),
+            "Should have seen bios.rom TotalImageSize"
+        );
 
         // Clean up
         let _ = fs::remove_dir_all(&out_dir);
@@ -869,8 +989,46 @@ mod tests {
         fs::create_dir_all(&out_dir).unwrap();
 
         // Create test files
-        fs::write(out_dir.join("firmware.bin"), vec![0xAA; 100]).unwrap();
-        fs::write(out_dir.join("bios.rom"), vec![0xBB; 200]).unwrap();
+        let fw_content = vec![0xAA; 100];
+        let bios_content = vec![0xBB; 200];
+        fs::write(out_dir.join("firmware.bin"), &fw_content).unwrap();
+        fs::write(out_dir.join("bios.rom"), &bios_content).unwrap();
+
+        // Create manifest with correct SHA256 hashes so restore proceeds past integrity check
+        use crate::card::BackupArtifact;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&fw_content);
+        let result = hasher.finalize();
+        let fw_sha256 = format!("{:x}", result);
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bios_content);
+        let result = hasher.finalize();
+        let bios_sha256 = format!("{:x}", result);
+
+        let manifest = BackupManifest {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            sas_wwn: None,
+            artifacts: vec![
+                BackupArtifact {
+                    path: "firmware.bin".to_string(),
+                    image_type: "Fw".to_string(),
+                    sha256: fw_sha256.clone(),
+                    size: 100u64,
+                },
+                BackupArtifact {
+                    path: "bios.rom".to_string(),
+                    image_type: "Bios".to_string(),
+                    sha256: bios_sha256.clone(),
+                    size: 200u64,
+                },
+            ],
+            source_card: None,
+        };
+
+        let toml_str = toml::to_string_pretty(&manifest).unwrap();
+        fs::write(out_dir.join("manifest.toml"), toml_str).unwrap();
 
         let transport = Box::new(MockTransportWithFailure);
 
@@ -903,13 +1061,88 @@ mod tests {
         let _ = fs::remove_dir_all(&out_dir);
     }
 
-    /// restore() refuses oversized region (ADR-015 Rule 11a) - stub for future live FLASH_LAYOUT check
+    /// restore() refuses corrupt or truncated region via manifest integrity check
     #[test]
-    #[ignore = "TODO: Implement ADR-015 Rule 11a live guard via CONFIG page type 0x14"]
-    fn test_restore_refuses_oversized_region() {
-        // For R1, this test is ignored. The pre-flight size check logic exists
-        // in restore() as a TODO comment for future implementation.
-        // Rule 11a requires CONFIG ioctl to query FLASH_LAYOUT page type 0x14.
+    fn test_restore_refuses_corrupt_or_truncated_region() {
+        use crate::card::BackupArtifact;
+
+        // Create a backup directory with valid files but mismatched manifest
+        let out_dir = std::env::temp_dir().join("lsi-flash-test-restore-corrupt");
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).unwrap();
+
+        // Create firmware.bin with known content
+        let original_content = vec![0xCC; 256];
+        fs::write(out_dir.join("firmware.bin"), &original_content).unwrap();
+
+        // Compute correct SHA256
+        let mut hasher = Sha256::new();
+        hasher.update(&original_content);
+        let _result = hasher.finalize();
+
+        // Create manifest with WRONG sha256 (simulating corruption)
+        let manifest = BackupManifest {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            sas_wwn: None,
+            artifacts: vec![BackupArtifact {
+                path: "firmware.bin".to_string(),
+                image_type: "Fw".to_string(),
+                sha256: "wrongsha256value1234567890abcdef1234567890abcdef1234567890abcd"
+                    .to_string(), // WRONG!
+                size: 256u64,
+            }],
+            source_card: None,
+        };
+
+        let toml_str = toml::to_string_pretty(&manifest).unwrap();
+        fs::write(out_dir.join("manifest.toml"), toml_str).unwrap();
+
+        // Create MptCard with mock transport that should NEVER be called
+        struct MockTransportShouldNotRun;
+        impl MptTransport for MockTransportShouldNotRun {
+            fn send_with_sge_offset(
+                &mut self,
+                _request: &[u8],
+                _data_sge_offset_words: u32,
+                _reply: &mut [u8],
+                _data_in: Option<&mut [u8]>,
+                _data_out: Option<&mut [u8]>,
+            ) -> Result<usize, crate::mpt::TransportError> {
+                panic!("Should not send FW_DOWNLOAD after manifest integrity failure");
+            }
+        }
+
+        let transport = Box::new(MockTransportShouldNotRun);
+
+        let mut card = MptCard {
+            identity: CardIdentity {
+                bdf: "0000:03:00.0".to_string(),
+                vendor_id: 0x1000,
+                device_id: 0x0072,
+                subsystem_vid: None,
+                subsystem_did: None,
+                chip_family: ChipFamily::Sas2008,
+                friendly_name: None,
+            },
+            transport,
+        };
+
+        let result = card.restore(&out_dir);
+
+        // Should fail with Transport error about SHA256 mismatch
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_str = format!("{}", e);
+            assert!(
+                err_str.to_lowercase().contains("sha256")
+                    || err_str.to_lowercase().contains("mismatch"),
+                "Error should mention SHA256 or mismatch: {}",
+                err_str
+            );
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&out_dir);
     }
 
     /// Verify MptCard implements Send (required by Card trait)
