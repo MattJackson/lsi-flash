@@ -4,7 +4,9 @@
 
 #![allow(clippy::too_many_lines)]
 
-use crate::mpi::messages::{ConfigReply, ConfigRequest, IocFactsReply, IocInitRequest, IocStatus};
+use crate::mpi::messages::{
+    ConfigReply, ConfigRequest, IocFactsReply, IocInitRequest, IocStatus, MpiError,
+};
 use crate::mpi::real_ioc::RealIoc;
 use crate::mpi::session::IocBackend;
 use crate::pci;
@@ -115,18 +117,22 @@ fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Er
     let platform = pci::LinuxSysfs;
     match RealIoc::open(platform, bdf) {
         Ok(mut realioc) => {
-            // Try to initialize IOC and fetch fields
-            let init_req = IocInitRequest {
-                who_init: 0x04, // MPI2_WHOINIT_HOST_DRIVER per mpi-overview.md §9.1
+            // IOC_FACTS is a "find out who you are" query — per MPI 2.0 spec it
+            // can be issued in any IOC state (Reset/Ready/Operational), so we
+            // skip the IOC_INIT round-trip the detect verb originally did. That
+            // step was preventing the freshman's cycle from returning anything
+            // useful when mpt3sas had already brought the chip to Operational.
+            let _ = IocInitRequest {
+                who_init: 0x04,
                 host_msix_vectors: 0,
-                reply_descriptor_post_queue_depth: 16, // MPI2_RDPQ_DEPTH_MIN per mpi-overview.md §9
+                reply_descriptor_post_queue_depth: 16,
                 system_request_frame_base_address: 0,
                 reply_descriptor_post_queue_address: 0,
             };
 
-            match realioc.send_ioc_init(&init_req) {
+            match Ok::<(), MpiError>(()) {
                 Ok(_) => {
-                    // IOC initialized successfully, now fetch IOC_FACTS
+                    // Fetch IOC_FACTS directly (no IOC_INIT needed for a read-only query)
                     match realioc.send_ioc_facts() {
                         Ok(mut facts) => {
                             // Fetch Manufacturing Page 0 for NVDATA vendor/product ID
@@ -189,15 +195,14 @@ fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Er
                         }
                     }
                 }
-                Err(_) => {
-                    // IOC_INIT failed (card not yet initialized) — return None
-                    Ok(None)
-                }
+                Err(_) => unreachable!(),
             }
         }
-        Err(_) => {
-            // RealIoc::open failed (no hardware present, no BAR1 mmap, etc.) — graceful skip
-            Ok(None)
+        Err(e) => {
+            // RealIoc::open failed — surface the actual error so the operator
+            // sees whether it's a missing BAR1, missing sysfs, no permissions,
+            // etc. The earlier swallow-to-None hid all of this.
+            Err(crate::Error::Other(format!("RealIoc::open failed: {e}")))
         }
     }
 }
