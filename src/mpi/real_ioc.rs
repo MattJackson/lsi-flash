@@ -34,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::mpi::doorbell::{read32, write32, MPI2_DOORBELL};
+use crate::mpi::doorbell::MPI2_DOORBELL;
 use crate::mpi::messages::{
     ConfigReply, FwDownloadReply, FwUploadReply, IocFactsReply, IocInitReply, ToolboxReply,
 };
@@ -198,16 +198,11 @@ impl<P: Platform> IocBackend for RealIoc<P> {
         &mut self,
         req: &'a mut FwUploadRequest<'a>,
     ) -> Result<FwUploadReply, MpiError> {
-        // TODO(cycle 2b followup): the dword loops below skip the
-        // IOC_DOORBELL_INT handshake. On a real chip the host must wait for
-        // the IOC interrupt bit between every write and every read; without
-        // it, writes can race the IOC and reads return stale doorbell
-        // contents. Will surface on dev-1 — fix as part of the hardware
-        // bring-up cycle. Same applies to send_ioc_init below.
-        use crate::mpi::doorbell::{get_ioc_state, IocState};
+        use crate::mpi::doorbell::{
+            doorbell_handshake_recv, doorbell_handshake_send, get_ioc_state, IocState,
+        };
 
-        // Step 1: Validate payload buffer size against requested image_size FIRST
-        // This check must happen before accessing BAR1 to work in tests on non-Linux
+        // Step 1: payload buffer guard (testable without BAR1 on non-Linux).
         if req.image_size as usize > req.payload_buffer.len() {
             return Err(MpiError::Io(format!(
                 "upload buffer too small: chip says {} bytes, buffer is {}",
@@ -216,66 +211,28 @@ impl<P: Platform> IocBackend for RealIoc<P> {
             )));
         }
 
-        // Step 2: Verify IOC state via doorbell — must be READY or OPERATIONAL
         let bar1 = self
             .bar1_mut()
             .ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
-        let ioc_state = get_ioc_state(bar1, MPI2_DOORBELL);
 
+        let ioc_state = get_ioc_state(bar1, MPI2_DOORBELL);
         if !matches!(ioc_state, IocState::Ready | IocState::Operational) {
             return Err(MpiError::IocStatus(IocStatus::InvalidState));
         }
 
-        // Step 3: Serialize FW_UPLOAD request to wire format
-        let request_bytes = req.serialize_to(2);
-
-        if request_bytes.len() < 40 {
-            return Err(MpiError::Io(format!(
-                "FW_UPLOAD request too small: {} bytes, need at least 40",
-                request_bytes.len()
-            )));
+        let mut request_bytes = req.serialize_to(2);
+        while request_bytes.len() % 4 != 0 {
+            request_bytes.push(0);
         }
 
-        // Step 4: Doorbell handshake (same pattern as send_ioc_init)
-        let doorbell_offset = MPI2_DOORBELL;
+        let timeout = std::time::Duration::from_secs(10); // longer for big payloads
+        doorbell_handshake_send(bar1, MpiFunction::FwUpload.as_u8(), &request_bytes, timeout)
+            .map_err(|e| MpiError::Io(format!("FW_UPLOAD send: {}", e)))?;
 
-        let msg_size_dwords = (request_bytes.len() / 4) as u32;
-        let function_code = MpiFunction::FwUpload.as_u8();
+        let reply_bytes = doorbell_handshake_recv(bar1, 64, timeout)
+            .map_err(|e| MpiError::Io(format!("FW_UPLOAD recv: {}", e)))?;
 
-        let doorbell_value = (function_code as u32) << 24 | ((msg_size_dwords - 2) << 16);
-
-        write32(bar1, doorbell_offset, doorbell_value);
-
-        // Step 5: Write request payload to DOORBELL register
-        // Safe dword iteration: zero-pad partial trailing chunk so a
-        // non-dword-aligned request_bytes length (caught on dev-1 2026-05-28
-        // with an IOC_INIT/IOC_FACTS request that ended on a 78-byte odd
-        // boundary) doesn't index past the end.
-        for chunk in request_bytes.chunks(4) {
-            let mut padded = [0u8; 4];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            let dword = u32::from_le_bytes(padded);
-            write32(bar1, doorbell_offset, dword);
-        }
-
-        // Step 6: Read reply from DOORBELL register
-        let mut reply_bytes = Vec::with_capacity(22);
-        let mut offset = 0usize;
-
-        while offset < 22 {
-            let dword = read32(bar1, doorbell_offset);
-
-            for i in 0..4 {
-                if offset + i < 22 {
-                    reply_bytes.push((dword >> (i * 8)) as u8);
-                }
-            }
-            offset += 4;
-        }
-
-        // Step 7: Parse reply and extract IOCStatus + ActualImageSize
         let reply = FwUploadReply::parse(&reply_bytes)?;
-
         if reply.ioc_status != IocStatus::Success {
             return Err(MpiError::IocStatus(reply.ioc_status));
         }
@@ -284,79 +241,31 @@ impl<P: Platform> IocBackend for RealIoc<P> {
     }
 
     fn send_config(&mut self, req: &ConfigRequest<'_>) -> Result<ConfigReply, MpiError> {
-        // TODO(cycle 2b followup): the dword loops below skip the
-        // IOC_DOORBELL_INT handshake. On a real chip the host must wait for
-        // the IOC interrupt bit between every write and every read; without
-        // it, writes can race the IOC and reads return stale doorbell
-        // contents. Will surface on dev-1 — fix as part of the hardware
-        // bring-up cycle. Same applies to send_ioc_init above.
+        use crate::mpi::doorbell::{
+            doorbell_handshake_recv, doorbell_handshake_send, get_ioc_state, IocState,
+        };
 
-        use crate::mpi::doorbell::{get_ioc_state, IocState};
-
-        // Step 1: Get BAR1 via self.bar1_mut() - must be mapped for real hardware access
         let bar1 = self
             .bar1_mut()
             .ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
-
-        // Step 2: Verify IOC state via doorbell — must be Ready or Operational
-        // Cites: doorbell.rs:132-152 (get_ioc_state function)
         let ioc_state = get_ioc_state(bar1, MPI2_DOORBELL);
         if !matches!(ioc_state, IocState::Ready | IocState::Operational) {
             return Err(MpiError::IocStatus(IocStatus::InvalidState));
         }
 
-        // Step 3: Serialize the request to wire format
-        // Cites: messages.rs:717-773 (ConfigRequest::serialize_to), toolbox-and-config.md §6
-        let request_bytes = req.serialize_to(2); // SMID=2 for this call
-
-        // Step 4: Compute doorbell value
-        // Cites: mpi-overview.md:38 (function codes in bits 24-31)
-        // Cites: messages.rs:73,99 (MpiFunction::Config = 0x04)
-        // Cites: real_ioc.rs:244 (doorbell value formula from send_fw_upload pattern)
-        let function_code = MpiFunction::Config.as_u8(); // 0x04 per messages.rs:73
-
-        // msg_size_dwords = request_bytes.len() / 4, then subtract 2 for doorbell encoding
-        // Cites: mpi-overview.md:35 (bits 16-23 encode message length in dwords minus 2)
-        let msg_size_dwords = (request_bytes.len() / 4) as u32;
-        let doorbell_value = (function_code as u32) << 24 | ((msg_size_dwords - 2) << 16);
-
-        // Step 5: Write doorbell value to trigger the message
-        // Cites: doorbell.rs:5 (MPI2_DOORBELL = 0x00), doorbell.rs:63-66 (write32)
-        let doorbell_offset = MPI2_DOORBELL;
-        crate::mpi::doorbell::write32(bar1, doorbell_offset, doorbell_value);
-
-        // Step 6: Write request payload dword-by-dword to DOORBELL register
-        // Each dwords (4 bytes) written sequentially per lsirec.c pattern
-        // Safe dword iteration: zero-pad partial trailing chunk (caught on
-        // dev-1 2026-05-28 when a 78-byte request indexed past the end of
-        // the buffer at offset+1).
-        for chunk in request_bytes.chunks(4) {
-            let mut padded = [0u8; 4];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            let dword = u32::from_le_bytes(padded);
-            crate::mpi::doorbell::write32(bar1, doorbell_offset, dword);
+        let mut request_bytes = req.serialize_to(2);
+        while request_bytes.len() % 4 != 0 {
+            request_bytes.push(0);
         }
 
-        // Step 7: Read reply from DOORBELL register
-        // Cites: messages.rs:1019-1043 (ConfigReply::parse expects at least 26 bytes)
-        let mut reply_bytes = Vec::with_capacity(26);
-        let mut offset = 0usize;
+        let timeout = std::time::Duration::from_secs(5);
+        doorbell_handshake_send(bar1, MpiFunction::Config.as_u8(), &request_bytes, timeout)
+            .map_err(|e| MpiError::Io(format!("CONFIG send: {}", e)))?;
 
-        while offset < 26 {
-            let dword = crate::mpi::doorbell::read32(bar1, doorbell_offset);
+        let reply_bytes = doorbell_handshake_recv(bar1, 64, timeout)
+            .map_err(|e| MpiError::Io(format!("CONFIG recv: {}", e)))?;
 
-            for i in 0..4 {
-                if offset + i < 26 {
-                    reply_bytes.push((dword >> (i * 8)) as u8);
-                }
-            }
-            offset += 4;
-        }
-
-        // Step 8: Parse reply with ConfigReply::parse
         let reply = ConfigReply::parse(&reply_bytes)?;
-
-        // Step 9: If ioc_status != Success, return error
         if reply.ioc_status != IocStatus::Success {
             return Err(MpiError::IocStatus(reply.ioc_status));
         }
@@ -365,74 +274,26 @@ impl<P: Platform> IocBackend for RealIoc<P> {
     }
 
     fn send_ioc_init(&mut self, req: &IocInitRequest) -> Result<IocInitReply, MpiError> {
-        // Get BAR1 mmap — must be mapped for real hardware access
+        use crate::mpi::doorbell::{doorbell_handshake_recv, doorbell_handshake_send};
+
         let bar1 = self
             .bar1_mut()
             .ok_or_else(|| MpiError::Io("BAR1 not mapped".into()))?;
 
-        // Serialize IOC_INIT request to wire format (72 bytes per mpi-overview.md §9)
-        // Request structure: mpi2_ioc.h:135-164, header at mpi-overview.md §1.2
-        let request_bytes = req.serialize_to(1); // SMID=1 for test simplicity
-
-        // Ensure we have exactly 72 bytes (header + body)
-        if request_bytes.len() < 72 {
-            return Err(MpiError::Io(format!(
-                "IOC_INIT request too small: {} bytes, need 72",
-                request_bytes.len()
-            )));
+        let mut request_bytes = req.serialize_to(1);
+        while request_bytes.len() % 4 != 0 {
+            request_bytes.push(0);
         }
 
-        // Doorbell handshake per mpi-overview.md §1.1, lsirec.c doorbell pattern
-        // DOORBELL register at BAR1+0x00 (doorbell.rs:5)
+        let timeout = std::time::Duration::from_secs(5);
+        doorbell_handshake_send(bar1, MpiFunction::IocInit.as_u8(), &request_bytes, timeout)
+            .map_err(|e| MpiError::Io(format!("IOC_INIT send: {}", e)))?;
 
-        // Step 1: Write function code + message size to doorbell
-        // Function code 0x02 = IOC_INIT (messages.rs:74), bits 24-31 of doorbell
-        // Bits 16-23 = message length in dwords minus 2 (mpi2.h:178-193)
-        // Message is 72 bytes = 18 dwords, so size field = 18 - 2 = 16 = 0x10
-        let doorbell_offset = 0x00; // MPI2_DOORBELL from doorbell.rs:5
-        let msg_size_dwords = (request_bytes.len() / 4) as u32; // 18 dwords for 72 bytes
-        let function_code = crate::mpi::messages::MpiFunction::IocInit.as_u8();
+        let reply_bytes = doorbell_handshake_recv(bar1, 64, timeout)
+            .map_err(|e| MpiError::Io(format!("IOC_INIT recv: {}", e)))?;
 
-        let doorbell_value = (function_code as u32) << 24 | ((msg_size_dwords - 2) << 16);
-
-        // Write to DOORBELL register (BAR1+0x00, lsirec.c:12)
-        crate::mpi::doorbell::write32(bar1, doorbell_offset, doorbell_value);
-
-        // Step 2: Wait for IOC_DOORBELL_INT bit in HISTATUS (interrupt posted by IOC)
-        // Per mpi-overview.md §9 initialization pattern
-
-        // Step 3: Write request payload dword-by-dword to DOORBELL register.
-        // Safe chunk iteration zero-pads any partial trailing chunk — caught
-        // on dev-1 2026-05-28 when a 78-byte request panicked at offset+2.
-        for chunk in request_bytes.chunks(4) {
-            let mut padded = [0u8; 4];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            let dword = u32::from_le_bytes(padded);
-            crate::mpi::doorbell::write32(bar1, doorbell_offset, dword);
-        }
-
-        // Step 4: Read reply from DOORBELL register
-        // Reply structure per mpi-overview.md §9.2 (mpi2_ioc.h:191-207)
-        // IOC writes reply back to doorbell register after processing
-
-        let mut reply_bytes = Vec::with_capacity(18); // Minimum reply is 18 bytes
-        let mut offset = 0usize;
-
-        while offset < 18 {
-            let dword = crate::mpi::doorbell::read32(bar1, doorbell_offset);
-
-            for i in 0..4 {
-                if offset + i < 18 {
-                    reply_bytes.push((dword >> (i * 8)) as u8);
-                }
-            }
-            offset += 4;
-        }
-
-        // Step 5: Deserialize reply and check status
         let reply = IocInitReply::parse(&reply_bytes)?;
-
-        if reply.ioc_status != crate::mpi::messages::IocStatus::Success {
+        if reply.ioc_status != IocStatus::Success {
             return Err(MpiError::IocStatus(reply.ioc_status));
         }
 

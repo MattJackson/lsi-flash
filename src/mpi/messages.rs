@@ -1444,19 +1444,22 @@ impl IocFactsReply {
     }
 
     /// Parse FW version u32 into (major, minor, unit, dev) components.
-    /// Format per mpi2_ioc.h:254 — each byte is a component in LE order.
+    /// MPI2_FW_VERSION_UNION per mpi2_ioc.h:254 is `struct { U8 Dev; U8 Unit;
+    /// U8 Minor; U8 Major; }` — high byte of the u32 is Major. Dev-1 confirmed
+    /// 2026-05-28: chip returned fw_version=0x07150800 for the H200 Tape Adapter
+    /// running Dell ITA A04 (MPTFW-07.15.08.00-IE).
     pub fn fw_version_components(&self) -> (u8, u8, u8, u8) {
-        let b0 = (self.fw_version & 0xFF) as u8;
-        let b1 = ((self.fw_version >> 8) & 0xFF) as u8;
-        let b2 = ((self.fw_version >> 16) & 0xFF) as u8;
-        let b3 = ((self.fw_version >> 24) & 0xFF) as u8;
-        (b0, b1, b2, b3)
+        let dev = (self.fw_version & 0xFF) as u8;
+        let unit = ((self.fw_version >> 8) & 0xFF) as u8;
+        let minor = ((self.fw_version >> 16) & 0xFF) as u8;
+        let major = ((self.fw_version >> 24) & 0xFF) as u8;
+        (major, minor, unit, dev)
     }
 
     /// Format FW version as human-readable string "major.minor.unit.dev".
     pub fn fw_version_string(&self) -> String {
-        let (major, minor, unit, _dev) = self.fw_version_components();
-        format!("{}.{}.{}", major, minor, unit)
+        let (major, minor, unit, dev) = self.fw_version_components();
+        format!("{}.{}.{}.{}", major, minor, unit, dev)
     }
 
     /// Parse NVDATA version u32 into (major, minor, build, revision) components.
@@ -1521,9 +1524,17 @@ impl IocFactsReply {
             lines.push(format!("  Board Tracer: {}", tracer));
         }
 
-        // Additional capabilities
-        if self.protocol_flags & (1 << 0) != 0 {
-            lines.push("  Protocol Flags: SR-IOV enabled".to_string());
+        // ProtocolFlags per mpi2_ioc.h:262 — bit 0 = INITIATOR, bit 1 = TARGET.
+        // (SR-IOV doesn't live here; the freshman cycle mislabeled it.)
+        let mut protocols = Vec::new();
+        if self.protocol_flags & 0x0001 != 0 {
+            protocols.push("Initiator");
+        }
+        if self.protocol_flags & 0x0002 != 0 {
+            protocols.push("Target");
+        }
+        if !protocols.is_empty() {
+            lines.push(format!("  Protocols: {}", protocols.join(" + ")));
         }
 
         lines.push(format!("  Max SAS Expanders: {}", self.max_sas_expanders));

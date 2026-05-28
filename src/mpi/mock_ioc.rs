@@ -246,7 +246,7 @@ impl IocBackend for MockIoc {
                 request_credit: 0x00FF,
                 product_id: 0x0725,           // SAS2008 IT personality product ID
                 ioc_capabilities: 0x00000004, // MPI2_IOC_CAP_ENABLED_PERPHYS
-                fw_version: 0x00080F07, // Version format: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
+                fw_version: 0x070F0800, // Version format: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
 
                 ioc_request_frame_size: 0x0048, // 72 bytes
                 ioc_max_chain_segment_size: 0xFFFF,
@@ -293,7 +293,7 @@ impl IocBackend for MockIoc {
             request_credit: 0x00FF,       // 255 credits
             product_id: 0x0725,           // Product ID for SAS2008 IT firmware (per mpi2.h)
             ioc_capabilities: 0x00000004, // MPI2_IOC_CAP_ENABLED_PERPHYS per mpi2_ioc.h
-            fw_version: 0x00080F07, // Version: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
+            fw_version: 0x070F0800, // Version: major=7, minor=15, unit=8, dev=0 (LE encoding: byte0=major)
 
             ioc_request_frame_size: 0x0048, // 72 bytes per mpi-overview.md §9.1
             ioc_max_chain_segment_size: 0xFFFF,
