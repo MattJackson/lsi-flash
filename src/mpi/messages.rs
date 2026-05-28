@@ -599,51 +599,49 @@ pub struct FwUploadRequest<'a> {
 }
 
 impl FwUploadRequest<'_> {
-    /// Serialize FW_UPLOAD request to wire format.
+    /// Serialize FW_UPLOAD request to wire format per
+    /// `MPI2_FW_UPLOAD_REQUEST` at mpi2_ioc.h:1226-1242. The struct IS the
+    /// wire message — there is NO separate REQUEST_HEADER prefix. The first
+    /// 10 bytes follow the standard layout (ImageType/Reserved/ChainOffset/
+    /// Function/...) but you write them once, not twice.
     ///
-    /// Returns ~40 bytes: header + body + SGL pointing at output buffer.
-    pub fn serialize_to(&self, smid: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(56);
+    /// Caught on dev-1 2026-05-28: the earlier freshman version wrote a
+    /// duplicate 10-byte header which made the chip read ImageType=0 for all
+    /// calls — backup.bin / bios.rom / nvdata.bin all came out byte-identical.
+    pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
 
-        // MPI2_REQUEST_HEADER (10 bytes) — mpi-overview.md §1.2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // FunctionDependent1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::FwUpload.as_u8()); // Function = 0x12
-        buf.extend_from_slice(&smid.to_le_bytes()); // FunctionDependent2 (SMID)
-        buf.push(0x01); // FunctionDependent3
+        // 0x00 ImageType
+        buf.push(self.image_type.as_u8());
+        // 0x01 Reserved1
+        buf.push(0x00);
+        // 0x02 ChainOffset
+        buf.push(0x00);
+        // 0x03 Function = 0x12
+        buf.push(MpiFunction::FwUpload.as_u8());
+        // 0x04 Reserved2 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x06 Reserved3
+        buf.push(0x00);
+        // 0x07 MsgFlags
+        buf.push(0x00);
+        // 0x08 VP_ID
+        buf.push(0x00);
+        // 0x09 VF_ID
+        buf.push(0x00);
+        // 0x0A Reserved4 (U16)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        // 0x0C Reserved5 (U32)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // 0x10 Reserved6 (U32)
+        buf.extend_from_slice(&0u32.to_le_bytes());
 
-        let msg_flags = 0x00; // No LAST_SEGMENT for upload
-        buf.push(msg_flags);
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
-
-        // MPI25_FW_UPLOAD_REQUEST body (30 bytes) — fw-download-upload.md §4.1
-        buf.push(self.image_type.as_u8()); // ImageType
-        buf.push(0x00); // Reserved1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::FwUpload.as_u8()); // Function
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-        buf.push(0x00); // Reserved3
-        buf.push(msg_flags); // MsgFlags
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved4
-
-        // Reserved5-7 (v2.5 extension)
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved5
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved6
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved7
-
-        // ImageOffset/ImageSize (v2.5 extension)
-        buf.extend_from_slice(&self.image_offset.to_le_bytes());
-        buf.extend_from_slice(&self.image_size.to_le_bytes());
-
-        // SGL pointing at output buffer — IOC writes data here (IOC_TO_HOST direction)
+        // 0x14 SGL — IEEE_SIMPLE_64 (12 bytes). IOC writes data here, so
+        // direction is IOC_TO_HOST (END_OF_LIST + IOC_TO_HOST flags).
         let sge = IeeeSgeSimple64::with_flags(
             self.payload_buffer.as_ptr() as u64,
             self.payload_buffer.len().min(self.image_size as usize) as u32,
-            0xC0, // END_OF_LIST + IOC_TO_HOST for IEEE format
+            0xC0,
         );
         sge.serialize_to(&mut buf);
 
@@ -1927,11 +1925,10 @@ mod tests {
 
         let bytes = req.serialize_to(1);
 
-        // Function at offset 0x03 should be 0x12 (FW_UPLOAD)
+        // ImageType at offset 0x00 — corrected per mpi2_ioc.h:1228
+        assert_eq!(bytes[0], ImageType::Fw.as_u8());
+        // Function at offset 0x03 should be 0x12 (FW_UPLOAD) per mpi2_ioc.h:1231
         assert_eq!(bytes[3], MpiFunction::FwUpload.as_u8());
-
-        // ImageType at body start
-        assert_eq!(bytes[12], ImageType::Fw.as_u8());
     }
 
     // ========================================================================
