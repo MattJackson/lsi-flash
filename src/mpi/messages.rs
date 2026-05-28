@@ -1231,11 +1231,16 @@ pub struct IocFactsReply {
     /// Reserved4 (2B at offset 0x3E) — mpi2_ioc.h:269
     pub reserved_4: u16,
 
-    /// Board name string (16 bytes null-terminated at offset 0x40) — mpi2_ioc.h:270-275
-    pub board_name: String,
+    /// Board name string (16 bytes null-terminated at offset 0x40) — mpi2_ioc.h:270-275.
+    /// Optional because SAS2008 IOC_FACTS reply only carries the 64-byte header
+    /// (16 dwords); BoardName/Tracer were added in later MPI revisions and only
+    /// appear when the chip reports MsgLength ≥ 24 dwords (96 bytes). For pre-MPI-2.5
+    /// chips like SAS2008, fetch this from Manufacturing Page 0 separately.
+    pub board_name: Option<String>,
 
-    /// Board tracer string (16 bytes null-terminated at offset 0x50) — mpi2_ioc.h:276-281
-    pub board_tracer: String,
+    /// Board tracer string (16 bytes null-terminated at offset 0x50) — mpi2_ioc.h:276-281.
+    /// Optional for the same reason as board_name.
+    pub board_tracer: Option<String>,
 
     // Extended fields from Manufacturing Page 0 (fetched via CONFIG roundtrip):
     // These are populated separately after send_config read of Mfg Page 0
@@ -1254,14 +1259,17 @@ pub struct IocFactsReply {
 
 impl IocFactsReply {
     /// Parse IOC_FACTS reply from raw bytes.
-    /// Expects at least 96 bytes (header + 16-byte BoardName + 16-byte BoardTracer).
-    /// Cites: mpi2_ioc.h:231-281 for exact field offsets
+    /// Parse IOC_FACTS reply. Requires at least 64 bytes (16 dwords) for the
+    /// MPI 2.0 base reply; BoardName + BoardTracer at offsets 0x40 and 0x50
+    /// are parsed only if the chip reports a length covering them (SAS2008
+    /// returns 64-byte replies and omits them — confirmed dev-1 2026-05-28).
+    /// Cites: mpi2_ioc.h:231-281 for the full field layout.
     pub fn parse(bytes: &[u8]) -> Result<Self, MpiError> {
-        if bytes.len() < 96 {
+        if bytes.len() < 64 {
             return Err(MpiError::MalformedReply {
                 function: MpiFunction::IocFacts,
                 got: bytes.len(),
-                need: 96,
+                need: 64,
             });
         }
 
@@ -1377,13 +1385,18 @@ impl IocFactsReply {
         // Offset 0x3E-0x3F: Reserved4 — mpi2_ioc.h:269
         let reserved_4 = u16::from_le_bytes([bytes[62], bytes[63]]);
 
-        // Offset 0x40-0x4F: BoardName (16 bytes null-terminated ASCII) — mpi2_ioc.h:270-275
-        let board_name_raw = &bytes[64..80];
-        let board_name = parse_null_terminated_string(board_name_raw);
-
-        // Offset 0x50-0x5F: BoardTracer (16 bytes null-terminated ASCII) — mpi2_ioc.h:276-281
-        let board_tracer_raw = &bytes[80..96];
-        let board_tracer = parse_null_terminated_string(board_tracer_raw);
+        // Offsets 0x40-0x4F BoardName, 0x50-0x5F BoardTracer — only present
+        // when the chip returns ≥80 / ≥96 bytes. SAS2008 omits both.
+        let board_name = if bytes.len() >= 80 {
+            Some(parse_null_terminated_string(&bytes[64..80]))
+        } else {
+            None
+        };
+        let board_tracer = if bytes.len() >= 96 {
+            Some(parse_null_terminated_string(&bytes[80..96]))
+        } else {
+            None
+        };
 
         Ok(Self {
             msg_version,
@@ -1499,9 +1512,14 @@ impl IocFactsReply {
             lines.push(format!("  Firmware Product ID: {}", fw_prod_id));
         }
 
-        // Board name and tracer from IOC_FACTS
-        lines.push(format!("  Board Name: {}", self.board_name));
-        lines.push(format!("  Board Tracer: {}", self.board_tracer));
+        // Board name and tracer from IOC_FACTS — None on chips that return
+        // the short 64-byte reply (SAS2008); fetched from Mfg Page 0 instead.
+        if let Some(ref name) = self.board_name {
+            lines.push(format!("  Board Name: {}", name));
+        }
+        if let Some(ref tracer) = self.board_tracer {
+            lines.push(format!("  Board Tracer: {}", tracer));
+        }
 
         // Additional capabilities
         if self.protocol_flags & (1 << 0) != 0 {

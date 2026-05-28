@@ -256,8 +256,10 @@ fn parse_mfg_page_0(page_data: &[u8], facts: &mut IocFactsReply) {
         let board_name_bytes = &page_data[56..72];
         let mfg_board_name = parse_null_terminated_string(board_name_bytes);
         // Use Mfg Page 0 Board Name if different from IOC_FACTS (Mfg Page is more authoritative)
-        if !mfg_board_name.is_empty() && facts.board_name != mfg_board_name {
-            facts.board_name = mfg_board_name;
+        if !mfg_board_name.is_empty()
+            && facts.board_name.as_deref() != Some(mfg_board_name.as_str())
+        {
+            facts.board_name = Some(mfg_board_name);
         }
     }
 
@@ -266,8 +268,10 @@ fn parse_mfg_page_0(page_data: &[u8], facts: &mut IocFactsReply) {
         let board_tracer_bytes = &page_data[72..80];
         let mfg_board_tracer = parse_null_terminated_string(board_tracer_bytes);
         // Use Mfg Page 0 Board Tracer if different from IOC_FACTS
-        if !mfg_board_tracer.is_empty() && facts.board_tracer != mfg_board_tracer {
-            facts.board_tracer = mfg_board_tracer;
+        if !mfg_board_tracer.is_empty()
+            && facts.board_tracer.as_deref() != Some(mfg_board_tracer.as_str())
+        {
+            facts.board_tracer = Some(mfg_board_tracer);
         }
     }
 }
@@ -470,8 +474,8 @@ mod tests {
         // Verify key fields match canned Tape Adapter data per task spec
         assert_eq!(facts.function, MpiFunction::IocFacts.as_u8());
         assert_eq!(facts.ioc_status, IocStatus::Success);
-        assert_eq!(facts.board_name, "Dell H200");
-        assert_eq!(facts.board_tracer, "00000001");
+        assert_eq!(facts.board_name.as_deref(), Some("Dell H200"));
+        assert_eq!(facts.board_tracer.as_deref(), Some("00000001"));
         assert_eq!(facts.nvdata_vendor_id, Some(0x1000));
         assert_eq!(facts.nvdata_product_id, Some("LSI2008".to_string()));
 
@@ -514,8 +518,8 @@ mod tests {
         let facts = mock.send_ioc_facts().unwrap();
 
         // Verify all extended fields are present
-        assert!(facts.board_name.contains("Dell"));
-        assert!(!facts.board_tracer.is_empty());
+        assert!(facts.board_name.as_deref().unwrap_or("").contains("Dell"));
+        assert!(!facts.board_tracer.as_deref().unwrap_or("").is_empty());
         assert!(facts.nvdata_vendor_id.is_some());
         assert!(facts.nvdata_product_id.is_some());
         assert!(facts.nvdata_version.is_some());
@@ -534,8 +538,8 @@ mod tests {
             nvdata_vendor_id: facts.nvdata_vendor_id,
             nvdata_product_id: facts.nvdata_product_id.clone(),
             nvdata_version: facts.nvdata_version_string(),
-            board_name: Some(facts.board_name),
-            board_tracer: Some(facts.board_tracer),
+            board_name: facts.board_name.clone(),
+            board_tracer: facts.board_tracer.clone(),
         };
 
         let output = serde_json::json!({

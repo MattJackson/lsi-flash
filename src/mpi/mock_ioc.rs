@@ -263,8 +263,8 @@ impl IocBackend for MockIoc {
                 max_persistent_entries: 256, // Truncated from 0x0258 to fit in u16
                 min_dev_handle: 0x0000,
                 reserved_4: 0x0000,
-                board_name: "Dell H200".to_string(), // Canned data for Tape Adapter per baseline.md
-                board_tracer: "00000001".to_string(), // 8-char trace number from baseline.md
+                board_name: Some("Dell H200".to_string()), // Canned data for Tape Adapter per baseline.md
+                board_tracer: Some("00000001".to_string()), // 8-char trace number from baseline.md
                 nvdata_vendor_id: None, // Populated separately via Mfg Page 0 CONFIG read
                 nvdata_product_id: None,
                 nvdata_version: None,
@@ -310,9 +310,9 @@ impl IocBackend for MockIoc {
             max_persistent_entries: 256, // Truncated from 0x0258 to fit in u16
             min_dev_handle: 0x0000,
             reserved_4: 0x0000,
-            board_name: "Dell H200".to_string(), // Canned data for Tape Adapter per baseline.md:15
-            board_tracer: "00000001".to_string(), // 8-char trace number from baseline.md:15
-            nvdata_vendor_id: Some(0x1000),      // LSI vendor ID (per task spec)
+            board_name: Some("Dell H200".to_string()), // Canned data for Tape Adapter per baseline.md:15
+            board_tracer: Some("00000001".to_string()), // 8-char trace number from baseline.md:15
+            nvdata_vendor_id: Some(0x1000),            // LSI vendor ID (per task spec)
             nvdata_product_id: Some("LSI2008".to_string()), // Per task spec
             nvdata_version: Some(0x00041003), // NVDATA version 3.16.4 (LE encoding: major=3, minor=16, build=4)
 
