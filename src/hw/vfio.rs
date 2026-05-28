@@ -224,6 +224,11 @@ impl VfioBackend {
             len: mapped_len,
         });
 
+        eprintln!(
+            "vfio: alloc_dma_hugepage len={} va={:p} iova(pa)=0x{:x}",
+            mapped_len, va, pa
+        );
+
         Ok(DmaBuffer {
             va: va as *mut u8,
             iova: pa,
