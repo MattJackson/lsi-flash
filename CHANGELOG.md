@@ -10,6 +10,14 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 ## [Unreleased]
 
 ### Added
+- `lsi-flash sbr read` hardware-bound verb for reading SBR from chip EEPROM via I2C
+  - Cites `src/sbr/i2c.rs::i2c_read_sbr` signature and wire protocol (lsirec.c:570-630)
+  - Accepts `--pci <bdf>` to specify target card, defaults to first SAS2008 if omitted
+  - Accepts `--output <path>` for file output, defaults to stdout as raw bytes
+  - Accepts `--json` flag for JSON serialization of SBR struct fields
+  - Computes SHA256 hash of SBR bytes and prints to stderr in all modes
+- `src/sbr/parse.rs` serde Serialize/Deserialize derives on MfgFields and Sbr structs
+- src/cli/sbr.rs test module with canned SBR byte tests for JSON serialization round-trip
 - `src/mpi/real_ioc.rs` `RealIoc` backend scaffolding (cycle 1) — `IocBackend`
   trait impl with `todo!()` bodies; tests against `MockPlatform`
 - `src/mpi/mmap_region.rs` — persistent read-write BAR1 mmap (cycle 2a). Holds

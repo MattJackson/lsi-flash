@@ -21,33 +21,58 @@ pub const WWID_CHECKSUM_OFFSET: usize = 0xef; // 239 bytes from start
 pub const CHECKSUM_MAGIC: u8 = 0x5b;
 
 /// SBR manufacturing data fields. Cites sbrtool.py:4-30.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MfgFields {
-    pub unk00: u32,      // 0x00 - 4 bytes, I (sbrtool.py:5) **OPEN: undocumented**
-    pub unk04: u32,      // 0x04 - 4 bytes, I (sbrtool.py:6) **OPEN: undocumented**
-    pub unk08: u32,      // 0x08 - 4 bytes, I (sbrtool.py:7) **OPEN: undocumented**
-    pub pcivid: u16,     // 0x0C - 2 bytes, H (sbrtool.py:8) PCI Vendor ID
-    pub pcipid: u16,     // 0x0E - 2 bytes, H (sbrtool.py:9) PCI Product ID
-    pub unk10: u16,      // 0x10 - 2 bytes, H (sbrtool.py:10) **OPEN: undocumented**
-    pub hwconfig: u16,   // 0x12 - 2 bytes, H (sbrtool.py:11) **OPEN: undocumented**
+    #[serde(rename = "unk_0x00")]
+    pub unk00: u32, // 0x00 - 4 bytes, I (sbrtool.py:5) **OPEN: undocumented**
+    #[serde(rename = "unk_0x04")]
+    pub unk04: u32, // 0x04 - 4 bytes, I (sbrtool.py:6) **OPEN: undocumented**
+    #[serde(rename = "unk_0x08")]
+    pub unk08: u32, // 0x08 - 4 bytes, I (sbrtool.py:7) **OPEN: undocumented**
+    #[serde(rename = "pcivid")]
+    pub pcivid: u16, // 0x0C - 2 bytes, H (sbrtool.py:8) PCI Vendor ID
+    #[serde(rename = "pcipid")]
+    pub pcipid: u16, // 0x0E - 2 bytes, H (sbrtool.py:9) PCI Product ID
+    #[serde(rename = "unk_0x10")]
+    pub unk10: u16, // 0x10 - 2 bytes, H (sbrtool.py:10) **OPEN: undocumented**
+    #[serde(rename = "hwconfig")]
+    pub hwconfig: u16, // 0x12 - 2 bytes, H (sbrtool.py:11) **OPEN: undocumented**
+    #[serde(rename = "subsys_vid")]
     pub subsys_vid: u16, // 0x14 - 2 bytes, H (sbrtool.py:12) Subsystem Vendor ID
+    #[serde(rename = "subsys_pid")]
     pub subsys_pid: u16, // 0x16 - 2 bytes, H (sbrtool.py:13) Subsystem Device ID
-    pub unk18: u32,      // 0x18 - 4 bytes, I (sbrtool.py:14) **OPEN: undocumented**
-    pub unk1c: u32,      // 0x1C - 4 bytes, I (sbrtool.py:15) **OPEN: undocumented**
-    pub unk20: u32,      // 0x20 - 4 bytes, I (sbrtool.py:16) **OPEN: undocumented**
-    pub unk24: u32,      // 0x24 - 4 bytes, I (sbrtool.py:17) **OPEN: undocumented**
-    pub unk28: u32,      // 0x28 - 4 bytes, I (sbrtool.py:18) **OPEN: undocumented**
-    pub unk2c: u32,      // 0x2C - 4 bytes, I (sbrtool.py:19) **OPEN: undocumented**
-    pub unk30: u32,      // 0x30 - 4 bytes, I (sbrtool.py:20) **OPEN: undocumented**
-    pub unk34: u32,      // 0x34 - 4 bytes, I (sbrtool.py:21) **OPEN: undocumented**
-    pub unk38: u32,      // 0x38 - 4 bytes, I (sbrtool.py:22) **OPEN: undocumented**
-    pub unk3c: u32,      // 0x3C - 4 bytes, I (sbrtool.py:23) **OPEN: undocumented**
-    pub interface: u8,   // 0x40 - 1 byte, B (sbrtool.py:24) Interface type (0x00=IT/IR, 0x10=iMR)
-    pub unk41: u8,       // 0x41 - 1 byte, B (sbrtool.py:25) **OPEN: undocumented**
-    pub unk42: u16,      // 0x42 - 2 bytes, H (sbrtool.py:26) **OPEN: undocumented**
-    pub unk44: u32,      // 0x44 - 4 bytes, I (sbrtool.py:27) **OPEN: undocumented**
-    pub unk48: u16,      // 0x48 - 2 bytes, H (sbrtool.py:28) **OPEN: undocumented**
-    pub unk4a: u8,       // 0x4A - 1 byte, B (sbrtool.py:29) **OPEN: undocumented**
+    #[serde(rename = "unk_0x18")]
+    pub unk18: u32, // 0x18 - 4 bytes, I (sbrtool.py:14) **OPEN: undocumented**
+    #[serde(rename = "unk_0x1c")]
+    pub unk1c: u32, // 0x1C - 4 bytes, I (sbrtool.py:15) **OPEN: undocumented**
+    #[serde(rename = "unk_0x20")]
+    pub unk20: u32, // 0x20 - 4 bytes, I (sbrtool.py:16) **OPEN: undocumented**
+    #[serde(rename = "unk_0x24")]
+    pub unk24: u32, // 0x24 - 4 bytes, I (sbrtool.py:17) **OPEN: undocumented**
+    #[serde(rename = "unk_0x28")]
+    pub unk28: u32, // 0x28 - 4 bytes, I (sbrtool.py:18) **OPEN: undocumented**
+    #[serde(rename = "unk_0x2c")]
+    pub unk2c: u32, // 0x2C - 4 bytes, I (sbrtool.py:19) **OPEN: undocumented**
+    #[serde(rename = "unk_0x30")]
+    pub unk30: u32, // 0x30 - 4 bytes, I (sbrtool.py:20) **OPEN: undocumented**
+    #[serde(rename = "unk_0x34")]
+    pub unk34: u32, // 0x34 - 4 bytes, I (sbrtool.py:21) **OPEN: undocumented**
+    #[serde(rename = "unk_0x38")]
+    pub unk38: u32, // 0x38 - 4 bytes, I (sbrtool.py:22) **OPEN: undocumented**
+    #[serde(rename = "unk_0x3c")]
+    pub unk3c: u32, // 0x3C - 4 bytes, I (sbrtool.py:23) **OPEN: undocumented**
+    #[serde(rename = "interface")]
+    pub interface: u8, // 0x40 - 1 byte, B (sbrtool.py:24) Interface type (0x00=IT/IR, 0x10=iMR)
+    #[serde(rename = "unk_0x41")]
+    pub unk41: u8, // 0x41 - 1 byte, B (sbrtool.py:25) **OPEN: undocumented**
+    #[serde(rename = "unk_0x42")]
+    pub unk42: u16, // 0x42 - 2 bytes, H (sbrtool.py:26) **OPEN: undocumented**
+    #[serde(rename = "unk_0x44")]
+    pub unk44: u32, // 0x44 - 4 bytes, I (sbrtool.py:27) **OPEN: undocumented**
+    #[serde(rename = "unk_0x48")]
+    pub unk48: u16, // 0x48 - 2 bytes, H (sbrtool.py:28) **OPEN: undocumented**
+    #[serde(rename = "unk_0x4a")]
+    pub unk4a: u8, // 0x4A - 1 byte, B (sbrtool.py:29) **OPEN: undocumented**
 }
 
 /// Error type for SBR operations. Cites thiserror usage from scoping doc §1.
@@ -119,13 +144,18 @@ fn parse_mfg_fields(data: &[u8]) -> Result<MfgFields, SbrError> {
 }
 
 /// Full SBR structure. Cites sbrtool.py:37-95.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Sbr {
     pub mfg: MfgFields,
+    #[serde(rename = "mfg_duplicate_valid")]
     pub mfg_duplicate_valid: bool, // True if duplicate copy matches
+    #[serde(rename = "mfg_duplicate", skip_serializing_if = "Option::is_none")]
     pub mfg_duplicate: Option<MfgFields>, // Duplicate MFG block (0x4c-0x97)
-    pub sas_addr: Option<u64>,     // WWID SAS address (optional)
-    pub checksum_valid: bool,      // MFG checksum valid?
+    #[serde(rename = "sas_addr", skip_serializing_if = "Option::is_none")]
+    pub sas_addr: Option<u64>, // WWID SAS address (optional)
+    #[serde(rename = "checksum_valid")]
+    pub checksum_valid: bool, // MFG checksum valid?
+    #[serde(rename = "wwid_checksum_valid")]
     pub wwid_checksum_valid: bool, // WWID checksum valid?
 }
 

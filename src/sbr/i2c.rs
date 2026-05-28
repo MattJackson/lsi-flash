@@ -206,7 +206,7 @@ fn i2c_getbyte(bar1: &mut [u8; 4096]) -> u8 {
 pub fn i2c_init(
     ctx: &mut I2cContext,
     dcr_read32_fn: impl Fn(u32) -> u32,
-    dcr_write32_fn: impl Fn(u32, u32),
+    mut dcr_write32_fn: impl FnMut(u32, u32),
 ) {
     // Read DCR_SBR_CONFIG to determine addr and type (lsirec.c:501-514).
     let val = dcr_read32_fn(DCR_SBR_CONFIG);
@@ -261,7 +261,7 @@ pub fn i2c_init(
 pub fn i2c_close(
     ctx: &mut I2cContext,
     dcr_read32_fn: impl Fn(u32) -> u32,
-    dcr_write32_fn: impl Fn(u32, u32),
+    mut dcr_write32_fn: impl FnMut(u32, u32),
 ) {
     let offset = CHIP_I2C_RESET_OFFSET as usize;
     ctx.bar1[offset] = 1;
