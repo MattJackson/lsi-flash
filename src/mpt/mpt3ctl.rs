@@ -26,18 +26,58 @@ type IoctlReq = libc::c_int;
 #[cfg(not(target_env = "musl"))]
 type IoctlReq = c_ulong;
 
+/// mpt3sas exposes TWO character devices, gated by MPI version of the IOC:
+///
+/// - `/dev/mpt2ctl` — IOCs reporting `MPI2_VERSION` (MPI 2.0 chips: SAS2008,
+///   SAS2208). This is our path for the dev-1 Tape Adapter.
+/// - `/dev/mpt3ctl` — IOCs reporting `MPI25_VERSION` or `MPI26_VERSION`
+///   (SAS3008 / SAS3408 / SAS3508 and newer).
+///
+/// Kernel-side gating is at `mpt3sas_ctl.c:_ctl_verify_adapter` — if you
+/// open the wrong node, `_ctl_verify_adapter` returns -1 because the IOC's
+/// MPI version doesn't match the node's mpi_version, and the ioctl handler
+/// returns -ENODEV. Our SAS2008 returned ENODEV through every ioc_number
+/// search until we figured this out (dev-1 finding 2026-05-28).
+const MPT2CTL_PATH: &str = "/dev/mpt2ctl";
 const MPT3CTL_PATH: &str = "/dev/mpt3ctl";
 
-/// Open the mpt3ctl device file. Returns NotFound if the driver isn't loaded.
-fn open_mpt3ctl() -> Result<File, super::TransportError> {
-    let path = PathBuf::from(MPT3CTL_PATH);
-    File::open(&path).map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => super::TransportError::NotFound(format!(
-            "{} not found (mpt3sas driver not loaded?)",
-            MPT3CTL_PATH
-        )),
-        _ => e.into(),
-    })
+/// Open whichever mpt control device serves this BDF, by trying both and
+/// using whichever yields a matching IOC. Returns NotFound if neither has
+/// our card.
+///
+/// The two device files have the same ioctl ABI — same `MPT3IOCINFO` /
+/// `MPT3COMMAND` numbers, same struct layouts. Only difference is which set
+/// of IOCs they expose (MPI 2.0 vs 2.5+). So a single open + try-both
+/// approach is correct.
+fn open_mpt_ctl_with_card(bdf: &str) -> Result<(File, u32), super::TransportError> {
+    let (target_seg, target_bus, target_dev, target_fn) = parse_bdf(bdf)?;
+    let mut last_err: Option<super::TransportError> = None;
+    for path_str in [MPT2CTL_PATH, MPT3CTL_PATH] {
+        let path = PathBuf::from(path_str);
+        let fd = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                last_err = Some(super::TransportError::NotFound(format!(
+                    "{} not found (mpt3sas driver not loaded?)",
+                    path_str
+                )));
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        match find_ioc_number(&fd, target_seg, target_bus, target_dev, target_fn) {
+            Ok(ioc) => return Ok((fd, ioc)),
+            Err(e) => {
+                last_err = Some(e);
+                // try next path
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| super::TransportError::NotFound("no mpt control device found".into())))
 }
 
 /// Parse a PCI BDF string into (segment, bus, device, function).
@@ -60,9 +100,9 @@ fn parse_bdf(bdf: &str) -> Result<(u16, u8, u8, u8), super::TransportError> {
     // For 2-part format (bus:dev.fn), we need special handling since parts[1] is dev.fn not empty
 
     let (segment, bus_str, dev_fn_str): (u16, &str, &str) = if parts.len() == 3 {
-        // Format: segment:bus:dev.fn -> ["0000", "03", "00.0"]
+        // Format: segment:bus:dev.fn -> ["0000", "03", "00.0"]. All hex.
         let seg_str = parts[0];
-        let segment: u16 = seg_str.parse().map_err(|_| {
+        let segment = u16::from_str_radix(seg_str, 16).map_err(|_| {
             super::TransportError::Other(format!("invalid segment in BDF: {}", bdf))
         })?;
         (segment, parts[1], parts[2])
@@ -84,37 +124,20 @@ fn parse_bdf(bdf: &str) -> Result<(u16, u8, u8, u8), super::TransportError> {
         )));
     }
 
-    let bus: u8 = match bus_str.parse::<u16>() {
-        Ok(v) if v <= 0xFF => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(format!(
-                "invalid bus in BDF: {}",
-                bdf
-            )))
-        }
-    };
-
+    // PCI BDF fields are always hex per lspci convention. Decimal parse would
+    // silently accept "03" but reject "0a"; we use hex throughout.
+    let bus = u8::from_str_radix(bus_str, 16)
+        .map_err(|_| super::TransportError::Other(format!("invalid bus in BDF: {}", bdf)))?;
     let device_str = device_fn_parts[0];
-    let device: u8 = match device_str.parse::<u16>() {
-        Ok(v) if v <= 0x1F => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(format!(
-                "invalid device in BDF: {}",
-                bdf
-            )))
-        }
-    };
-
+    let device = u8::from_str_radix(device_str, 16)
+        .ok()
+        .filter(|&v| v <= 0x1F)
+        .ok_or_else(|| super::TransportError::Other(format!("invalid device in BDF: {}", bdf)))?;
     let function_str = device_fn_parts[1];
-    let function: u8 = match function_str.parse::<u16>() {
-        Ok(v) if v <= 0x7 => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(format!(
-                "invalid function in BDF: {}",
-                bdf
-            )))
-        }
-    };
+    let function = u8::from_str_radix(function_str, 16)
+        .ok()
+        .filter(|&v| v <= 0x7)
+        .ok_or_else(|| super::TransportError::Other(format!("invalid function in BDF: {}", bdf)))?;
 
     Ok((segment, bus, device, function))
 }
@@ -132,34 +155,18 @@ fn parse_bdf_2part(
         )));
     }
 
-    let bus: u8 = match bus_str.parse::<u16>() {
-        Ok(v) if v <= 0xFF => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(
-                "invalid bus in BDF".to_string(),
-            ))
-        }
-    };
-
+    let bus = u8::from_str_radix(bus_str, 16)
+        .map_err(|_| super::TransportError::Other("invalid bus in BDF".to_string()))?;
     let device_str = device_fn_parts[0];
-    let device: u8 = match device_str.parse::<u16>() {
-        Ok(v) if v <= 0x1F => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(
-                "invalid device in BDF".to_string(),
-            ))
-        }
-    };
-
+    let device = u8::from_str_radix(device_str, 16)
+        .ok()
+        .filter(|&v| v <= 0x1F)
+        .ok_or_else(|| super::TransportError::Other("invalid device in BDF".to_string()))?;
     let function_str = device_fn_parts[1];
-    let function: u8 = match function_str.parse::<u16>() {
-        Ok(v) if v <= 0x7 => v as u8,
-        _ => {
-            return Err(super::TransportError::Other(
-                "invalid function in BDF".to_string(),
-            ))
-        }
-    };
+    let function = u8::from_str_radix(function_str, 16)
+        .ok()
+        .filter(|&v| v <= 0x7)
+        .ok_or_else(|| super::TransportError::Other("invalid function in BDF".to_string()))?;
 
     Ok((0, bus, device, function))
 }
@@ -327,19 +334,16 @@ pub struct Mpt3CtlTransport {
 }
 
 impl Mpt3CtlTransport {
-    /// Open the mpt3ctl device and bind to the IOC managing the PCI BDF.
+    /// Open the right mpt control device for the IOC managing the PCI BDF.
     ///
-    /// Returns `NotFound` if:
-    /// - `/dev/mpt3ctl` doesn't exist (driver not loaded)
-    /// - No IOC in the system manages this BDF
+    /// Tries both `/dev/mpt2ctl` (MPI 2.0 chips: SAS2008, SAS2208) and
+    /// `/dev/mpt3ctl` (MPI 2.5+: SAS3008, SAS3408, SAS3508). Uses whichever
+    /// finds a matching IOC.
+    ///
+    /// Returns `NotFound` if neither device file exists, OR if neither
+    /// manages this BDF.
     pub fn open(bdf: &str) -> Result<Self, super::TransportError> {
-        let fd = open_mpt3ctl()?;
-
-        // Find which ioc_number corresponds to this BDF
-        let (target_seg, target_bus, target_dev, target_fn) = parse_bdf(bdf)?;
-
-        let ioc_number = find_ioc_number(&fd, target_seg, target_bus, target_dev, target_fn)?;
-
+        let (fd, ioc_number) = open_mpt_ctl_with_card(bdf)?;
         Ok(Self { fd, ioc_number })
     }
 
@@ -608,8 +612,11 @@ mod tests {
     /// IOC lookup. Both outcomes are valid NotFound errors.
     #[test]
     fn open_nonexistent_bdf_returns_not_found() {
-        // Use an extreme BDF that definitely doesn't exist on any real machine
-        let result = Mpt3CtlTransport::open("0000:ff:ff.7");
+        // Use a BDF that is *valid in format* (device <= 0x1F per PCI spec)
+        // but unlikely to exist on any real machine. The freshman's original
+        // 0000:ff:ff.7 had device=0xff which exceeds the 5-bit PCI device
+        // field, so parse_bdf rejected it before the file-open path ran.
+        let result = Mpt3CtlTransport::open("00ff:ff:1f.7");
 
         match result {
             Ok(_) => panic!("Mpt3CtlTransport::open should fail for non-existent BDF"),
