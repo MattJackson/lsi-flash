@@ -232,11 +232,6 @@ impl VfioBackend {
             len: mapped_len,
         });
 
-        eprintln!(
-            "vfio: alloc_dma_hugepage len={} va={:p} iova(pa)=0x{:x}",
-            mapped_len, va, pa
-        );
-
         Ok(DmaBuffer {
             va: va as *mut u8,
             iova: pa,
@@ -791,30 +786,24 @@ fn enable_bus_master(device_fd: RawFd) -> Result<(), HwError> {
         .map_err(|e| HwError::Preflight(format!("read PCI Command: {}", e)))?;
     let cur = u16::from_le_bytes(cmd_bytes);
     let new = cur | PCI_COMMAND_MASTER;
-    eprintln!(
-        "vfio: enable_bus_master cur=0x{:04x} new=0x{:04x} cfg_offset=0x{:x}",
-        cur, new, cfg_offset
-    );
     if new != cur {
         cfg_file
             .write_all_at(&new.to_le_bytes(), cfg_offset)
             .map_err(|e| HwError::Preflight(format!("write PCI Command: {}", e)))?;
-    }
-    // Read-back to verify the write stuck.
-    let mut verify = [0u8; 2];
-    cfg_file
-        .read_exact_at(&mut verify, cfg_offset)
-        .map_err(|e| HwError::Preflight(format!("verify PCI Command: {}", e)))?;
-    let post = u16::from_le_bytes(verify);
-    eprintln!(
-        "vfio: enable_bus_master readback=0x{:04x} (BME bit {})",
-        post,
-        if post & PCI_COMMAND_MASTER != 0 {
-            "SET"
-        } else {
-            "CLEAR — write was rejected!"
+        // Read-back to verify the write stuck. vfio-pci can refuse the write
+        // if e.g. SR-IOV is involved; if BME is still clear, the chip won't DMA.
+        let mut verify = [0u8; 2];
+        cfg_file
+            .read_exact_at(&mut verify, cfg_offset)
+            .map_err(|e| HwError::Preflight(format!("verify PCI Command: {}", e)))?;
+        let post = u16::from_le_bytes(verify);
+        if post & PCI_COMMAND_MASTER == 0 {
+            return Err(HwError::Preflight(format!(
+                "BME write to PCI Command rejected (cur=0x{:04x} tried=0x{:04x} got=0x{:04x})",
+                cur, new, post
+            )));
         }
-    );
+    }
     Ok(())
 }
 

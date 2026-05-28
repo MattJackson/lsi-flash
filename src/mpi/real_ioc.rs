@@ -348,18 +348,6 @@ impl<P: Platform> IocBackend for RealIoc<P> {
 
         let reply_bytes = recv_result.map_err(|e| MpiError::Io(format!("FW_UPLOAD: {}", e)))?;
         let reply = FwUploadReply::parse(&reply_bytes)?;
-        #[cfg(target_os = "linux")]
-        eprintln!(
-            "real_ioc: FW_UPLOAD type={:?} reply.actual_image_size={} ioc_status={:?} (backend={})",
-            req.image_type,
-            reply.actual_image_size,
-            reply.ioc_status,
-            if self.hw_backend.is_some() {
-                "HwBackend"
-            } else {
-                "legacy"
-            }
-        );
         if reply.ioc_status != IocStatus::Success {
             return Err(MpiError::IocStatus(reply.ioc_status));
         }

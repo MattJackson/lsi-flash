@@ -225,10 +225,6 @@ fn run_backup_via_mpt3ctl(
                     image_type, e
                 ))
             })?;
-        eprintln!(
-            "mpt3ctl FW_UPLOAD type={:?} actual_image_size={} ioc_status={:?}",
-            image_type, reply.actual_image_size, reply.ioc_status
-        );
         if reply.ioc_status != IocStatus::Success {
             return Err(BackupError::PartialUpload {
                 image_type,
