@@ -1,3 +1,4 @@
+mod card;
 mod card_database;
 mod cli;
 mod error;
@@ -7,6 +8,7 @@ pub mod firmware;
 pub mod hcb;
 pub mod hw;
 pub mod mpi;
+pub mod mpt;
 pub mod sbr;
 
 use clap::Parser;

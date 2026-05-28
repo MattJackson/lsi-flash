@@ -10,6 +10,17 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 ## [Unreleased]
 
 ### Added
+- Card trait scaffold per ADR-017 — pluggable abstraction over flash-capable cards
+  - `src/card/mod.rs`: `Card` trait with detect/backup/current_personality methods
+  - `CardIdentity` struct for PCI-based identification (BDF, VID:DID, chip family)
+  - `ChipFamily` enum: Sas2008/Sas2208/Sas3008/Unknown — maps to card-database.toml entries
+  - `CardError` error type following project's thiserror pattern
+  - `DetectReport` + `BackupReport` stubs mirroring existing CLI shapes (TODO: senior flesh out)
+  - `discover()` factory walks `/sys/bus/pci/devices/` via `crate::pci::Platform`, dispatches by VID:DID
+  - `discover_one(bdf)` for specific BDF lookup — both return NotImplemented today (MptCard impl in follow-up)
+  - Re-exports `Personality` from mpi::session for convenient access: `use crate::card::{Card, Personality}`
+  - Cites ADR-017 (`lsi-flash-notes/01-architecture/adr/017-card-trait-and-pluggable-transport.md`)
+  - ChipFamily mapping cites card_database.rs entries (SAS2008: LSI 9211-8i, Dell H200/H310, IBM M1015; SAS2208/SAS3008 future targets)
 - `lsi-flash sbr read` hardware-bound verb for reading SBR from chip EEPROM via I2C
   - Cites `src/sbr/i2c.rs::i2c_read_sbr` signature and wire protocol (lsirec.c:570-630)
   - Accepts `--pci <bdf>` to specify target card, defaults to first SAS2008 if omitted
