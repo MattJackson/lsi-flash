@@ -108,11 +108,16 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
     };
 
     for image_type in [ImageType::Fw, ImageType::Bios, ImageType::NvData] {
-        let mut payload_buffer = vec![0u8; 65536];
+        // SAS2008 flash region tops out around 1 MB across all known OEM
+        // variants (Dell ITA A04 firmware on dev-1 measured at 885 KB / 0xD831C
+        // bytes 2026-05-28). 2 MB buffer gives headroom for future SAS2208
+        // and Dell-extended NVData revisions without a second round-trip.
+        const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
+        let mut payload_buffer = vec![0u8; UPLOAD_BUF_SIZE];
         let mut req = FwUploadRequest {
             image_type,
             image_offset: 0,
-            image_size: 65536,
+            image_size: UPLOAD_BUF_SIZE as u32,
             payload_buffer: &mut payload_buffer,
         };
 
@@ -125,7 +130,7 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
             .into());
         }
 
-        let actual_size = reply.actual_image_size as usize;
+        let actual_size = (reply.actual_image_size as usize).min(payload_buffer.len());
         let data = &payload_buffer[..actual_size];
 
         let file_name = match image_type {
