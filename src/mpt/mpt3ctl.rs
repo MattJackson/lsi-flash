@@ -430,13 +430,13 @@ fn find_ioc_number(
 impl super::MptTransport for Mpt3CtlTransport {
     /// Send an MPI request via the mpt3sas kernel driver.
     ///
-    /// For FW_UPLOAD requests (the only type supported in v1), the SGE offset
-    /// is hardcoded to word 5 (byte 0x14). The caller provides `data_in` with
-    /// the payload; the transport copies it into a DMA region and inserts the
-    /// SGE at the correct offset.
-    fn send(
+    /// The kernel inserts the data SGE at `data_sge_offset_words` (in u32
+    /// words from request byte 0). For MPI 2.0 `FW_UPLOAD` with TCSGE,
+    /// pass 9 (= 36 bytes). For MPI 2.5+ `FW_UPLOAD`, pass 5 (= 20 bytes).
+    fn send_with_sge_offset(
         &mut self,
         request: &[u8],
+        data_sge_offset_words: u32,
         reply: &mut [u8],
         data_in: Option<&mut [u8]>,
         data_out: Option<&[u8]>,
@@ -496,7 +496,7 @@ impl super::MptTransport for Mpt3CtlTransport {
 
             // SGE offset: hardcoded to word 5 (byte 0x14) for FW_UPLOAD_REQUEST.
             // This is the only request type supported in v1 per ADR-017 scope.
-            cmd.data_sge_offset = 5;
+            cmd.data_sge_offset = data_sge_offset_words;
 
             // Copy request bytes into the buffer starting at mf[] offset (68),
             // overlapping the trailing padding bytes of the struct. The kernel

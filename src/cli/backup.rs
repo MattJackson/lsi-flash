@@ -168,22 +168,49 @@ fn run_backup_via_mpt3ctl(
         const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
         let mut data_in = vec![0u8; UPLOAD_BUF_SIZE];
 
-        // Build FwUploadRequest. Serialize_to includes a SGE; we strip it
-        // off because the kernel inserts the real (DMA-mapped) SGE at
-        // data_sge_offset=5. Request bytes = header[0x00..0x14], 20 bytes.
-        let mut throwaway = vec![0u8; 0];
-        let req = FwUploadRequest {
-            image_type,
-            image_offset: 0,
-            image_size: UPLOAD_BUF_SIZE as u32,
-            payload_buffer: &mut throwaway,
-        };
-        let req_bytes_with_sge = req.serialize_to(0);
-        let req_bytes = &req_bytes_with_sge[..0x14];
+        // Build the MPI 2.0 FW_UPLOAD request: 20-byte header + 12-byte TCSGE
+        // (Transaction Context SGE — required for MPI 2.0 FW_UPLOAD per
+        // lsiutil.c:34857-34875). MPT3COMMAND's data_sge_offset (we'll set
+        // = 8 words = 32 bytes) tells the kernel where to insert the data
+        // SGE (right after the TCSGE).
+        //
+        // TCSGE layout (mpi2_ioc.h:1165-1175):
+        //   0x00: Reserved1
+        //   0x01: ContextSize = 0
+        //   0x02: DetailsLength = 12
+        //   0x03: Flags = MPI_SGE_FLAGS_TRANSACTION_ELEMENT (0x00)
+        //   0x04: Reserved2 (u32 = 0)
+        //   0x08: ImageOffset (u32 LE) — where in the chip image to start
+        //   0x0C: ImageSize (u32 LE) — how many bytes to upload
+        let mut req_bytes = Vec::with_capacity(32);
+        // Header
+        req_bytes.push(image_type.as_u8()); // 0x00 ImageType
+        req_bytes.push(0x00); // 0x01 Reserved1
+        req_bytes.push(0x00); // 0x02 ChainOffset
+        req_bytes.push(crate::mpi::messages::MpiFunction::FwUpload.as_u8()); // 0x03 Function
+        req_bytes.extend_from_slice(&0u16.to_le_bytes()); // 0x04 Reserved2
+        req_bytes.push(0x00); // 0x06 Reserved3
+        req_bytes.push(0x00); // 0x07 MsgFlags
+        req_bytes.push(0x00); // 0x08 VP_ID
+        req_bytes.push(0x00); // 0x09 VF_ID
+        req_bytes.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved4
+        req_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0x0C Reserved5
+        req_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0x10 Reserved6
+                                                          // TCSGE — 16 bytes total (4-byte tcsge header + 12-byte details).
+                                                          // lsiutil's DetailsLength=12 refers to the bytes AFTER the 4-byte
+                                                          // header (Reserved2 + ImageOffset + ImageSize = 12).
+        req_bytes.push(0x00); // 0x14 Reserved1
+        req_bytes.push(0x00); // 0x15 ContextSize = 0
+        req_bytes.push(0x0C); // 0x16 DetailsLength = 12
+        req_bytes.push(0x00); // 0x17 Flags = MPI_SGE_FLAGS_TRANSACTION_ELEMENT (0x00)
+        req_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0x18 Reserved2
+        req_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0x1C ImageOffset = 0
+        req_bytes.extend_from_slice(&(UPLOAD_BUF_SIZE as u32).to_le_bytes()); // 0x20 ImageSize
+        debug_assert_eq!(req_bytes.len(), 0x24); // 36 bytes = 20 hdr + 16 tcsge
 
         let mut reply_buf = vec![0u8; 64];
         let bytes_written = transport
-            .send(req_bytes, &mut reply_buf, Some(&mut data_in), None)
+            .send_with_sge_offset(&req_bytes, 9, &mut reply_buf, Some(&mut data_in), None)
             .map_err(|e| {
                 crate::Error::Other(format!(
                     "mpt3ctl FW_UPLOAD type={:?} send: {}",

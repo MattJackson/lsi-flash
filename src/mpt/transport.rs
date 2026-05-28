@@ -91,13 +91,29 @@ pub trait MptTransport: Send {
     /// # Note on SGE offset
     ///
     /// The MPI request format reserves a slot for the SGE at a per-request-
-    /// type offset (e.g., word 5 / byte 0x14 for `FW_UPLOAD`). The transport
-    /// needs to know this offset to insert the SGE. For v1, transports
-    /// hardcode the FW_UPLOAD offset; generalization (per-call offset arg,
-    /// or per-method-on-trait split) is a future refactor.
+    /// type offset. Caller MUST provide it via `send_with_sge_offset`.
+    /// `send` is a convenience wrapper that defaults to offset 5 (the
+    /// SGE position for an MPI 2.5+ FW_UPLOAD with no TCSGE).
+    ///
+    /// MPI 2.0 `FW_UPLOAD` requires a 16-byte TCSGE between the 20-byte
+    /// header and the SGE, so its offset is 9 (= 36 bytes / 4).
     fn send(
         &mut self,
         request: &[u8],
+        reply: &mut [u8],
+        data_in: Option<&mut [u8]>,
+        data_out: Option<&[u8]>,
+    ) -> Result<usize, TransportError> {
+        self.send_with_sge_offset(request, 5, reply, data_in, data_out)
+    }
+
+    /// Like `send`, but the caller specifies where in the request (in
+    /// u32 words from byte 0) the kernel/transport should insert the
+    /// data SGE.
+    fn send_with_sge_offset(
+        &mut self,
+        request: &[u8],
+        data_sge_offset_words: u32,
         reply: &mut [u8],
         data_in: Option<&mut [u8]>,
         data_out: Option<&[u8]>,
