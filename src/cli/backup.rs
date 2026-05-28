@@ -87,12 +87,20 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
         // VFIO+doorbell (which has the 885-KB-of-zeros bug we're working
         // around, but at least produces SOMETHING for offline testing).
         #[cfg(target_os = "linux")]
-        if let Ok(transport) = crate::mpt::Mpt3CtlTransport::open(&bdf) {
-            eprintln!(
-                "backup: using Mpt3CtlTransport (kernel-mediated, ioc_number={})",
-                transport.ioc_number()
-            );
-            return run_backup_via_mpt3ctl(transport, &out_dir, json);
+        match crate::mpt::Mpt3CtlTransport::open(&bdf) {
+            Ok(transport) => {
+                eprintln!(
+                    "backup: using Mpt3CtlTransport (kernel-mediated, ioc_number={})",
+                    transport.ioc_number()
+                );
+                return run_backup_via_mpt3ctl(transport, &out_dir, json);
+            }
+            Err(e) => {
+                eprintln!(
+                    "backup: Mpt3CtlTransport::open({}) failed: {} — falling back",
+                    bdf, e
+                );
+            }
         }
 
         let platform = crate::pci::LinuxSysfs;
