@@ -365,8 +365,11 @@ fn find_ioc_number(
         | (target_dev as u32 & 0x1f);
     let target_seg_u32 = target_seg as u32;
 
+    // The kernel's ioc_number is a monotonically-increasing counter, not a
+    // slot index — it bumps every time a card is bind/unbind'd, never resets.
+    // After a night of VFIO flip-flops, we've seen it reach 23+. Search wide.
     let mut tried = Vec::with_capacity(8);
-    for candidate in 0..16u32 {
+    for candidate in 0..256u32 {
         let mut info: Mpt3IoctlIocinfo = Default::default();
         info.hdr.ioc_number = candidate;
         info.hdr.max_data_size = std::mem::size_of::<Mpt3IoctlIocinfo>() as u32;
