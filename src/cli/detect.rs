@@ -98,17 +98,22 @@ fn print_human_readable(devices: &[pci::PciDevice]) -> io::Result<()> {
 /// Try to fetch MPI IOC_FACTS + Mfg Page 0 fields for a given BDF.
 /// Returns ExtendedCardInfo with populated fields, or None if hardware not available.
 fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Error> {
-    // Refuse to talk MPI to a device currently bound to mpt3sas — the kernel
-    // driver owns the doorbell and shares the chip state machine with us. Any
-    // doorbell write we make races mpt3sas's own commands, which on dev-1
-    // 2026-05-28 manifested as IOC_INIT replies with garbage lengths (panic
-    // post-fix; IocStatus errors pre-panic-fix). Surface a clear message
-    // instead of pretending to fetch.
+    // Per ADR-017: prefer Mpt3CtlTransport (kernel-mediated MPI via
+    // /dev/mpt2ctl ioctl) — works while mpt3sas is bound, no driver evict
+    // needed. Falls back to the legacy doorbell path on failure.
+    #[cfg(target_os = "linux")]
+    if let Ok(extended) = try_fetch_via_mpt3ctl(bdf) {
+        return Ok(Some(extended));
+    }
+
+    // Doorbell path requires mpt3sas NOT to be bound (we'd race the kernel
+    // driver on the chip's state machine). Refuse and surface a clear message.
     let driver_link = format!("/sys/bus/pci/devices/{}/driver", bdf);
     if let Ok(target) = std::fs::read_link(&driver_link) {
         if target.to_string_lossy().contains("mpt3sas") {
             return Err(crate::Error::Other(format!(
-                "card bound to mpt3sas — `sudo sh -c 'echo {bdf} > /sys/bus/pci/drivers/mpt3sas/unbind'` to free BAR1 first"
+                "card bound to mpt3sas and /dev/mpt2ctl ioctl path failed — \
+                 `sudo sh -c 'echo {bdf} > /sys/bus/pci/drivers/mpt3sas/unbind'` to free BAR1 for direct doorbell"
             )));
         }
     }
@@ -205,6 +210,60 @@ fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Er
             Err(crate::Error::Other(format!("RealIoc::open failed: {e}")))
         }
     }
+}
+
+/// Try fetching MPI fields via Mpt3CtlTransport (kernel-mediated). No driver
+/// flip-flop needed — works while mpt3sas is bound. Returns Ok(ExtendedCardInfo)
+/// on full success, Err on any failure (caller falls back to doorbell path).
+///
+/// Scope: IOC_FACTS only for now. Mfg Page 0 (NVDATA vendor/product) via
+/// CONFIG ioctl is a follow-up — needs the same TCSGE-or-not request crafting
+/// the backup verb has, which is moving into MptCard soon.
+#[cfg(target_os = "linux")]
+fn try_fetch_via_mpt3ctl(bdf: &str) -> Result<ExtendedCardInfo, crate::Error> {
+    use crate::mpi::messages::MpiFunction;
+    use crate::mpt::{Mpt3CtlTransport, MptTransport};
+
+    let mut transport = Mpt3CtlTransport::open(bdf)
+        .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
+
+    // Build IOC_FACTS request — 12 bytes, just the MPI header. No SGE, no
+    // data transfer. data_sge_offset = 3 (= 12 bytes / 4) — value doesn't
+    // matter when data_in/data_out are both empty, kernel skips SGE
+    // insertion, but ioctl still validates the field is within request size.
+    let mut req = Vec::with_capacity(12);
+    req.extend_from_slice(&0u16.to_le_bytes()); // 0x00 FunctionDependent1
+    req.push(0x00); // 0x02 ChainOffset
+    req.push(MpiFunction::IocFacts.as_u8()); // 0x03 Function = 0x03
+    req.extend_from_slice(&0u16.to_le_bytes()); // 0x04 FunctionDependent2 (SMID)
+    req.push(0x00); // 0x06 FunctionDependent3
+    req.push(0x00); // 0x07 MsgFlags
+    req.push(0x00); // 0x08 VP_ID
+    req.push(0x00); // 0x09 VF_ID
+    req.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved1
+    debug_assert_eq!(req.len(), 12);
+
+    let mut reply_buf = vec![0u8; 96]; // IOC_FACTS reply can be up to ~64 bytes
+    let n = transport
+        .send_with_sge_offset(&req, 3, &mut reply_buf, None, None)
+        .map_err(|e| crate::Error::Other(format!("mpt3ctl IOC_FACTS: {}", e)))?;
+
+    let facts = IocFactsReply::parse(&reply_buf[..n.min(reply_buf.len())])
+        .map_err(|e| crate::Error::Other(format!("IOC_FACTS reply parse: {}", e)))?;
+
+    if facts.ioc_status != IocStatus::Success {
+        return Err(crate::Error::Other(format!(
+            "IOC_FACTS non-Success: {:?}",
+            facts.ioc_status
+        )));
+    }
+
+    Ok(ExtendedCardInfo {
+        pci_name: String::new(),
+        chip_family: pci::ChipFamily::Unknown,
+        quirks: vec![],
+        ioc_facts: Some(facts),
+    })
 }
 
 /// Parse Manufacturing Page 0 to extract NVDATA vendor/product ID and other fields.
