@@ -100,6 +100,18 @@ pub struct BackupArtifact {
     pub size: u64,
 }
 
+/// Report from Card::restore — mirrors fields needed for restore reporting.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RestoreReport {
+    /// Timestamp of restore in RFC3339 format
+    pub timestamp: String,
+    /// Number of regions written back to the card
+    pub regions_written: usize,
+    /// List of artifacts that were restored with their metadata
+    pub regions: Vec<String>,
+}
+
 /// Top-level trait for flash-capable cards.
 ///
 /// Per ADR-017, CLI verbs speak through this trait uniformly, enabling future
@@ -126,6 +138,15 @@ pub trait Card: Send {
     /// so each Card impl can opt in.
     fn sbr_read(&mut self) -> Result<[u8; 256], CardError> {
         Err(CardError::NotImplemented("sbr_read"))
+    }
+
+    /// Write a previously-captured backup's firmware regions back to THIS card
+    /// via FW_DOWNLOAD. Destructive. Per ADR-015 Rule 8 (non-destructive
+    /// round-trip), restoring the same OEM firmware is the safe first write test.
+    /// Default impl returns NotImplemented so each Card opts in.
+    fn restore(&mut self, backup_dir: &Path) -> Result<RestoreReport, CardError> {
+        let _ = backup_dir;
+        Err(CardError::NotImplemented("restore"))
     }
 
     // NOTE: flash(), recover(), sbr_write() land in a follow-up.

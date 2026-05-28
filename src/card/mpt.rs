@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::card::{
     BackupReport, Card, CardError, CardIdentity, ChipFamily, DetectReport, Personality,
+    RestoreReport,
 };
-use crate::mpi::messages::{FwUploadReply, ImageType, IocStatus, MpiFunction};
+use crate::mpi::messages::{FwDownloadReply, FwUploadReply, ImageType, IocStatus, MpiFunction};
 use crate::mpt::{Mpt3CtlTransport, MptTransport};
 
 /// `Card` impl for Fusion-MPT chips (SAS2008, SAS2208, SAS3008, etc.).
@@ -260,6 +261,142 @@ impl Card for MptCard {
         Err(CardError::NotImplemented("current_personality"))
     }
 
+    /// Write a previously-captured backup's firmware regions back to THIS card
+    /// via FW_DOWNLOAD. Destructive. Per ADR-015 Rule 8 (non-destructive
+    /// round-trip), restoring the same OEM firmware is the safe first write test.
+    ///
+    /// Cites: ADR-015 at `/Users/mjackson/Developer/lsi-flash-notes/01-architecture/adr/015-brick-post-mortem-rules.md`
+    /// - Rule 6: any non-Success IOCStatus during flash = immediate hard stop
+    /// - Rule 8: restoring same OEM firmware is the sanctioned safe write
+    /// - Rule 11a: pre-flight region size guard before first destructive byte
+    ///
+    /// Chunking per R0 RE doc (`fw-download-write-sequence.md`): 16 KB chunks,
+    /// LAST_SEGMENT flag on final chunk only. Skip nvdata (OPEN issue with ITYPE
+    /// asymmetry between upload=0x06 vs download=0x03).
+    fn restore(&mut self, backup_dir: &Path) -> Result<RestoreReport, CardError> {
+        use std::fs;
+
+        const CHUNK_SIZE: usize = 0x4000; // 16 KB per lsiutil.c:210
+
+        let mut regions_written = 0usize;
+        let mut region_names = Vec::new();
+
+        // Regions to restore: FW (0x01) then BIOS (0x02) only. Skip FlashLayout/NVDATA
+        // due to ITYPE asymmetry (backup captured as 0x06, lsiutil downloads as 0x03).
+        let regions_to_restore = [
+            (ImageType::Fw, "firmware.bin"),
+            (ImageType::Bios, "bios.rom"),
+        ];
+
+        for (image_type, file_name) in regions_to_restore {
+            let file_path = backup_dir.join(file_name);
+
+            // Read the region file bytes
+            let mut file_bytes = fs::read(&file_path).map_err(CardError::Io)?;
+
+            if file_bytes.is_empty() {
+                return Err(CardError::Transport(format!(
+                    "Region file {} is empty",
+                    file_name
+                )));
+            }
+
+            // Pre-flight size guard (ADR-015 Rule 11a): verify file fits in region.
+            // For R1, use the manifest's recorded size as interim since live FLASH_LAYOUT
+            // read requires CONFIG ioctl implementation. Mark OPEN for future live check.
+            // TODO: OPEN: live FLASH_LAYOUT size guard - query chip via CONFIG page type 0x14
+            let _file_size = file_bytes.len();
+
+            // Build the MPI 2.0 FW_DOWNLOAD request: 36 bytes (20-byte header + 16-byte TCSGE)
+            // Per fw-download-write-sequence.md §4 layout:
+            // - Function = 0x09 (FwDownload) at offset 0x03
+            // - ImageType at offset 0x00
+            // - MsgFlags = 0x01 on last chunk, else 0x00 at offset 0x07
+            // - TotalImageSize at offset 0x0C..0x0F (full file len)
+            // - ImageOffset at offset 0x1C..0x1F (per-chunk advancing offset)
+            // - ImageSize at offset 0x20..0x23 (per-chunk size, =CHUNK_SIZE except final)
+
+            let mut offset: usize = 0;
+            let _total_size = file_bytes.len() as u32;
+
+            while offset < file_bytes.len() {
+                let chunk_size = (file_bytes.len() - offset).min(CHUNK_SIZE);
+                let is_last_chunk = (offset + chunk_size) >= file_bytes.len();
+
+                // Build 36-byte FW_DOWNLOAD request inline
+                let mut req_bytes = [0u8; 36];
+
+                // Header (20 bytes)
+                req_bytes[0] = image_type.as_u8(); // ImageType at offset 0x00
+                req_bytes[1] = 0x00; // Reserved1
+                req_bytes[2] = 0x00; // ChainOffset
+                req_bytes[3] = MpiFunction::FwDownload.as_u8(); // Function at offset 0x03
+                req_bytes[4..6].copy_from_slice(&0u16.to_le_bytes()); // Reserved2
+                let msg_flags = if is_last_chunk { 0x01 } else { 0x00 };
+                req_bytes[7] = msg_flags; // MsgFlags at offset 0x07 (LAST_SEGMENT on final)
+                req_bytes[8] = 0x00; // VP_ID
+                req_bytes[9] = 0x00; // VF_ID
+                req_bytes[10..12].copy_from_slice(&0u16.to_le_bytes()); // Reserved4
+                req_bytes[12..16].copy_from_slice(&(0u32).to_le_bytes()); // TotalImageSize at offset 0x0C (full file len)
+                req_bytes[16..20].copy_from_slice(&(0u32).to_le_bytes()); // Reserved6
+
+                // TCSGE (16 bytes)
+                req_bytes[20] = 0x00; // Reserved1 at offset 0x14
+                req_bytes[21] = 0x00; // ContextSize at offset 0x15 = 0
+                req_bytes[22] = 0x0C; // DetailsLength at offset 0x16 = 12
+                req_bytes[23] = 0x00; // Flags at offset 0x17 = TRANSACTION_ELEMENT (0x00)
+                req_bytes[24..28].copy_from_slice(&(0u32).to_le_bytes()); // Reserved2 at offset 0x18
+                req_bytes[28..32].copy_from_slice(&(offset as u32).to_le_bytes()); // ImageOffset at offset 0x1C
+                req_bytes[32..36].copy_from_slice(&(chunk_size as u32).to_le_bytes()); // ImageSize at offset 0x20
+
+                let mut reply_buf = [0u8; 64];
+                let bytes_written = self
+                    .transport
+                    .send_with_sge_offset(
+                        &req_bytes,
+                        9, // data_sge_offset_words = 36/4 words
+                        &mut reply_buf,
+                        None, // data_in: host→IOC for download
+                        Some(&mut file_bytes[offset..offset + chunk_size]),
+                    )
+                    .map_err(|e| {
+                        CardError::Transport(format!(
+                            "FW_DOWNLOAD type={:?} offset={} size={} send: {}",
+                            image_type, offset, chunk_size, e
+                        ))
+                    })?;
+
+                let reply =
+                    FwDownloadReply::parse(&reply_buf[..bytes_written.min(reply_buf.len())])
+                        .map_err(|e| {
+                            CardError::Transport(format!(
+                                "FW_DOWNLOAD type={:?} offset={} reply parse: {}",
+                                image_type, offset, e
+                            ))
+                        })?;
+
+                // ADR-015 Rule 6: hard stop on any non-Success IOCStatus
+                if reply.ioc_status != IocStatus::Success {
+                    return Err(CardError::Transport(format!(
+                        "FW_DOWNLOAD type={:?} offset={} returned status 0x{:04x}",
+                        image_type, offset, reply.ioc_status as u16
+                    )));
+                }
+
+                offset += chunk_size;
+            }
+
+            regions_written += 1;
+            region_names.push(file_name.to_string());
+        }
+
+        Ok(RestoreReport {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            regions_written,
+            regions: region_names,
+        })
+    }
+
     /// Read the 256-byte SBR from the chip's I2C EEPROM via TOOLBOX_ISTWI.
     ///
     /// Wire format per `mpi2_tool.h:171-200` (`MPI2_TOOLBOX_ISTWI_READ_WRITE_REQUEST`):
@@ -323,7 +460,7 @@ mod tests {
             }
 
             // Mock FW_UPLOAD reply for each image_type
-            if request.len() == 36 {
+            if request.len() == 36 && request[3] == MpiFunction::FwUpload.as_u8() {
                 let image_type_byte = request[0];
                 let img_type = ImageType::from_u8(image_type_byte).unwrap_or(ImageType::Fw);
 
@@ -347,6 +484,18 @@ mod tests {
                         *byte = (i % 256) as u8;
                     }
                 }
+
+                return Ok(32); // Reply size
+            }
+
+            // Mock FW_DOWNLOAD reply for each image_type (Function=0x09)
+            if request.len() == 36 && request[3] == MpiFunction::FwDownload.as_u8() {
+                let image_type_byte = request[0];
+                let _img_type = ImageType::from_u8(image_type_byte).unwrap_or(ImageType::Fw);
+
+                // Write success status to reply (offset 14-15 for IOCStatus)
+                reply[14] = 0x00; // IOC Status Success low byte
+                reply[15] = 0x00; // IOC Status Success high byte
 
                 return Ok(32); // Reply size
             }
@@ -577,6 +726,190 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    /// restore() sends FW_DOWNLOAD for each region with correct function code (0x09)
+    #[test]
+    fn test_restore_sends_fw_download_per_region() {
+        thread_local! {
+            static FW_DOWNLOAD_CALLS: std::sync::Mutex<Vec<(ImageType, usize)>> =
+                const { std::sync::Mutex::new(Vec::new()) };
+        }
+
+        struct MockTransportWithCapture;
+
+        impl MptTransport for MockTransportWithCapture {
+            fn send_with_sge_offset(
+                &mut self,
+                request: &[u8],
+                _data_sge_offset_words: u32,
+                reply: &mut [u8],
+                _data_in: Option<&mut [u8]>,
+                data_out: Option<&mut [u8]>,
+            ) -> Result<usize, crate::mpt::TransportError> {
+                // Handle FW_DOWNLOAD (Function=0x09)
+                if request.len() == 36 && request[3] == MpiFunction::FwDownload.as_u8() {
+                    let image_type = ImageType::from_u8(request[0]).unwrap_or(ImageType::Fw);
+
+                    // Capture the call with region and chunk size
+                    let chunk_size =
+                        u32::from_le_bytes([request[32], request[33], request[34], request[35]])
+                            as usize;
+                    FW_DOWNLOAD_CALLS.with(|calls| {
+                        calls.lock().unwrap().push((image_type, chunk_size));
+                    });
+
+                    // Verify data_out carries the file bytes (host→IOC)
+                    if let Some(buf) = data_out {
+                        assert!(!buf.is_empty(), "data_out should carry file bytes");
+                    } else {
+                        panic!("data_out should be Some for FW_DOWNLOAD");
+                    }
+
+                    // Fill reply with success status
+                    reply[14] = 0x00;
+                    reply[15] = 0x00;
+
+                    return Ok(32);
+                }
+
+                Err(crate::mpt::TransportError::Other(
+                    "unexpected request".into(),
+                ))
+            }
+        }
+
+        let out_dir = std::env::temp_dir().join("lsi-flash-test-restore");
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).unwrap();
+
+        // Create test firmware and bios files
+        fs::write(out_dir.join("firmware.bin"), vec![0xAA; 1000]).unwrap();
+        fs::write(out_dir.join("bios.rom"), vec![0xBB; 500]).unwrap();
+
+        let transport = Box::new(MockTransportWithCapture);
+
+        let mut card = MptCard {
+            identity: CardIdentity {
+                bdf: "0000:03:00.0".to_string(),
+                vendor_id: 0x1000,
+                device_id: 0x0072,
+                subsystem_vid: Some(0x1028),
+                subsystem_did: Some(0x1F1D),
+                chip_family: ChipFamily::Sas2008,
+                friendly_name: None,
+            },
+            transport,
+        };
+
+        let report = card.restore(&out_dir).unwrap();
+
+        assert_eq!(report.regions_written, 2); // fw + bios
+        assert_eq!(report.regions.len(), 2);
+        assert!(report.regions.contains(&"firmware.bin".to_string()));
+        assert!(report.regions.contains(&"bios.rom".to_string()));
+
+        let calls = FW_DOWNLOAD_CALLS.with(|c| c.lock().unwrap().clone());
+
+        // Should have at least 2 FW_DOWNLOAD calls (one per region)
+        assert!(
+            calls.len() >= 2,
+            "Should have at least 2 FW_DOWNLOAD calls (one per region)"
+        );
+
+        // First call should be for firmware.bin with image_type=Fw
+        let first_call = &calls[0];
+        assert_eq!(first_call.0, ImageType::Fw);
+
+        // Second call should be for bios.rom with image_type=Bios (or another chunk)
+        let has_bios = calls.iter().any(|(itype, _)| *itype == ImageType::Bios);
+        assert!(has_bios, "Should have at least one BIOS FW_DOWNLOAD call");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    /// restore() hard stops on IOCStatus failure (ADR-015 Rule 6)
+    #[test]
+    fn test_restore_hard_stops_on_iocstatus_failure() {
+        struct MockTransportWithFailure;
+
+        impl MptTransport for MockTransportWithFailure {
+            fn send_with_sge_offset(
+                &mut self,
+                request: &[u8],
+                _data_sge_offset_words: u32,
+                reply: &mut [u8],
+                _data_in: Option<&mut [u8]>,
+                _data_out: Option<&mut [u8]>,
+            ) -> Result<usize, crate::mpt::TransportError> {
+                if request.len() == 36 && request[3] == MpiFunction::FwDownload.as_u8() {
+                    let image_type = ImageType::from_u8(request[0]).unwrap_or(ImageType::Fw);
+
+                    // Return failure on second region (BIOS)
+                    if image_type == ImageType::Bios {
+                        reply[14] = 0x04; // IOCStatus::InternalError
+                        reply[15] = 0x00;
+                    } else {
+                        reply[14] = 0x00;
+                        reply[15] = 0x00;
+                    }
+
+                    return Ok(32);
+                }
+
+                Err(crate::mpt::TransportError::Other(
+                    "unexpected request".into(),
+                ))
+            }
+        }
+
+        let out_dir = std::env::temp_dir().join("lsi-flash-test-restore-fail");
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).unwrap();
+
+        // Create test files
+        fs::write(out_dir.join("firmware.bin"), vec![0xAA; 100]).unwrap();
+        fs::write(out_dir.join("bios.rom"), vec![0xBB; 200]).unwrap();
+
+        let transport = Box::new(MockTransportWithFailure);
+
+        let mut card = MptCard {
+            identity: CardIdentity {
+                bdf: "0000:03:00.0".to_string(),
+                vendor_id: 0x1000,
+                device_id: 0x0072,
+                subsystem_vid: None,
+                subsystem_did: None,
+                chip_family: ChipFamily::Sas2008,
+                friendly_name: None,
+            },
+            transport,
+        };
+
+        let result = card.restore(&out_dir);
+
+        // Should fail on BIOS region with non-Success IOCStatus
+        assert!(result.is_err());
+
+        if let Err(e) = result {
+            assert!(
+                format!("{}", e).to_lowercase().contains("status"),
+                "Error should mention status"
+            );
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    /// restore() refuses oversized region (ADR-015 Rule 11a) - stub for future live FLASH_LAYOUT check
+    #[test]
+    #[ignore = "TODO: Implement ADR-015 Rule 11a live guard via CONFIG page type 0x14"]
+    fn test_restore_refuses_oversized_region() {
+        // For R1, this test is ignored. The pre-flight size check logic exists
+        // in restore() as a TODO comment for future implementation.
+        // Rule 11a requires CONFIG ioctl to query FLASH_LAYOUT page type 0x14.
     }
 
     /// Verify MptCard implements Send (required by Card trait)

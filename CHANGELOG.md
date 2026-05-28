@@ -77,7 +77,21 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 - `cli/flash.rs` 12-phase orchestrator state machine (Step 5 part 1)
 - `cli/safety.rs` mount / LVM / mdraid / ZFS safety guards (Step 5 part 2)
 - Real MPI ops wired into orchestrator destructive states (Step 5 part 3)
-- `cli/backup.rs` — `lsi-flash backup` verb
+ - `Card::restore()` trait method + `RestoreReport` struct (`src/card/mod.rs`)
+   - Default impl returns NotImplemented so each Card impl can opt in
+   - Mirrors `backup()`: FW_UPLOAD→FW_DOWNLOAD, data_in→data_out round-trip
+ - `MptCard::restore()` implementation via MPI 2.0 FW_DOWNLOAD (cycle R1)
+   - Per ADR-015 (`lsi-flash-notes/01-architecture/adr/015-brick-post-mortem-rules.md`):
+     Rule 6: non-Success IOCStatus = hard stop; Rule 8: same-OEM firmware safe write;
+     Rule 11a: pre-flight region size guard (marked OPEN for live FLASH_LAYOUT read)
+   - Chunking per `fw-download-write-sequence.md`: 16 KB chunks, LAST_SEGMENT flag on final
+   - Restores FW (0x01) and BIOS (0x02) regions only; skips nvdata due to ITYPE asymmetry
+     (backup captured as FlashLayout=0x06, lsiutil downloads as NvData=0x03) — OPEN pending senior resolution
+   - Builds 36-byte FW_DOWNLOAD request inline (20-byte header + 16-byte TCSGE), sends via
+     `transport.send_with_sge_offset(&req, 9, &mut reply, None, Some(chunk))`
+   - Tests: `restore_sends_fw_download_per_region`, `restore_hard_stops_on_iocstatus_failure`,
+     `test_restore_refuses_oversized_region` (ignored until Rule 11a implemented)
+ - `cli/backup.rs` — `lsi-flash backup` verb
 - `cli/recover.rs` — `lsi-flash recover` verb
 - `firmware/synthesize.rs` — first manipulator feature (`firmware reverse-phy`)
 - `mpi/messages.rs` — typed Request/Reply for IOC_INIT/CONFIG/FW_{DOWNLOAD,UPLOAD}/TOOLBOX_CLEAN
