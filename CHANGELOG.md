@@ -74,6 +74,12 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 - Manufacturing Page 0 fetch via CONFIG read (action=0x06 NVRAM copy, page type=0x09 Mfg, page=0);
   parses NVDATA vendor ID at offset 0x08, product ID string at 0x0A, NVDATA version at 0x18,
   firmware product ID at 0x28 per toolbox-and-config.md §5 and baseline.md:14-15
+- `src/mpt/mpt3ctl.rs` — `Mpt3CtlTransport` kernel-mediated MPI transport impl (freshman cycle). Wraps
+  `/dev/mpt3ctl` character device + `MPT3COMMAND` ioctl from Linux's `mpt3sas` driver. Implements the
+  `MptTransport` trait for read-safe operations where the card stays bound to mpt3sas. Uses kernel-allocated
+  bounce pages for DMA, avoiding ~2000 LoC of user-space post-queue plumbing (Path B from ADR-017). Hardcodes
+  SGE offset to word 5 (byte 0x14) for FW_UPLOAD_REQUEST per v1 scope. Includes ioctl ABI verification tests
+  and musl portability support via local `IoctlReq` type alias matching patterns in `src/hw/vfio.rs`.
 
 ### Fixed
 - Flash orchestrator `step_backup` was unconditionally returning

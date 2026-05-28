@@ -6,6 +6,8 @@
 //!
 //! See ADR-017 (lsi-flash-notes) for the pluggable-transport design rationale.
 
+pub mod mpt3ctl;
 pub mod transport;
 
+pub use mpt3ctl::Mpt3CtlTransport;
 pub use transport::{MptTransport, TransportError};
