@@ -5,7 +5,12 @@
 
 #![allow(dead_code)]
 
+use serde::{Deserialize, Serialize};
+
+pub mod mpt;
 pub mod tests;
+
+pub use mpt::MptCard;
 
 use std::path::Path;
 
@@ -81,8 +86,18 @@ pub struct BackupReport {
     pub timestamp: String,
     /// Artifacts written (firmware.bin, bios.rom, nvdata.bin)
     pub artifacts_count: usize,
-    // TODO: senior to flesh out with full manifest fields per ADR-015 Rule 10
-    // Fields to add later: sas_wwn, artifacts[].{path,image_type,sha256,size}, source_card info
+    /// List of artifacts with their metadata for reporting
+    pub artifacts: Vec<BackupArtifact>,
+}
+
+/// Artifact information from Card::backup — mirrors BackupArtifact in cli/backup.rs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupArtifact {
+    pub path: String,
+    pub image_type: String,
+    pub sha256: String,
+    pub size: u64,
 }
 
 /// Top-level trait for flash-capable cards.
@@ -113,71 +128,25 @@ pub trait Card: Send {
 /// Discover all supported cards on the PCI bus.
 ///
 /// Walks `/sys/bus/pci/devices/` via `crate::pci::Platform` (LinuxSysfs in prod).
-/// For each device, reads vendor/device IDs and dispatches to the right Card impl
-/// by VID:DID lookup against the card database. Today only MptCard is planned for
-/// SAS2008/SAS2208/SAS3008 chips, but since MptCard doesn't exist yet, this returns
-/// `CardError::NotImplemented("MptCard")` for each discovered device.
-///
-/// The senior follow-up plugs in the MptCard impl here — this scaffold-only cycle
-/// ensures the contract is stable so future cycles can build against it.
+/// For each device, reads vendor/device IDs and dispatches to MptCard::discover_one()
+/// per BDF found via `pci::discover_sas2008_devices_linux()`. Cards that can't be
+/// opened (mpt3sas not loaded) are skipped.
 pub fn discover() -> Result<Vec<Box<dyn Card>>, CardError> {
-    let platform = crate::pci::LinuxSysfs;
+    let devs = crate::pci::discover_sas2008_devices_linux()
+        .map_err(|e| CardError::PciEnumeration(format!("{}", e)))?;
 
-    // Use existing PCI enumeration path from pci.rs
-    let devices = crate::pci::discover_sas2008_devices(&platform)
-        .map_err(|e| CardError::PciEnumeration(e.to_string()))?;
-
-    if devices.is_empty() {
-        return Err(CardError::NoCardsFound);
+    let mut cards: Vec<Box<dyn Card>> = Vec::new();
+    for dev in devs {
+        match MptCard::discover_one(&dev.bdf) {
+            Ok(card) => cards.push(Box::new(card)),
+            Err(_) => continue, // skip cards we can't talk to (mpt3sas not loaded etc.)
+        }
     }
 
-    // For each discovered device, attempt to build the right Card impl.
-    // Since MptCard doesn't exist yet, we return NotImplemented for all entries.
-    let num_devices = devices.len();
-    #[allow(unused_variables)]
-    for dev in &devices {
-        // Look up chip family from VID:DID via card_database module
-        let _chip_family = match (dev.vendor_id, dev.device_id) {
-            (0x1000, 0x0072) => ChipFamily::Sas2008,
-            (0x1000, 0x0084) => ChipFamily::Sas2208, // Future target
-            (0x1000, 0x00C0) => ChipFamily::Sas3008, // Future target
-            _ => {
-                // Check subsystem IDs for known variants
-                let card_db = crate::card_database::load_embedded()
-                    .map_err(|e| CardError::PciEnumeration(e.to_string()))?;
-
-                if let Some(info) = crate::card_database::identify_card(
-                    &card_db,
-                    dev.vendor_id,
-                    dev.device_id,
-                    dev.subsystem_vendor_id,
-                    dev.subsystem_device_id,
-                ) {
-                    // Map card-database ChipFamily to our Card module enum
-                    match info.chip_family {
-                        crate::card_database::ChipFamily::Sas2008 => ChipFamily::Sas2008,
-                        crate::card_database::ChipFamily::Sas2108
-                        | crate::card_database::ChipFamily::Sas2208
-                        | crate::card_database::ChipFamily::Sas2308 => ChipFamily::Sas2208,
-                        crate::card_database::ChipFamily::Sas3008 => ChipFamily::Sas3008,
-                        crate::card_database::ChipFamily::Unknown => ChipFamily::Unknown,
-                    }
-                } else {
-                    ChipFamily::Unknown
-                }
-            }
-        };
-
-        // TODO: senior follow-up — construct MptCard here based on chip_family
-        // For now, we just iterate over devices to consume them
-    }
-
-    // Since we can't push errors into Vec<Box<dyn Card>>, return NotImplemented error
-    if num_devices == 0 {
+    if cards.is_empty() {
         Err(CardError::NoCardsFound)
     } else {
-        // Return NotImplemented to lock the scaffold-only behavior
-        Err(CardError::NotImplemented("MptCard"))
+        Ok(cards)
     }
 }
 
@@ -185,8 +154,6 @@ pub fn discover() -> Result<Vec<Box<dyn Card>>, CardError> {
 ///
 /// Like `discover()` but for a specific BDF. Returns the right Card impl based on
 /// VID:DID lookup, or an error if the device doesn't exist or isn't supported.
-pub fn discover_one(_bdf: &str) -> Result<Box<dyn Card>, CardError> {
-    // TODO: senior follow-up — implement single-card discovery with BDF-specific lookup
-    // For now, return NotImplemented to match discover() behavior
-    Err(CardError::NotImplemented("discover_one"))
+pub fn discover_one(bdf: &str) -> Result<Box<dyn Card>, CardError> {
+    Ok(Box::new(MptCard::discover_one(bdf)?))
 }

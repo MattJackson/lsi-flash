@@ -9,6 +9,20 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 
 ## [Unreleased]
 
+### Changed
+- MptCard `Card` impl — concrete implementation for Fusion-MPT chips (SAS2008/SAS2208/SAS3008)
+  - `src/card/mpt.rs`: `MptCard` struct wrapping `MptTransport`; implements `Card::identity()`, `detect()`, `backup()`, `current_personality()` stub
+  - `discover_one(bdf)` now routes through `MptCard::discover_one()` which opens `Mpt3CtlTransport` (kernel-mediated via `/dev/mpt3ctl`)
+  - `backup()` implements FW_UPLOAD for [Fw, Bios, FlashLayout] image types using MPI 2.0 wire format (cites `src/cli/backup.rs:185-209` for byte layout)
+  - Writes firmware.bin, bios.rom, nvdata.bin + manifest.toml with SHA256 hashes per ADR-015 Rule 10
+  - Tests: `identity()` returns correct values; `current_personality()` returns NotImplemented; `detect()` via mock transport; `backup_writes_artifacts` verifies file output
+  - Cites ADR-017 (`lsi-flash-notes/01-architecture/adr/017-card-trait-and-pluggable-transport.md`)
+- `cli/backup.rs` — refactor to use Card trait instead of inline Mpt3CtlTransport path
+  - Removed `run_backup_via_mpt3ctl()` function (lines ~144-278) — functionality now in `MptCard::backup()`
+  - `--pci <bdf>` branch calls `crate::card::discover_one(&bdf)?` then `card.backup(&out_dir)`
+  - Kept VFIO+legacy doorbell fallback chain for operators when mpt3sas isn't loaded
+  - Added `print_backup_report()` helper for unified output formatting (human-readable + JSON modes)
+
 ### Added
 - MPI2_FLASH_LAYOUT struct + parser (ADR-015 Rule 11a)
   - `src/mpi/messages.rs`: `FlashRegion`, `FlashRegionType` enum, `FlashLayoutReply` with parse() and region() methods
