@@ -10,12 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Note (2026-05-27): clippy is still advisory pending a sweep of
-# ~30 pre-existing dead-code / capitalized-acronym warnings inherited
-# from Stage 1+2. Hard-gating clippy without that cleanup would just
-# encourage scattered #[allow] noise. Tracked separately; restore once
-# the sweep commit lands. MSRV is dropped to "stable only" — clap_lex
-# 1.1.0 requires Rust edition 2024, so 1.74 is no longer realistic.
+# Note (2026-05-28): all four gates (fmt, clippy, test, musl) are
+# hard gates. MSRV is "stable only" — clap_lex 1.1.0 requires Rust
+# edition 2024, so 1.74 is no longer realistic. Revisit MSRV by picking
+# a real floor (probably 1.80+) once we have feedback from one external
+# contributor.
 
 jobs:
   fmt:
@@ -31,7 +30,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

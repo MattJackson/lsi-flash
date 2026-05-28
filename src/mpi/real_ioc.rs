@@ -176,9 +176,9 @@ impl<P: Platform> RealIoc<P> {
 impl<P: Platform> IocBackend for RealIoc<P> {
     // === Destructive ops — brick-gated, stay NotImplementedYet until CH341A ===
 
-    fn send_fw_download<'a>(
+    fn send_fw_download(
         &mut self,
-        _req: &FwDownloadRequest<'a>,
+        _req: &FwDownloadRequest<'_>,
     ) -> Result<FwDownloadReply, MpiError> {
         Err(MpiError::NotImplementedYet {
             op: "RealIoc::send_fw_download (destructive — brick-gated)",
@@ -284,7 +284,7 @@ impl<P: Platform> IocBackend for RealIoc<P> {
         Ok(reply)
     }
 
-    fn send_config<'a>(&mut self, req: &ConfigRequest<'a>) -> Result<ConfigReply, MpiError> {
+    fn send_config(&mut self, req: &ConfigRequest<'_>) -> Result<ConfigReply, MpiError> {
         // TODO(cycle 2b followup): the dword loops below skip the
         // IOC_DOORBELL_INT handshake. On a real chip the host must wait for
         // the IOC interrupt bit between every write and every read; without
@@ -470,7 +470,6 @@ impl<P: Platform> IocBackend for RealIoc<P> {
 mod tests {
     use super::*;
     use crate::mpi::messages::ImageType;
-    use crate::mpi::session::IocBackend as _;
     use crate::pci::MockPlatform;
 
     /// for_tests builds a RealIoc without hardware mmap (bar1_mmap = None).
@@ -563,16 +562,11 @@ mod tests {
         );
     }
 
-    /// BAR1_LEN must be at least large enough to cover all SAS2008 register
-    /// offsets exposed by doorbell.rs (DOORBELL=0x00, DIAG=0x10, WRSEQ=0x14,
-    /// HCDW pointers at 0x74..0x7C). 4 KB easily covers this per lsirec.c.
-    #[test]
-    fn bar1_len_covers_all_known_register_offsets() {
-        assert!(
-            BAR1_LEN >= 0x100,
-            "BAR1_LEN must cover at least the first 256 bytes"
-        );
-    }
+    /// BAR1_LEN must cover all SAS2008 register offsets exposed by doorbell.rs
+    /// (DOORBELL=0x00, DIAG=0x10, WRSEQ=0x14, HCDW pointers at 0x74..0x7C).
+    /// 4 KB easily covers this per lsirec.c. Const assertion → compile error
+    /// if a future change drops BAR1_LEN below the floor.
+    const _BAR1_LEN_COVERS_KNOWN_REGISTERS: () = assert!(BAR1_LEN >= 0x100);
 
     /// Test that send_fw_upload respects buffer size limits.
     #[test]
