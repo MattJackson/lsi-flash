@@ -1703,6 +1703,179 @@ pub enum MpiError {
 }
 
 // ============================================================================
+// FlashRegionType and FlashLayoutReply — ADR-015 Rule 11a (mpi2_ioc.h:1469-1502)
+// ============================================================================
+
+/// One flash region descriptor — 16 bytes wire format per MPI2_FLASH_REGION at mpi2_ioc.h:1469-1477.
+/// Layout: RegionType(U8, offset 0x00), Reserved1(U8, 0x01), Reserved2(U16, 0x02),
+/// RegionOffset(U32, 0x04), RegionSize(U32, 0x08), Reserved3(U32, 0x0C).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashRegion {
+    region_type: u8,        // Offset 0x00 — stored as raw byte for wire format
+    reserved_1: u8,         // Offset 0x01 — not exposed (reserved)
+    reserved_2: u16,        // Offset 0x02-0x03 — not exposed (reserved)
+    pub region_offset: u32, // Offset 0x04
+    pub region_size: u32,   // Offset 0x08
+    reserved_3: u32,        // Offset 0x0C-0x0F — not exposed (reserved)
+}
+
+impl FlashRegion {
+    /// Create a new FlashRegion with all fields including reserved padding.
+    pub fn new(region_type: FlashRegionType, region_offset: u32, region_size: u32) -> Self {
+        Self {
+            region_type: region_type.as_u8(),
+            reserved_1: 0x00,
+            reserved_2: 0x0000,
+            region_offset,
+            region_size,
+            reserved_3: 0x00000000,
+        }
+    }
+
+    /// Get the region type as FlashRegionType enum.
+    pub fn region_type(&self) -> FlashRegionType {
+        FlashRegionType::from_u8(self.region_type)
+    }
+}
+
+/// Flash region type discriminator — MPI2_FLASH_REGIONTYPE_* at mpi2_ioc.h:1506-1518.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashRegionType {
+    Unused = 0x00,        // MPI2_FLASH_REGION_UNUSED
+    Firmware = 0x01,      // MPI2_FLASH_REGION_FIRMWARE
+    Bios = 0x02,          // MPI2_FLASH_REGION_BIOS
+    Manufacturing = 0x03, // MPI2_FLASH_REGION_NVDATA (manufacturing pages / NVDATA)
+    Config = 0x04,        // MPI2_FLASH_REGION_CONFIG_1/CONFIG_2
+    MfgPlusConfig = 0x05, // MPI2_FLASH_REGION_MEGARAID (mfg + cfg combined)
+    BootService = 0x06,   // MPI2_FLASH_REGION_MFG_INFORMATION (boot service)
+    Log = 0x07,           // MPI2_FLASH_REGION_INIT (log / init data)
+    Other(u8),            // Unknown or future types
+}
+
+impl FlashRegionType {
+    /// Parse raw u8 into FlashRegionType enum.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0x00 => Self::Unused,
+            0x01 => Self::Firmware,
+            0x02 => Self::Bios,
+            0x03 => Self::Manufacturing,
+            0x04 => Self::Config,
+            0x05 => Self::MfgPlusConfig,
+            0x06 => Self::BootService,
+            0x07 => Self::Log,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Convert FlashRegionType back to raw u8.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Unused => 0x00,
+            Self::Firmware => 0x01,
+            Self::Bios => 0x02,
+            Self::Manufacturing => 0x03,
+            Self::Config => 0x04,
+            Self::MfgPlusConfig => 0x05,
+            Self::BootService => 0x06,
+            Self::Log => 0x07,
+            Self::Other(v) => v,
+        }
+    }
+}
+
+/// MPI2_FLASH_LAYOUT reply — chip's authoritative flash map per ADR-015 Rule 11a.
+/// Wire format per mpi2_ioc.h:1480-1502 (MPI2_FLASH_LAYOUT_DATA).
+/// Layout: FlashSize(U32, 0x00), Reserved1-3(U32 each, 0x04-0x0C), Region[] (variable length, 16 bytes each starting at 0x10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashLayoutReply {
+    pub flash_size: u32,
+    pub regions: Vec<FlashRegion>,
+}
+
+impl FlashLayoutReply {
+    /// Parse from raw config-page-data bytes returned by CONFIG(MPI2_CONFIG_EXTPAGETYPE_FLASH_LAYOUT).
+    /// Returns Err on short buffer or impossible field values.
+    ///
+    /// The layout header is 16 bytes (mpi2_ioc.h:1480-1487), followed by variable-length region array.
+    /// Each region is 16 bytes per mpi2_ioc.h:1469-1477. The number of regions is inferred from buffer length.
+    pub fn parse(bytes: &[u8]) -> Result<Self, MpiError> {
+        if bytes.len() < 16 {
+            return Err(MpiError::MalformedReply {
+                function: MpiFunction::Config,
+                got: bytes.len(),
+                need: 16,
+            });
+        }
+
+        // Layout header at offset 0x00-0x0F (16 bytes) — mpi2_ioc.h:1480-1487
+        let flash_size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+        // Reserved fields at 0x04, 0x08, 0x0C are ignored (not exposed in reply)
+
+        // Regions start at offset 0x10 — mpi2_ioc.h:1469-1477
+        let mut regions = Vec::new();
+        let region_start = 16;
+        let region_size = 16;
+
+        if bytes.len() >= region_start {
+            let remaining = bytes.len() - region_start;
+            let num_regions = remaining / region_size;
+
+            for i in 0..num_regions {
+                let offset = region_start + (i * region_size);
+
+                // RegionType at offset+0x00 (U8)
+                let _region_type_raw = bytes[offset];
+
+                // Reserved1 at offset+0x01 (U8) — ignored
+                // Reserved2 at offset+0x02-0x03 (U16) — ignored
+
+                // RegionOffset at offset+0x04 (U32 LE)
+                let region_offset = u32::from_le_bytes([
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
+                ]);
+
+                // RegionSize at offset+0x08 (U32 LE)
+                let region_size = u32::from_le_bytes([
+                    bytes[offset + 8],
+                    bytes[offset + 9],
+                    bytes[offset + 10],
+                    bytes[offset + 11],
+                ]);
+
+                // Reserved3 at offset+0x0C-0x0F (U32) — ignored
+
+                regions.push(FlashRegion {
+                    region_type: _region_type_raw,
+                    reserved_1: 0x00,
+                    reserved_2: 0x0000,
+                    region_offset,
+                    region_size,
+                    reserved_3: 0x0000_0000,
+                });
+            }
+        }
+
+        Ok(Self {
+            flash_size,
+            regions,
+        })
+    }
+
+    /// Look up the region whose `region_type` matches; returns the FIRST match.
+    /// Used by Rule 11a to find "where does the FW image go".
+    pub fn region(&self, kind: FlashRegionType) -> Option<&FlashRegion> {
+        self.regions.iter().find(|r| r.region_type() == kind)
+    }
+}
+
+// ============================================================================
 // Unit Tests — golden bytes from wire-format docs
 // ============================================================================
 
@@ -2280,5 +2453,179 @@ mod tests {
         // All types should have Cites comments referencing wire-format docs;
         // the comments themselves are the test artifact (citation count is
         // checked in PR review, not at runtime).
+    }
+
+    // ========================================================================
+    // FlashLayoutReply tests — ADR-015 Rule 11a (mpi2_ioc.h:1469-1502)
+    // ========================================================================
+
+    #[test]
+    fn flash_region_type_from_u8_handles_all_codes() {
+        assert_eq!(FlashRegionType::from_u8(0x00), FlashRegionType::Unused);
+        assert_eq!(FlashRegionType::from_u8(0x01), FlashRegionType::Firmware);
+        assert_eq!(FlashRegionType::from_u8(0x02), FlashRegionType::Bios);
+        assert_eq!(
+            FlashRegionType::from_u8(0x03),
+            FlashRegionType::Manufacturing
+        );
+        assert_eq!(FlashRegionType::from_u8(0x04), FlashRegionType::Config);
+        assert_eq!(
+            FlashRegionType::from_u8(0x05),
+            FlashRegionType::MfgPlusConfig
+        );
+        assert_eq!(FlashRegionType::from_u8(0x06), FlashRegionType::BootService);
+        assert_eq!(FlashRegionType::from_u8(0x07), FlashRegionType::Log);
+        assert_eq!(FlashRegionType::from_u8(0xFF), FlashRegionType::Other(0xFF));
+    }
+
+    #[test]
+    fn flash_region_type_as_u8_roundtrip() {
+        let variants = [
+            FlashRegionType::Unused,
+            FlashRegionType::Firmware,
+            FlashRegionType::Bios,
+            FlashRegionType::Manufacturing,
+            FlashRegionType::Config,
+            FlashRegionType::MfgPlusConfig,
+            FlashRegionType::BootService,
+            FlashRegionType::Log,
+        ];
+
+        for variant in &variants {
+            let raw = variant.as_u8();
+            assert_eq!(FlashRegionType::from_u8(raw), *variant);
+        }
+    }
+
+    #[test]
+    fn flash_region_type_other_roundtrip() {
+        let other = FlashRegionType::Other(0x42);
+        assert_eq!(other.as_u8(), 0x42);
+        assert_eq!(FlashRegionType::from_u8(0x42), FlashRegionType::Other(0x42));
+    }
+
+    #[test]
+    fn flash_layout_reply_parse_golden_buffer() {
+        // Construct a golden buffer: layout header (16 bytes) + 2 regions (32 bytes) = 48 bytes total.
+        // Layout header per mpi2_ioc.h:1480-1487:
+        //   Offset 0x00: FlashSize (U32) = 0x00100000 (1MB)
+        //   Offset 0x04: Reserved1 (U32) = 0
+        //   Offset 0x08: Reserved2 (U32) = 0
+        //   Offset 0x0C: Reserved3 (U32) = 0
+        // Region per mpi2_ioc.h:1469-1477 (16 bytes each):
+        //   Offset 0x00: RegionType (U8)
+        //   Offset 0x01: Reserved1 (U8)
+        //   Offset 0x02: Reserved2 (U16)
+        //   Offset 0x04: RegionOffset (U32)
+        //   Offset 0x08: RegionSize (U32)
+        //   Offset 0x0C: Reserved3 (U32)
+
+        let mut bytes = vec![0x00; 48];
+
+        // Layout header — FlashSize at offset 0x00-0x03 = 1MB (0x00100000 LE)
+        bytes[0] = 0x00;
+        bytes[1] = 0x00;
+        bytes[2] = 0x10;
+        bytes[3] = 0x00;
+
+        // Region 0 at offset 0x10: Firmware region (type=0x01)
+        bytes[0x10] = 0x01; // RegionType = Firmware
+        bytes[0x14..0x18].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // RegionOffset
+        bytes[0x18..0x1C].copy_from_slice(&0x0008_0000u32.to_le_bytes()); // RegionSize = 512KB
+
+        // Region 1 at offset 0x20: BIOS region (type=0x02)
+        bytes[0x20] = 0x02; // RegionType = Bios
+        bytes[0x24..0x28].copy_from_slice(&0x0009_0000u32.to_le_bytes()); // RegionOffset
+        bytes[0x28..0x2C].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // RegionSize = 64KB
+
+        let reply = FlashLayoutReply::parse(&bytes).unwrap();
+
+        assert_eq!(reply.flash_size, 0x00100000);
+        assert_eq!(reply.regions.len(), 2);
+        assert_eq!(reply.regions[0].region_type(), FlashRegionType::Firmware);
+        assert_eq!(reply.regions[0].region_offset, 0x0001_0000);
+        assert_eq!(reply.regions[0].region_size, 0x0008_0000);
+        assert_eq!(reply.regions[1].region_type(), FlashRegionType::Bios);
+        assert_eq!(reply.regions[1].region_offset, 0x0009_0000);
+        assert_eq!(reply.regions[1].region_size, 0x0001_0000);
+    }
+
+    #[test]
+    fn flash_layout_reply_region_finds_correct_type() {
+        let mut bytes = vec![0x00; 48];
+
+        // Layout header — FlashSize at offset 0x00-0x03 = 1MB (0x00100000 LE)
+        bytes[0] = 0x00;
+        bytes[1] = 0x00;
+        bytes[2] = 0x10;
+        bytes[3] = 0x00;
+
+        // Region 0 at offset 0x10: Firmware region (type=0x01)
+        bytes[0x10] = 0x01; // RegionType = Firmware
+        bytes[0x14..0x18].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // RegionOffset
+        bytes[0x18..0x1C].copy_from_slice(&0x0008_0000u32.to_le_bytes()); // RegionSize = 512KB
+
+        // Region 1 at offset 0x20: BIOS region (type=0x02)
+        bytes[0x20] = 0x02; // RegionType = Bios
+        bytes[0x24..0x28].copy_from_slice(&0x0009_0000u32.to_le_bytes()); // RegionOffset
+        bytes[0x28..0x2C].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // RegionSize = 64KB
+
+        let reply = FlashLayoutReply::parse(&bytes).unwrap();
+
+        // Find firmware region
+        let fw_region = reply
+            .region(FlashRegionType::Firmware)
+            .expect("should find firmware");
+        assert_eq!(fw_region.region_type(), FlashRegionType::Firmware);
+        assert_eq!(fw_region.region_size, 0x0008_0000);
+
+        // Find BIOS region
+        let bios_region = reply
+            .region(FlashRegionType::Bios)
+            .expect("should find bios");
+        assert_eq!(bios_region.region_type(), FlashRegionType::Bios);
+        assert_eq!(bios_region.region_size, 0x0001_0000);
+
+        // Non-existent region returns None
+        assert!(reply.region(FlashRegionType::Log).is_none());
+
+        // Verify reserved fields are zeroed
+        assert_eq!(fw_region.reserved_1, 0x00);
+        assert_eq!(fw_region.reserved_2, 0x0000);
+    }
+
+    #[test]
+    fn flash_layout_reply_parse_too_short_returns_malformed() {
+        let bytes = vec![0x00; 12]; // Less than required 16 bytes for layout header
+
+        match FlashLayoutReply::parse(&bytes) {
+            Err(MpiError::MalformedReply {
+                function,
+                got,
+                need,
+            }) => {
+                assert_eq!(function, MpiFunction::Config);
+                assert_eq!(got, 12);
+                assert_eq!(need, 16);
+            }
+            _ => panic!("Expected MalformedReply error"),
+        }
+    }
+
+    #[test]
+    fn flash_region_struct_size_is_16_bytes() {
+        // Verify FlashRegion is 16 bytes as per mpi2_ioc.h:1469-1477 (U8+U8+U16+U32+U32+U32)
+        assert_eq!(std::mem::size_of::<FlashRegion>(), 16);
+    }
+
+    #[test]
+    fn flash_region_type_debug_impl() {
+        let fw = FlashRegionType::Firmware;
+        let debug_str = format!("{:?}", fw);
+        assert_eq!(debug_str, "Firmware");
+
+        let other = FlashRegionType::Other(0x42);
+        let debug_str = format!("{:?}", other);
+        assert_eq!(debug_str, "Other(66)");
     }
 }

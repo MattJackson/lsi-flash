@@ -10,6 +10,10 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 ## [Unreleased]
 
 ### Added
+- MPI2_FLASH_LAYOUT struct + parser (ADR-015 Rule 11a)
+  - `src/mpi/messages.rs`: `FlashRegion`, `FlashRegionType` enum, `FlashLayoutReply` with parse() and region() methods
+  - Wire format per mpi2_ioc.h:1469-1502 (MPI2_FLASH_REGION at :1469, MPI2_FLASH_LAYOUT at :1480)
+  - Tests: from_u8/as_u8 roundtrip for all region types, golden buffer parse with 2 regions, region() lookup by type, short-buffer error handling
 - Card trait scaffold per ADR-017 — pluggable abstraction over flash-capable cards
   - `src/card/mod.rs`: `Card` trait with detect/backup/current_personality methods
   - `CardIdentity` struct for PCI-based identification (BDF, VID:DID, chip family)
