@@ -107,7 +107,14 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
         source_card: None,
     };
 
-    for image_type in [ImageType::Fw, ImageType::Bios, ImageType::NvData] {
+    // FW_UPLOAD ITYPE values per mpi2_ioc.h:1244-1253:
+    //   0x01 = MPI2_FW_UPLOAD_ITYPE_FW_FLASH       (firmware ARM code)
+    //   0x02 = MPI2_FW_UPLOAD_ITYPE_BIOS_FLASH     (option ROM)
+    //   0x06 = MPI2_FW_UPLOAD_ITYPE_MANUFACTURING  (NVDATA — DIFFERENT
+    //          from FW_DOWNLOAD's NVDATA=0x03; our ImageType::NvData
+    //          maps the DOWNLOAD value and is wrong for UPLOAD).
+    // ImageType::FlashLayout serializes to 0x06 — the right UPLOAD code.
+    for image_type in [ImageType::Fw, ImageType::Bios, ImageType::FlashLayout] {
         // SAS2008 flash region tops out around 1 MB across all known OEM
         // variants (Dell ITA A04 firmware on dev-1 measured at 885 KB / 0xD831C
         // bytes 2026-05-28). 2 MB buffer gives headroom for future SAS2208
@@ -136,7 +143,7 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
         let file_name = match image_type {
             ImageType::Fw => "firmware.bin",
             ImageType::Bios => "bios.rom",
-            ImageType::NvData => "nvdata.bin",
+            ImageType::FlashLayout => "nvdata.bin", // FW_UPLOAD ITYPE_MANUFACTURING = NVDATA
             _ => continue,
         };
 
