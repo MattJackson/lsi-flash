@@ -61,6 +61,10 @@ const IOVA_BASE: u64 = 0x10_0000_0000;
 /// these pages for the lifetime of the mapping.
 const DMA_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
+/// MAP_HUGETLB flag for mmap. libc only exposes it on Linux, so we declare
+/// our own constant. Value per `bits/mman-linux.h`: 0x40000.
+const MAP_HUGETLB: libc::c_int = 0x40000;
+
 /// PCI BAR index — BAR1 is what holds the MPI doorbell registers on SAS2008.
 const VFIO_PCI_BAR1_REGION_INDEX: u32 = 1;
 
@@ -145,6 +149,89 @@ pub struct VfioBackend {
 unsafe impl Send for VfioBackend {}
 
 impl VfioBackend {
+    /// Hugepage + pagemap fallback for noiommu hosts (lab/dev only).
+    ///
+    /// On `iommu=off` systems the kernel doesn't translate IO addresses, so
+    /// the SGE must carry a real physical address. We can't allocate "the
+    /// physical memory at address X" from user-space — instead: mmap a
+    /// hugepage, mlock to pin it, then ask `/proc/self/pagemap` what PA the
+    /// kernel happened to give us. The hugepage means the whole allocation
+    /// is one contiguous PA range — no scatter-gather of fragments.
+    ///
+    /// Requires root (pagemap PFNs are zeroed for non-CAP_SYS_ADMIN since
+    /// kernel 4.0). dev-1 runs `lsi-flash` as root, so this is fine.
+    fn alloc_dma_hugepage(&mut self, len: usize) -> Result<DmaBuffer, HwError> {
+        let mapped_len = len.div_ceil(DMA_PAGE_SIZE) * DMA_PAGE_SIZE;
+        if mapped_len > DMA_PAGE_SIZE {
+            return Err(HwError::DmaAlloc(format!(
+                "noiommu DMA buffers limited to one hugepage ({} bytes); \
+                 requested {} would span multiple pages with non-contiguous PAs",
+                DMA_PAGE_SIZE, mapped_len
+            )));
+        }
+
+        // MAP_HUGETLB|MAP_ANONYMOUS — kernel uses a hugepage from the pool
+        // configured at boot (dev-1 has hugepagesz=2M hugepages=16).
+        let va = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        if va == libc::MAP_FAILED {
+            return Err(HwError::DmaAlloc(format!(
+                "mmap MAP_HUGETLB {} bytes: {} — \
+                 check /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages",
+                mapped_len,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        // Pin the page so the kernel doesn't migrate or swap it. Hugepages
+        // are already unswappable, but mlock also blocks NUMA migration.
+        if unsafe { libc::mlock(va, mapped_len) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe {
+                libc::munmap(va, mapped_len);
+            }
+            return Err(HwError::DmaAlloc(format!("mlock: {}", e)));
+        }
+
+        // Touch the page so the kernel actually backs it (lazy allocation).
+        unsafe {
+            std::ptr::write_bytes(va as *mut u8, 0, mapped_len);
+        }
+
+        // Recover PA via pagemap.
+        let pa = match va_to_pa(va as usize) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    libc::munlock(va as *const libc::c_void, mapped_len);
+                    libc::munmap(va, mapped_len);
+                }
+                return Err(HwError::DmaAlloc(format!("va_to_pa: {}", e)));
+            }
+        };
+
+        self.dma_allocs.push(DmaAlloc {
+            va: va as *mut u8,
+            iova: pa,
+            len: mapped_len,
+        });
+
+        Ok(DmaBuffer {
+            va: va as *mut u8,
+            iova: pa,
+            len: mapped_len,
+            handle: pa,
+        })
+    }
+
     pub fn open(bdf: &str) -> Result<Self, HwError> {
         // 1. preflight: vfio + vfio-pci modules loaded; noiommu mode enabled.
         Self::preflight()?;
@@ -328,14 +415,7 @@ impl HwBackend for VfioBackend {
 
     fn alloc_dma(&mut self, len: usize) -> Result<DmaBuffer, HwError> {
         if self.is_noiommu {
-            // Step 3b will add a hugepage + pagemap fallback for lab hosts
-            // with iommu=off. Production hosts have IOMMU on.
-            return Err(HwError::DmaAlloc(
-                "noiommu mode: DMA fallback not yet implemented (step 3b). \
-                 Reboot host with iommu=on (intel_iommu=on / amd_iommu=on) \
-                 for production DMA path."
-                    .into(),
-            ));
+            return self.alloc_dma_hugepage(len);
         }
 
         let mapped_len = len.div_ceil(DMA_PAGE_SIZE) * DMA_PAGE_SIZE;
@@ -399,11 +479,6 @@ impl HwBackend for VfioBackend {
     }
 
     fn free_dma(&mut self, buf: DmaBuffer) -> Result<(), HwError> {
-        if self.is_noiommu {
-            return Err(HwError::DmaAlloc(
-                "noiommu mode: free_dma not applicable (DMA path not implemented)".into(),
-            ));
-        }
         let pos = self
             .dma_allocs
             .iter()
@@ -415,7 +490,15 @@ impl HwBackend for VfioBackend {
                 ))
             })?;
         let alloc = self.dma_allocs.swap_remove(pos);
-        unmap_dma_one(self.container_fd.as_raw_fd(), &alloc)?;
+        if self.is_noiommu {
+            // No UNMAP_DMA — kernel doesn't track these. Just munlock + munmap.
+            unsafe {
+                libc::munlock(alloc.va as *const libc::c_void, alloc.len);
+                libc::munmap(alloc.va as *mut libc::c_void, alloc.len);
+            }
+        } else {
+            unmap_dma_one(self.container_fd.as_raw_fd(), &alloc)?;
+        }
         Ok(())
     }
 
@@ -617,4 +700,49 @@ fn ioctl_value(fd: RawFd, request: IoctlReq, arg: IoctlReq) -> std::io::Result<i
 fn _silence_io_traits() {
     let _: Option<&dyn Read> = None;
     let _: Option<&dyn Write> = None;
+}
+
+/// Translate a process VA to physical address via /proc/self/pagemap.
+///
+/// Format per Documentation/admin-guide/mm/pagemap.rst:
+/// - 8 bytes per page (index = va >> page_shift)
+/// - bits 0-54: page frame number (PFN); shift left by page_shift for PA
+/// - bit 63: page present (must be 1; if not, kernel hasn't allocated the page)
+/// - bits 56-60: page-level (used for hugepages; informational)
+///
+/// Returns PA of the page containing `va` plus the offset within the page.
+/// Caller is responsible for ensuring `va` is mlocked or otherwise pinned so
+/// the PA doesn't change between this call and the DMA.
+fn va_to_pa(va: usize) -> Result<u64, String> {
+    use std::io::{Read as _, Seek, SeekFrom};
+
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let page_shift = page_size.trailing_zeros() as u64;
+    let page_offset = (va as u64) & (page_size as u64 - 1);
+    let pfn_index = (va as u64) >> page_shift;
+
+    let mut f = std::fs::File::open("/proc/self/pagemap")
+        .map_err(|e| format!("open /proc/self/pagemap (requires root): {}", e))?;
+    f.seek(SeekFrom::Start(pfn_index * 8))
+        .map_err(|e| format!("seek: {}", e))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("read pagemap entry: {}", e))?;
+    let entry = u64::from_le_bytes(buf);
+
+    let present = (entry >> 63) & 1;
+    if present == 0 {
+        return Err(format!(
+            "page not present (pagemap entry=0x{:016x}); did you forget to mlock + touch the page?",
+            entry
+        ));
+    }
+    let pfn = entry & ((1u64 << 55) - 1);
+    if pfn == 0 {
+        return Err(format!(
+            "PFN is zero (pagemap entry=0x{:016x}); likely running without CAP_SYS_ADMIN",
+            entry
+        ));
+    }
+    Ok((pfn << page_shift) | page_offset)
 }
