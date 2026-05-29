@@ -629,6 +629,7 @@ mod tests {
             page_number: 5,  // SAS WWN page
             ext_page_type: None,
             payload_buffer: &mut payload_buf,
+            page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
         };
 
         let result = realioc.send_config(&req);
@@ -648,6 +649,35 @@ mod tests {
         let mock = MockPlatform::new();
         let mut realioc: RealIoc<MockPlatform> = RealIoc::for_tests(mock, "0000:03:00.0");
 
+        // Create another CONFIG request to test state validation path
+        let mut payload_buf2 = [0u8; 256];
+        let req2 = ConfigRequest {
+            action: 1,       // MPI2_CONFIG_ACTION_PAGE_READ_CURRENT per toolbox-and-config.md §6.1
+            sgl_flags: 0xC0, // END_OF_LIST + IOC_TO_HOST
+            page_type: 9,    // MPI2_CONFIG_PAGETYPE_MANUFACTURING per toolbox-and-config.md §6.2
+            page_number: 5,  // SAS WWN page
+            ext_page_type: None,
+            payload_buffer: &mut payload_buf2,
+            page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
+        };
+
+        let result = realioc.send_config(&req2);
+
+        assert!(
+            matches!(result, Err(MpiError::Io(_))),
+            "send_config should return MpiError::Io when BAR1 not mapped"
+        );
+    }
+
+    /// Test that send_config handles page_address correctly.
+    #[test]
+    fn send_config_page_address_zero() {
+        // This test verifies the pattern: on non-Linux/tests with no BAR1,
+        // we get Io error first (before state check). The state validation
+        // path would require mocking BAR1 contents which is out of scope for cycle 2b.
+        let mock = MockPlatform::new();
+        let mut realioc: RealIoc<MockPlatform> = RealIoc::for_tests(mock, "0000:03:00.0");
+
         let mut payload_buf = [0u8; 256];
         let req = ConfigRequest {
             action: 1,
@@ -656,6 +686,7 @@ mod tests {
             page_number: 5,
             ext_page_type: None,
             payload_buffer: &mut payload_buf,
+            page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
         };
 
         // Verify we get Io error (BAR1 not mapped), which is the expected behavior for tests

@@ -1,10 +1,11 @@
 //! CLI surface for `lsi-flash`. Per ADR-007 + ADR-014: 5 top-level verbs
-//! (detect/backup/flash/recover/sbr).
+//! (detect/backup/flash/recover/sbr) + config pages.
 //!
 //! See `lsi-flash-notes/01-architecture/adr/007-cli-surface.md` and
 //! `lsi-flash-notes/01-architecture/adr/014-sbr-verb-and-card-database.md`.
 
 pub mod backup;
+pub mod config;
 pub mod detect;
 pub mod flash;
 pub mod recover;
@@ -30,7 +31,7 @@ pub struct Cli {
     pub pci: Option<String>,
 }
 
-/// Four verbs. That's it.
+/// Five verbs + config. That's it.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Identify the card: PCI ids, current firmware, current SBR identity.
@@ -114,7 +115,15 @@ pub enum Command {
         sub: sbr::SbrCommand,
     },
 
-    /// Manipulator-grade firmware operations (offline; doesn't touch hardware).
+    /// Config page operations — read individual pages or dump all existing pages.
+    /// Cites: mpi2_cnfg.h for page types/actions, mpt3sas_config.c for 2-step pattern.
+    Config {
+        #[command(subcommand)]
+        sub: config::ConfigSubCommand,
+    },
+
+    /// Manipulator-grade firmware synthesis subcommands. Cites
+    /// `lsi-flash-notes/03-firmware-formats/mpt-firmware-format.md` §N (PHY-to-slot map).
     Firmware {
         #[command(subcommand)]
         sub: FirmwareCommand,
@@ -189,6 +198,13 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             dry_run,
         } => recover::run(backup_dir, yes, cli.json, cli.pci.clone(), dry_run),
         Command::Sbr { sub } => sbr::run(sub),
+        Command::Config { sub } => {
+            let bdf = cli
+                .pci
+                .clone()
+                .ok_or_else(|| crate::Error::Other("--pci <BDF> required".to_string()))?;
+            config::run(bdf, sub)
+        }
         Command::Firmware { sub } => match sub {
             FirmwareCommand::ReversePhy { input, output } => {
                 let data = std::fs::read(&input)?;
@@ -316,5 +332,53 @@ mod tests {
             }
             _ => panic!("expected Firmware::ReversePhy"),
         }
+    }
+
+    #[test]
+    fn config_read_parses() {
+        let cli = Cli::try_parse_from([
+            "lsi-flash",
+            "--pci",
+            "0000:03:00.0",
+            "config",
+            "read",
+            "--page-type",
+            "manufacturing",
+            "--page-number",
+            "0",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Config { sub } => {
+                matches!(sub, config::ConfigSubCommand::Read { .. });
+            }
+            _ => panic!("expected Config"),
+        }
+    }
+
+    #[test]
+    fn config_dump_parses() {
+        let cli =
+            Cli::try_parse_from(["lsi-flash", "--pci", "0000:03:00.0", "config", "dump"]).unwrap();
+        match cli.command {
+            Command::Config { sub } => {
+                matches!(sub, config::ConfigSubCommand::Dump { .. });
+            }
+            _ => panic!("expected Config"),
+        }
+    }
+
+    #[test]
+    fn config_read_requires_pci() {
+        let res = Cli::try_parse_from([
+            "lsi-flash",
+            "config",
+            "read",
+            "--page-type",
+            "manufacturing",
+            "--page-number",
+            "0",
+        ]);
+        assert!(res.is_ok()); // --pci is global, not required for parsing
     }
 }

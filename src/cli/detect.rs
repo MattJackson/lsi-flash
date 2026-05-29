@@ -149,6 +149,7 @@ fn try_fetch_mpi_fields(bdf: &str) -> Result<Option<ExtendedCardInfo>, crate::Er
                                 page_number: 0x00, // Page 0 (Manufacturing header)
                                 ext_page_type: None,
                                 payload_buffer: &mut mfg_page_buf,
+                                page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
                             };
 
                             match realioc.send_config(&mfg_req) {

@@ -813,6 +813,13 @@ pub struct ConfigRequest<'a> {
 
     /// Output buffer for read operations (filled by deserialize_from_reply)
     pub payload_buffer: &'a mut [u8],
+
+    /// PageAddress field — per mpi2_cnfg.h:347 (PageAddress at offset 0x18).
+    /// For plain pages (Manufacturing, IO Unit, IOC, BIOS), PageAddress MUST be 0.
+    /// The page type+number live in the 4-byte page header, NOT in PageAddress.
+    /// PageAddress is only nonzero for "addressed" pages (SAS device pages with a
+    /// FORM/handle): see mpi2_cnfg.h:237-298 for RAID/SAS/PCIe addressing formats.
+    pub page_address: u32,
 }
 
 impl ConfigRequest<'_> {
@@ -857,14 +864,21 @@ impl ConfigRequest<'_> {
         buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved4
 
         // Page header (4 bytes) — toolbox-and-config.md §6.2
+        // Offset 0x14: MPI2_CONFIG_PAGE_HEADER per mpi2_cnfg.h:346
         buf.push(0x00); // PageVersion (IOC will fill on reply)
         buf.push(self.payload_buffer.len() as u8); // PageLength (request max size)
-        buf.push(self.page_number); // PageNumber
-        buf.push(self.page_type); // PageType
+        buf.push(self.page_number); // PageNumber at offset 0x16
+        buf.push(self.page_type); // PageType at offset 0x17
 
-        // PageAddress (4 bytes) — encoding of type + number
-        let page_address = ((self.page_type as u32) << 24) | ((self.page_number as u32) << 16);
-        buf.extend_from_slice(&page_address.to_le_bytes());
+        // PageAddress (4 bytes) — mpi2_cnfg.h:347, offset 0x18.
+        // For plain pages (Manufacturing/IO Unit/IOC/BIOS), PageAddress MUST be 0.
+        // The page type+number live in the page header at 0x14-0x17.
+        // PageAddress is only nonzero for "addressed" pages with FORM/handle:
+        //   - RAID Volume: mpi2_cnfg.h:238-246 (HANDLE or GET_NEXT_HANDLE)
+        //   - SAS Device: mpi2_cnfg.h:267-275 (HANDLE or GET_NEXT_HANDLE)
+        //   - SAS Expander: mpi2_cnfg.h:257-265 (HNDL/PHY_NUM or GET_NEXT_HNDL)
+        // See mpi2_cnfg.h:237-298 for all PageAddress format encodings.
+        buf.extend_from_slice(&self.page_address.to_le_bytes());
 
         // SGE for page buffer (16 bytes IEEE format) — toolbox-and-config.md §6.5
         let sge = IeeeSgeSimple64::with_flags(
@@ -2256,6 +2270,7 @@ mod tests {
             page_number: 5,
             ext_page_type: None,
             payload_buffer: &mut buf,
+            page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
         };
 
         let bytes = req.serialize_to(1);

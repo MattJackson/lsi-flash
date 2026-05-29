@@ -707,6 +707,7 @@ mod tests {
             page_number: 5,
             ext_page_type: None,
             payload_buffer: &mut buf,
+            page_address: 0x0000_0000, // Plain pages have PageAddress=0 per mpi2_cnfg.h:347
         };
 
         let reply = mock.send_config(&req).unwrap();
