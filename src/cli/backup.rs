@@ -81,10 +81,10 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
         reply_descriptor_post_queue_address: 0,
     };
 
-    // Resolve the target card. NEVER silently mock: auto-detect the single card
-    // when --pci is omitted; the mock is reachable ONLY via the explicit sentinel
-    // BDF (crate::card::MOCK_BDF). A missing --pci can no longer produce a fake
-    // empty "backup".
+    // --pci is REQUIRED (no auto-detect; run `detect` to list cards). NEVER
+    // silently mock: the mock is reachable ONLY via the explicit sentinel BDF
+    // (crate::card::MOCK_BDF). A missing --pci errors out — it can no longer
+    // produce a fake empty "backup".
     let bdf = crate::card::resolve_bdf(pci.as_deref())
         .map_err(|e| crate::Error::Other(format!("{}", e)))?;
 

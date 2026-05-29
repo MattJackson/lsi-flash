@@ -52,8 +52,8 @@ pub enum CardError {
     #[error("no cards found on PCI bus")]
     NoCardsFound,
 
-    #[error("multiple SAS2008 cards found; pass --pci <bdf> to choose one: {0:?}")]
-    AmbiguousCards(Vec<String>),
+    #[error("specify which card with --pci <bdf> (run `lsi-flash detect` to list cards)")]
+    PciRequired,
 
     #[error("unsupported card: VID:DID {0:04x}:{1:04x}")]
     UnsupportedCard(u16, u16),
@@ -207,28 +207,21 @@ pub fn is_mock_bdf(bdf: &str) -> bool {
     bdf == MOCK_BDF
 }
 
-/// Resolve which card a hardware verb should operate on. NEVER assumes mock.
+/// Resolve which card a verb operates on. `--pci` is REQUIRED for every
+/// card-targeting verb — there is NO auto-detect. Discovery is `detect`'s job
+/// (it lists every card); you then pass the BDF you saw via `--pci`. This keeps
+/// one consistent rule and removes any "it picked the wrong card" surprise,
+/// especially for destructive ops.
 ///
-/// - `Some(MOCK_BDF)` → returns the sentinel (caller routes to the mock + stamps
-///   output as fake). This is the ONLY path to the mock.
-/// - `Some(real_bdf)` → returns it verbatim.
-/// - `None` → auto-detect: exactly one SAS2008 card → its BDF; zero →
-///   `NoCardsFound`; more than one → `AmbiguousCards` (asks for `--pci`).
+/// - `Some(MOCK_BDF)` → the sentinel (caller routes to the mock + stamps output).
+/// - `Some(real_bdf)` → returned verbatim.
+/// - `None` → `PciRequired` (points the user at `detect`).
 ///
-/// This is the single front door for every hardware verb so behavior is uniform
-/// and a missing `--pci` can never silently produce fake results.
+/// NEVER assumes mock and never guesses a target.
 pub fn resolve_bdf(pci: Option<&str>) -> Result<String, CardError> {
-    if let Some(bdf) = pci {
-        return Ok(bdf.to_string());
-    }
-    let devs = crate::pci::discover_sas2008_devices_linux()
-        .map_err(|e| CardError::PciEnumeration(format!("{}", e)))?;
-    match devs.len() {
-        0 => Err(CardError::NoCardsFound),
-        1 => Ok(devs[0].bdf.clone()),
-        _ => Err(CardError::AmbiguousCards(
-            devs.iter().map(|d| d.bdf.clone()).collect(),
-        )),
+    match pci {
+        Some(bdf) => Ok(bdf.to_string()),
+        None => Err(CardError::PciRequired),
     }
 }
 

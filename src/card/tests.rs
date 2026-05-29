@@ -175,23 +175,21 @@ fn chip_family_partial_eq_works() {
 }
 
 #[test]
-fn resolve_bdf_passes_through_explicit_and_sentinel() {
-    use crate::card::{is_mock_bdf, resolve_bdf, MOCK_BDF};
+fn resolve_bdf_requires_explicit_pci() {
+    use crate::card::{is_mock_bdf, resolve_bdf, CardError, MOCK_BDF};
 
-    // Explicit real BDF is returned verbatim (no enumeration).
-    assert_eq!(
-        resolve_bdf(Some("0000:03:00.0")).unwrap(),
-        "0000:03:00.0"
-    );
+    // Explicit real BDF is returned verbatim.
+    assert_eq!(resolve_bdf(Some("0000:03:00.0")).unwrap(), "0000:03:00.0");
 
     // The mock sentinel passes through and is recognized as mock.
     let r = resolve_bdf(Some(MOCK_BDF)).unwrap();
     assert_eq!(r, MOCK_BDF);
     assert!(is_mock_bdf(&r));
-
-    // A real BDF is NOT the mock.
     assert!(!is_mock_bdf("0000:03:00.0"));
 
-    // The sentinel is a syntactically impossible PCI address (cannot collide).
+    // No --pci → hard error (no auto-detect, no guessing).
+    assert!(matches!(resolve_bdf(None), Err(CardError::PciRequired)));
+
+    // Sentinel is a syntactically impossible PCI address (cannot collide).
     assert!(MOCK_BDF.contains("-1"));
 }
