@@ -10,6 +10,7 @@ pub mod detect;
 pub mod erase;
 pub mod flash;
 pub mod recover;
+pub mod region;
 pub mod safety;
 pub mod sbr;
 
@@ -54,10 +55,10 @@ pub enum Command {
         out: Option<String>,
     },
 
-    /// Run the cross-flash workflow.
-    ///
-    /// `flash` always takes an internal backup first; refuses to proceed if
-    /// backup didn't succeed. Per ADR-007 D-5: HCB auto-runs when needed.
+    /// LEGACY (hidden) — superseded by `fw write` + composition (ADR-007 v2).
+    /// Kept compiled only until the smart `fw write` orchestration lands; not in
+    /// the user surface. Do not document.
+    #[command(hide = true)]
     Flash {
         /// Target firmware mode.
         mode: Mode,
@@ -101,10 +102,9 @@ pub enum Command {
         wipe_mfg_pages: bool,
     },
 
-    /// Restore from a backup directory. Bit-for-bit fidelity to whatever was
-    /// captured. Only "go back" path; the chip does not remember its origin
-    /// once cross-flashed.
-    Recover {
+    /// Restore all 4 artifacts (fw + bios + sbr; nvdata OPEN) from a backup dir,
+    /// bit-for-bit + sha-verified. The inverse of `backup`.
+    Restore {
         /// Directory containing the backup artifacts to restore from.
         #[arg(long, value_name = "DIR")]
         backup_dir: String,
@@ -116,6 +116,24 @@ pub enum Command {
         /// Show what would happen; write nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Firmware image region (read / write). Write = the firmware installer.
+    Fw {
+        #[command(subcommand)]
+        sub: FwCommand,
+    },
+
+    /// BIOS option-ROM region (read / write).
+    Bios {
+        #[command(subcommand)]
+        sub: region::RegionCommand,
+    },
+
+    /// NVDATA region (read / write).
+    Nvdata {
+        #[command(subcommand)]
+        sub: region::RegionCommand,
     },
 
     /// SBR (Subsystem Boot Record) operations. Per ADR-014.
@@ -141,11 +159,28 @@ pub enum Command {
         sub: DebugCommand,
     },
 
-    /// Manipulator-grade firmware synthesis subcommands. Cites
-    /// `lsi-flash-notes/03-firmware-formats/mpt-firmware-format.md` §N (PHY-to-slot map).
+    /// LEGACY (hidden) — offline firmware synthesis moved under `fw` (e.g.
+    /// `fw reverse-phy`). Kept compiled until fully migrated.
+    #[command(hide = true)]
     Firmware {
         #[command(subcommand)]
         sub: FirmwareCommand,
+    },
+}
+
+/// `fw` — firmware image region + offline manipulation.
+#[derive(Subcommand, Debug)]
+pub enum FwCommand {
+    /// Read the firmware region from the chip (FW_UPLOAD).
+    Read(region::RegionReadArgs),
+    /// Write the firmware region to the chip (FW_DOWNLOAD). DESTRUCTIVE — --yes.
+    Write(region::RegionWriteArgs),
+    /// Offline: synthesize a PHY-reversed firmware blob (Port 0↔7 / 1↔6 / 2↔5 / 3↔4).
+    ReversePhy {
+        #[arg(long = "in", value_name = "PATH")]
+        input: std::path::PathBuf,
+        #[arg(long = "out", value_name = "PATH")]
+        output: std::path::PathBuf,
     },
 }
 
@@ -229,11 +264,56 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             wipe_mfg_pages,
             cli.json,
         ),
-        Command::Recover {
+        Command::Restore {
             backup_dir,
             yes,
             dry_run,
         } => recover::run(backup_dir, yes, cli.json, cli.pci.clone(), dry_run),
+        Command::Fw { sub } => match sub {
+            FwCommand::Read(a) => {
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                region::run_read(
+                    bdf,
+                    crate::mpi::messages::ImageType::Fw,
+                    "fw",
+                    a.out.as_deref(),
+                )
+            }
+            FwCommand::Write(a) => {
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                region::run_write(
+                    bdf,
+                    crate::mpi::messages::ImageType::Fw,
+                    "fw",
+                    &a.from_file,
+                    a.yes,
+                )
+            }
+            FwCommand::ReversePhy { input, output } => {
+                let data = std::fs::read(&input)?;
+                let out = crate::firmware::synthesize::synthesize_reverse_phy(&data)?;
+                std::fs::write(&output, &out)?;
+                eprintln!("synthesized {} bytes → {}", out.len(), output.display());
+                Ok(())
+            }
+        },
+        Command::Bios { sub } => {
+            let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+            region::run(bdf, crate::mpi::messages::ImageType::Bios, "bios", sub)
+        }
+        Command::Nvdata { sub } => {
+            let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+            region::run(
+                bdf,
+                crate::mpi::messages::ImageType::FlashLayout,
+                "nvdata",
+                sub,
+            )
+        }
         Command::Sbr { sub } => sbr::run(sub),
         Command::Debug { sub } => match sub {
             DebugCommand::Erase {
@@ -321,20 +401,53 @@ mod tests {
     }
 
     #[test]
-    fn recover_parses_with_backup_dir() {
+    fn restore_parses_with_backup_dir() {
         let cli = Cli::try_parse_from([
             "lsi-flash",
-            "recover",
+            "restore",
             "--backup-dir",
             "/var/lib/lsi-flash/backups/foo",
         ])
         .unwrap();
         match cli.command {
-            Command::Recover { backup_dir, .. } => {
+            Command::Restore { backup_dir, .. } => {
                 assert_eq!(backup_dir, "/var/lib/lsi-flash/backups/foo");
             }
-            _ => panic!("expected Recover"),
+            _ => panic!("expected Restore"),
         }
+    }
+
+    #[test]
+    fn fw_bios_nvdata_namespaces_parse() {
+        use super::*;
+        assert!(matches!(
+            Cli::try_parse_from(["lsi-flash", "fw", "read"])
+                .unwrap()
+                .command,
+            Command::Fw {
+                sub: FwCommand::Read(_)
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lsi-flash", "fw", "write", "--from-file", "x"])
+                .unwrap()
+                .command,
+            Command::Fw {
+                sub: FwCommand::Write(_)
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lsi-flash", "bios", "read"])
+                .unwrap()
+                .command,
+            Command::Bios { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lsi-flash", "nvdata", "write", "--from-file", "x"])
+                .unwrap()
+                .command,
+            Command::Nvdata { .. }
+        ));
     }
 
     #[test]

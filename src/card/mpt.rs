@@ -129,6 +129,109 @@ impl Card for MptCard {
         })
     }
 
+    fn read_region(&mut self, image_type: ImageType) -> Result<Vec<u8>, CardError> {
+        // MPI 2.0 FW_UPLOAD: 20-byte header + 16-byte TCSGE (36 bytes), data SGE
+        // inserted by the kernel at word 9. data_in is the IOC→host bounce buffer.
+        const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
+        let mut data_in = vec![0u8; UPLOAD_BUF_SIZE];
+
+        let mut req = Vec::with_capacity(36);
+        req.push(image_type.as_u8()); // 0x00 ImageType
+        req.push(0x00); // 0x01 Reserved1
+        req.push(0x00); // 0x02 ChainOffset
+        req.push(MpiFunction::FwUpload.as_u8()); // 0x03 Function
+        req.extend_from_slice(&0u16.to_le_bytes()); // 0x04 Reserved2
+        req.push(0x00); // 0x06
+        req.push(0x00); // 0x07 MsgFlags
+        req.push(0x00); // 0x08 VP_ID
+        req.push(0x00); // 0x09 VF_ID
+        req.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved4
+        req.extend_from_slice(&[0u8; 4]); // 0x0C Reserved5
+        req.extend_from_slice(&[0u8; 4]); // 0x10 Reserved6
+        req.push(0x00); // 0x14 TCSGE Reserved1
+        req.push(0x00); // 0x15 ContextSize=0
+        req.push(0x0C); // 0x16 DetailsLength=12
+        req.push(0x00); // 0x17 Flags=TRANSACTION_ELEMENT
+        req.extend_from_slice(&[0u8; 4]); // 0x18 Reserved2
+        req.extend_from_slice(&[0u8; 4]); // 0x1C ImageOffset=0
+        req.extend_from_slice(&(UPLOAD_BUF_SIZE as u32).to_le_bytes()); // 0x20 ImageSize
+
+        let mut reply_buf = vec![0u8; 64];
+        let n = self
+            .transport
+            .send_with_sge_offset(&req, 9, &mut reply_buf, Some(&mut data_in), None)
+            .map_err(|e| {
+                CardError::Transport(format!("FW_UPLOAD type={:?} send: {}", image_type, e))
+            })?;
+        let reply = FwUploadReply::parse(&reply_buf[..n.min(reply_buf.len())]).map_err(|e| {
+            CardError::Transport(format!("FW_UPLOAD type={:?} parse: {}", image_type, e))
+        })?;
+        if reply.ioc_status != IocStatus::Success {
+            return Err(CardError::Transport(format!(
+                "FW_UPLOAD type={:?} returned status 0x{:04x}",
+                image_type, reply.ioc_status as u16
+            )));
+        }
+        let actual = (reply.actual_image_size as usize).min(data_in.len());
+        data_in.truncate(actual);
+        Ok(data_in)
+    }
+
+    fn write_region(&mut self, image_type: ImageType, data: &[u8]) -> Result<(), CardError> {
+        // Chunked FW_DOWNLOAD: 16 KB chunks, LAST_SEGMENT (MsgFlags 0x01) on the
+        // final chunk only. Hard-stop on any non-Success IOCStatus (ADR-015 R6).
+        const CHUNK_SIZE: usize = 0x4000;
+        if data.is_empty() {
+            return Err(CardError::Transport("write_region: empty data".into()));
+        }
+        let total = data.len() as u32;
+        let mut buf = data.to_vec();
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let chunk = (buf.len() - offset).min(CHUNK_SIZE);
+            let last = offset + chunk >= buf.len();
+            let mut req = [0u8; 36];
+            req[0] = image_type.as_u8(); // 0x00 ImageType
+            req[3] = MpiFunction::FwDownload.as_u8(); // 0x03 Function
+            req[7] = if last { 0x01 } else { 0x00 }; // 0x07 MsgFlags LAST_SEGMENT
+            req[12..16].copy_from_slice(&total.to_le_bytes()); // 0x0C TotalImageSize
+            req[22] = 0x0C; // 0x16 TCSGE DetailsLength=12
+            req[28..32].copy_from_slice(&(offset as u32).to_le_bytes()); // 0x1C ImageOffset
+            req[32..36].copy_from_slice(&(chunk as u32).to_le_bytes()); // 0x20 ImageSize
+            let mut reply_buf = [0u8; 64];
+            let n = self
+                .transport
+                .send_with_sge_offset(
+                    &req,
+                    9,
+                    &mut reply_buf,
+                    None,
+                    Some(&mut buf[offset..offset + chunk]),
+                )
+                .map_err(|e| {
+                    CardError::Transport(format!(
+                        "FW_DOWNLOAD type={:?} off={} send: {}",
+                        image_type, offset, e
+                    ))
+                })?;
+            let reply =
+                FwDownloadReply::parse(&reply_buf[..n.min(reply_buf.len())]).map_err(|e| {
+                    CardError::Transport(format!(
+                        "FW_DOWNLOAD type={:?} off={} parse: {}",
+                        image_type, offset, e
+                    ))
+                })?;
+            if reply.ioc_status != IocStatus::Success {
+                return Err(CardError::Transport(format!(
+                    "FW_DOWNLOAD type={:?} off={} returned status 0x{:04x}",
+                    image_type, offset, reply.ioc_status as u16
+                )));
+            }
+            offset += chunk;
+        }
+        Ok(())
+    }
+
     fn backup(&mut self, out_dir: &Path) -> Result<BackupReport, CardError> {
         // FOR EACH image_type in [Fw, Bios, FlashLayout]:
         //   - Build 36-byte MPI 2.0 FW_UPLOAD request (20-byte header +
@@ -140,85 +243,11 @@ impl Card for MptCard {
         // Write manifest.toml. Return BackupReport.
 
         let mut artifacts = Vec::new();
-        const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
 
         for image_type in [ImageType::Fw, ImageType::Bios, ImageType::FlashLayout] {
-            let mut data_in = vec![0u8; UPLOAD_BUF_SIZE];
-
-            // Build the MPI 2.0 FW_UPLOAD request: 20-byte header + 16-byte TCSGE
-            // Cites: src/cli/backup.rs:185-209 (run_backup_via_mpt3ctl)
-            let mut req_bytes = Vec::with_capacity(36);
-
-            // Header (20 bytes)
-            req_bytes.push(image_type.as_u8()); // 0x00 ImageType
-            req_bytes.push(0x00); // 0x01 Reserved1
-            req_bytes.push(0x00); // 0x02 ChainOffset
-            req_bytes.push(MpiFunction::FwUpload.as_u8()); // 0x03 Function
-            req_bytes.extend_from_slice(&0u16.to_le_bytes()); // 0x04 Reserved2
-            req_bytes.push(0x00); // 0x06 Reserved3
-            req_bytes.push(0x00); // 0x07 MsgFlags
-            req_bytes.push(0x00); // 0x08 VP_ID
-            req_bytes.push(0x00); // 0x09 VF_ID
-            req_bytes.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved4
-            req_bytes.extend_from_slice(&[0u8; 4]); // 0x0C Reserved5
-            req_bytes.extend_from_slice(&[0u8; 4]); // 0x10 Reserved6
-
-            // TCSGE — 16 bytes total (4-byte tcsge header + 12-byte details)
-            // Cites: src/cli/backup.rs:202-208 for exact layout
-            req_bytes.push(0x00); // 0x14 Reserved1
-            req_bytes.push(0x00); // 0x15 ContextSize = 0
-            req_bytes.push(0x0C); // 0x16 DetailsLength = 12
-            req_bytes.push(0x00); // 0x17 Flags = MPI_SGE_FLAGS_TRANSACTION_ELEMENT (0x00)
-            req_bytes.extend_from_slice(&[0u8; 4]); // 0x18 Reserved2
-            req_bytes.extend_from_slice(&[0u8; 4]); // 0x1C ImageOffset = 0
-            req_bytes.extend_from_slice(&(UPLOAD_BUF_SIZE as u32).to_le_bytes()); // 0x20 ImageSize
-
-            let mut reply_buf = vec![0u8; 64];
-            let bytes_written = self
-                .transport
-                .send_with_sge_offset(&req_bytes, 9, &mut reply_buf, Some(&mut data_in), None)
-                .map_err(|e| {
-                    CardError::Transport(format!("FW_UPLOAD type={:?} send: {}", image_type, e))
-                })?;
-
-            if std::env::var("LSI_DEBUG").is_ok() {
-                let rb = &reply_buf[..32.min(reply_buf.len())];
-                let ioc_status_raw = u16::from_le_bytes([reply_buf[14], reply_buf[15]]);
-                let log_info = u32::from_le_bytes([
-                    reply_buf[16],
-                    reply_buf[17],
-                    reply_buf[18],
-                    reply_buf[19],
-                ]);
-                let asz = u32::from_le_bytes([
-                    reply_buf[20],
-                    reply_buf[21],
-                    reply_buf[22],
-                    reply_buf[23],
-                ]);
-                eprintln!(
-                    "[LSI_DEBUG] FW_UPLOAD type={:?} bytes_written={} IOCStatus=0x{:04x} IOCLogInfo=0x{:08x} ActualImageSize=0x{:08x} reply[0..32]={}",
-                    image_type, bytes_written, ioc_status_raw, log_info, asz, hex::encode(rb)
-                );
-            }
-
-            let reply = FwUploadReply::parse(&reply_buf[..bytes_written.min(reply_buf.len())])
-                .map_err(|e| {
-                    CardError::Transport(format!(
-                        "FW_UPLOAD type={:?} reply parse: {}",
-                        image_type, e
-                    ))
-                })?;
-
-            if reply.ioc_status != IocStatus::Success {
-                return Err(CardError::Transport(format!(
-                    "FW_UPLOAD type={:?} returned status 0x{:04x}",
-                    image_type, reply.ioc_status as u16
-                )));
-            }
-
-            let actual_size = (reply.actual_image_size as usize).min(data_in.len());
-            let data = &data_in[..actual_size];
+            // Read this region via the shared FW_UPLOAD primitive.
+            let data = self.read_region(image_type)?;
+            let actual_size = data.len();
 
             let file_name = match image_type {
                 ImageType::Fw => "firmware.bin",
@@ -228,10 +257,10 @@ impl Card for MptCard {
             };
 
             let path = out_dir.join(file_name);
-            fs::write(&path, data).map_err(CardError::Io)?;
+            fs::write(&path, &data).map_err(CardError::Io)?;
 
             let mut hasher = Sha256::new();
-            hasher.update(data);
+            hasher.update(&data);
             let result = hasher.finalize();
             let sha256 = format!("{:x}", result);
 
@@ -326,13 +355,11 @@ impl Card for MptCard {
     fn restore(&mut self, backup_dir: &Path) -> Result<RestoreReport, CardError> {
         use std::fs;
 
-        const CHUNK_SIZE: usize = 0x4000; // 16 KB per lsiutil.c:210
-
         let mut regions_written = 0usize;
         let mut region_names = Vec::new();
 
-        // Regions to restore: FW (0x01) then BIOS (0x02) only. Skip FlashLayout/NVDATA
-        // due to ITYPE asymmetry (backup captured as 0x06, lsiutil downloads as 0x03).
+        // Flash regions: FW (0x01) then BIOS (0x02). NVDATA skipped (ITYPE 0x06
+        // upload vs download asymmetry — OPEN). SBR handled after the loop.
         let regions_to_restore = [
             (ImageType::Fw, "firmware.bin"),
             (ImageType::Bios, "bios.rom"),
@@ -342,7 +369,7 @@ impl Card for MptCard {
             let file_path = backup_dir.join(file_name);
 
             // Read the region file bytes
-            let mut file_bytes = fs::read(&file_path).map_err(CardError::Io)?;
+            let file_bytes = fs::read(&file_path).map_err(CardError::Io)?;
 
             if file_bytes.is_empty() {
                 return Err(CardError::Transport(format!(
@@ -410,78 +437,33 @@ impl Card for MptCard {
             // - ImageOffset at offset 0x1C..0x1F (per-chunk advancing offset)
             // - ImageSize at offset 0x20..0x23 (per-chunk size, =CHUNK_SIZE except final)
 
-            let mut offset: usize = 0;
-            let total_size = file_bytes.len() as u32;
-
-            while offset < file_bytes.len() {
-                let chunk_size = (file_bytes.len() - offset).min(CHUNK_SIZE);
-                let is_last_chunk = (offset + chunk_size) >= file_bytes.len();
-
-                // Build 36-byte FW_DOWNLOAD request inline
-                let mut req_bytes = [0u8; 36];
-
-                // Header (20 bytes)
-                req_bytes[0] = image_type.as_u8(); // ImageType at offset 0x00
-                req_bytes[1] = 0x00; // Reserved1
-                req_bytes[2] = 0x00; // ChainOffset
-                req_bytes[3] = MpiFunction::FwDownload.as_u8(); // Function at offset 0x03
-                req_bytes[4..6].copy_from_slice(&0u16.to_le_bytes()); // Reserved2
-                let msg_flags = if is_last_chunk { 0x01 } else { 0x00 };
-                req_bytes[7] = msg_flags; // MsgFlags at offset 0x07 (LAST_SEGMENT on final)
-                req_bytes[8] = 0x00; // VP_ID
-                req_bytes[9] = 0x00; // VF_ID
-                req_bytes[10..12].copy_from_slice(&0u16.to_le_bytes()); // Reserved4
-                req_bytes[12..16].copy_from_slice(&total_size.to_le_bytes()); // TotalImageSize at offset 0x0C (full file len)
-                req_bytes[16..20].copy_from_slice(&(0u32).to_le_bytes()); // Reserved6
-
-                // TCSGE (16 bytes)
-                req_bytes[20] = 0x00; // Reserved1 at offset 0x14
-                req_bytes[21] = 0x00; // ContextSize at offset 0x15 = 0
-                req_bytes[22] = 0x0C; // DetailsLength at offset 0x16 = 12
-                req_bytes[23] = 0x00; // Flags at offset 0x17 = TRANSACTION_ELEMENT (0x00)
-                req_bytes[24..28].copy_from_slice(&(0u32).to_le_bytes()); // Reserved2 at offset 0x18
-                req_bytes[28..32].copy_from_slice(&(offset as u32).to_le_bytes()); // ImageOffset at offset 0x1C
-                req_bytes[32..36].copy_from_slice(&(chunk_size as u32).to_le_bytes()); // ImageSize at offset 0x20
-
-                let mut reply_buf = [0u8; 64];
-                let bytes_written = self
-                    .transport
-                    .send_with_sge_offset(
-                        &req_bytes,
-                        9, // data_sge_offset_words = 36/4 words
-                        &mut reply_buf,
-                        None, // data_in: host→IOC for download
-                        Some(&mut file_bytes[offset..offset + chunk_size]),
-                    )
-                    .map_err(|e| {
-                        CardError::Transport(format!(
-                            "FW_DOWNLOAD type={:?} offset={} size={} send: {}",
-                            image_type, offset, chunk_size, e
-                        ))
-                    })?;
-
-                let reply =
-                    FwDownloadReply::parse(&reply_buf[..bytes_written.min(reply_buf.len())])
-                        .map_err(|e| {
-                            CardError::Transport(format!(
-                                "FW_DOWNLOAD type={:?} offset={} reply parse: {}",
-                                image_type, offset, e
-                            ))
-                        })?;
-
-                // ADR-015 Rule 6: hard stop on any non-Success IOCStatus
-                if reply.ioc_status != IocStatus::Success {
-                    return Err(CardError::Transport(format!(
-                        "FW_DOWNLOAD type={:?} offset={} returned status 0x{:04x}",
-                        image_type, offset, reply.ioc_status as u16
-                    )));
-                }
-
-                offset += chunk_size;
-            }
+            // Write the verified region via the shared chunked FW_DOWNLOAD primitive.
+            self.write_region(image_type, &file_bytes)?;
 
             regions_written += 1;
             region_names.push(file_name.to_string());
+        }
+
+        // SBR write-back (4/4): if the backup captured an sbr.bin, restore the PCI
+        // identity + WWN too. Best-effort + last (sbr_write briefly unbinds mpt3sas).
+        // NOTE: NVDATA write-back is intentionally NOT done — the FW_UPLOAD ITYPE
+        // (0x06) vs FW_DOWNLOAD ITYPE asymmetry is an OPEN question; restoring
+        // NVDATA wrong is risky. Restore is FW + BIOS + SBR until that's resolved.
+        let sbr_path = backup_dir.join("sbr.bin");
+        if sbr_path.exists() {
+            let sbr_bytes = fs::read(&sbr_path).map_err(CardError::Io)?;
+            if sbr_bytes.len() == 256 {
+                let mut arr = [0u8; 256];
+                arr.copy_from_slice(&sbr_bytes);
+                self.sbr_write(&arr)?;
+                regions_written += 1;
+                region_names.push("sbr.bin".to_string());
+            } else {
+                return Err(CardError::Transport(format!(
+                    "sbr.bin in backup is {} bytes, expected 256",
+                    sbr_bytes.len()
+                )));
+            }
         }
 
         Ok(RestoreReport {

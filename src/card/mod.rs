@@ -167,6 +167,27 @@ pub trait Card: Send {
         Err(CardError::NotImplemented("sbr_write"))
     }
 
+    /// Read one flash-chip region (FW / BIOS / NVDATA) via FW_UPLOAD. Read-only.
+    /// The shared primitive that `backup` and `fw/bios/nvdata read` build on.
+    fn read_region(
+        &mut self,
+        _image_type: crate::mpi::messages::ImageType,
+    ) -> Result<Vec<u8>, CardError> {
+        Err(CardError::NotImplemented("read_region"))
+    }
+
+    /// Write one flash-chip region (FW / BIOS / NVDATA) via FW_DOWNLOAD.
+    /// DESTRUCTIVE. Shared primitive for `restore` and `fw/bios/nvdata write`.
+    /// (Erase-if-personality-change and HCB-on-lock live in the higher-level
+    /// `fw write` logic, not here — this is the raw region write.)
+    fn write_region(
+        &mut self,
+        _image_type: crate::mpi::messages::ImageType,
+        _data: &[u8],
+    ) -> Result<(), CardError> {
+        Err(CardError::NotImplemented("write_region"))
+    }
+
     /// Send a raw MPI TOOLBOX_CLEAN and return the firmware's exact reply
     /// (IOCStatus + IOCLogInfo). DESTRUCTIVE if the running firmware honors it
     /// (erases the flash). Diagnostic purpose: capture the real reply that
