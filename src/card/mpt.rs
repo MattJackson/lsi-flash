@@ -244,6 +244,35 @@ impl Card for MptCard {
             artifacts.push(artifact);
         }
 
+        // SBR capture (separate I²C EEPROM, NOT in SPI flash). Done LAST and
+        // best-effort: sbr_read() briefly unbinds mpt3sas via the Bar1Mmap path
+        // (a ~1s disk blip + rescan), so it must run after the FW_UPLOAD steps
+        // that need mpt3sas bound. The SBR holds PCI identity + WWN — a backup
+        // without it is INCOMPLETE for restore, so warn loudly if it fails
+        // rather than silently shipping a 3/4 snapshot.
+        match self.sbr_read() {
+            Ok(sbr) => {
+                let path = out_dir.join("sbr.bin");
+                fs::write(&path, &sbr[..]).map_err(CardError::Io)?;
+                let mut hasher = Sha256::new();
+                hasher.update(&sbr[..]);
+                let sha256 = format!("{:x}", hasher.finalize());
+                artifacts.push(crate::card::BackupArtifact {
+                    path: "sbr.bin".to_string(),
+                    image_type: "Sbr".to_string(),
+                    sha256,
+                    size: sbr.len() as u64,
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "backup: ⚠ SBR capture FAILED ({e}) — backup is INCOMPLETE (no sbr.bin). \
+                     The SBR holds PCI identity + WWN; capture it with `sbr read` before \
+                     relying on this backup for a full restore."
+                );
+            }
+        }
+
         // Write manifest.toml
         let source_card_info = SourceCardInfo {
             pci_vid: self.identity.vendor_id,
