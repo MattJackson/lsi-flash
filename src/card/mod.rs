@@ -220,6 +220,19 @@ pub fn is_mock_bdf(bdf: &str) -> bool {
 /// NEVER assumes mock and never guesses a target.
 pub fn resolve_bdf(pci: Option<&str>) -> Result<String, CardError> {
     match pci {
+        // `--pci -` reads the BDF from stdin (first whitespace-delimited token),
+        // enabling pipelines: `lsi-flash detect --bdf | head -1 | lsi-flash <verb> --pci -`.
+        Some("-") => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .map_err(CardError::Io)?;
+            s.split_whitespace()
+                .next()
+                .map(|t| t.to_string())
+                .ok_or(CardError::PciRequired)
+        }
         Some(bdf) => Ok(bdf.to_string()),
         None => Err(CardError::PciRequired),
     }

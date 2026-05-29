@@ -13,9 +13,17 @@ use crate::pci;
 use std::io;
 
 /// Run the detect verb. Returns detected cards as human-readable or JSON output.
-pub fn run(json: bool) -> Result<(), crate::Error> {
+pub fn run(json: bool, bdf_only: bool) -> Result<(), crate::Error> {
     let devices = pci::discover_sas2008_devices_linux()
         .map_err(|e| crate::Error::Other(format!("PCI discovery failed: {}", e)))?;
+
+    // Machine-readable: just BDFs, one per line — for piping into `--pci -`.
+    if bdf_only {
+        for dev in &devices {
+            println!("{}", dev.bdf);
+        }
+        return Ok(());
+    }
 
     if json {
         return print_json(&devices).map_err(crate::Error::Io);

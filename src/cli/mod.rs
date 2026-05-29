@@ -38,8 +38,13 @@ pub struct Cli {
 /// Five verbs + config. That's it.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Identify the card: PCI ids, current firmware, current SBR identity.
-    Detect,
+    /// Identify the card(s): PCI ids, current firmware, current SBR identity.
+    Detect {
+        /// Print only BDFs, one per line (machine-readable; for piping into
+        /// `--pci -`, e.g. `lsi-flash detect --bdf | head -1 | lsi-flash backup --pci -`).
+        #[arg(long = "bdf")]
+        bdf_only: bool,
+    },
 
     /// Snapshot SBR + flash + identity to disk. Non-destructive.
     Backup {
@@ -184,7 +189,7 @@ pub enum FirmwareCommand {
 /// real implementations land in Stages 2/3.
 pub fn run(cli: Cli) -> Result<(), crate::Error> {
     match cli.command {
-        Command::Detect => detect::run(cli.json),
+        Command::Detect { bdf_only } => detect::run(cli.json, bdf_only),
         Command::Backup { out } => backup::run(out, cli.json, cli.pci.clone()),
         Command::Flash {
             mode,
@@ -252,7 +257,7 @@ mod tests {
     #[test]
     fn detect_parses() {
         let cli = Cli::try_parse_from(["lsi-flash", "detect"]).unwrap();
-        assert!(matches!(cli.command, Command::Detect));
+        assert!(matches!(cli.command, Command::Detect { .. }));
     }
 
     #[test]
