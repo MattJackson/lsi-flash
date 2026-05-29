@@ -26,6 +26,11 @@ pub struct ConfigReadArgs {
     #[arg(long, value_name = "0xNNNNNNNN", default_value = "0")]
     pub page_address: String,
 
+    /// Which copy to read: current (live), default (firmware built-in), or
+    /// nvram (persisted). The default↔current delta = the OEM's customization.
+    #[arg(long, value_name = "current|default|nvram", default_value = "current")]
+    pub action: String,
+
     /// Emit JSON output instead of hexdump.
     #[arg(long)]
     pub json: bool,
@@ -37,6 +42,51 @@ pub struct ConfigDumpArgs {
     /// Emit JSON output instead of table/hexdump.
     #[arg(long)]
     pub json: bool,
+}
+
+/// CLI args for `config write` subcommand.
+#[derive(Args, Debug)]
+pub struct ConfigWriteArgs {
+    /// Page type name or hex value (0xNN).
+    #[arg(long, value_name = "NAME|0xNN")]
+    pub page_type: String,
+
+    /// Page number within the page type.
+    #[arg(long)]
+    pub page_number: u8,
+
+    /// Extended page type for extended pages (type 0x0F).
+    #[arg(long, value_name = "0xNN")]
+    pub ext_page_type: Option<String>,
+
+    /// PageAddress field — defaults to 0.
+    #[arg(long, value_name = "0xNNNNNNNN", default_value = "0")]
+    pub page_address: String,
+
+    /// Full page bytes as hex (must equal PageLength*4 bytes, incl. 4-byte header).
+    #[arg(long, value_name = "HEX")]
+    pub from_hex: String,
+
+    /// Persist to NVRAM (WRITE_NVRAM). Without this, writes are volatile
+    /// (WRITE_CURRENT) and revert on IOC reset. Requires --yes.
+    #[arg(long)]
+    pub nvram: bool,
+
+    /// Confirm a persistent (--nvram) write. Required for NVRAM writes.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// CLI args for `config selftest` subcommand — zero-risk write-path proof.
+#[derive(Args, Debug)]
+pub struct ConfigSelftestArgs {
+    /// Page type name or hex value (0xNN). Default: manufacturing.
+    #[arg(long, value_name = "NAME|0xNN", default_value = "manufacturing")]
+    pub page_type: String,
+
+    /// Page number. Default: 0 (chip/board identity — persistent, safe to rewrite).
+    #[arg(long, default_value = "0")]
+    pub page_number: u8,
 }
 
 /// Page type name to value mapping — cites mpi2_cnfg.h lines.
@@ -151,17 +201,47 @@ impl PageHeader {
     }
 }
 
+/// MPI2_CONFIG_ACTION_* constants — mpi2_cnfg.h:353-360.
+pub mod action {
+    pub const PAGE_HEADER: u8 = 0x00;
+    pub const READ_CURRENT: u8 = 0x01;
+    pub const WRITE_CURRENT: u8 = 0x02; // volatile — reverts on IOC reset
+    pub const READ_DEFAULT: u8 = 0x05; // firmware built-in defaults
+    pub const READ_NVRAM: u8 = 0x06; // persisted NVRAM values
+    pub const WRITE_NVRAM: u8 = 0x04; // persists to NVRAM
+}
+
 /// Read a single config page via Mpt3CtlTransport.
 ///
 /// Implements the 2-step pattern from mpt3sas_config.c:_config_request:
 /// 1. PAGE_HEADER (action=0x00) → get PageLength from reply header
-/// 2. READ_CURRENT (action=0x01) with buffer of PageLength*4 bytes
+/// 2. `data_action` (READ_CURRENT 0x01 / READ_DEFAULT 0x05 / READ_NVRAM 0x06)
+///    with a buffer of PageLength*4 bytes.
 pub fn read_config_page(
     transport: &mut dyn crate::mpt::MptTransport,
     page_type: u8,
     page_number: u8,
     ext_page_type: Option<u8>,
     page_address: u32,
+) -> Result<ConfigPageRead, String> {
+    read_config_page_action(
+        transport,
+        page_type,
+        page_number,
+        ext_page_type,
+        page_address,
+        action::READ_CURRENT,
+    )
+}
+
+/// Read a config page with an explicit data-read action (CURRENT/DEFAULT/NVRAM).
+pub fn read_config_page_action(
+    transport: &mut dyn crate::mpt::MptTransport,
+    page_type: u8,
+    page_number: u8,
+    ext_page_type: Option<u8>,
+    page_address: u32,
+    data_action: u8,
 ) -> Result<ConfigPageRead, String> {
     use crate::mpi::messages::{ConfigReply, ConfigRequest, IocStatus};
 
@@ -219,11 +299,11 @@ pub fn read_config_page(
     }
     let page_buf_size = page_len_words * 4;
 
-    // Step 2: READ_CURRENT — fetch full page data.
+    // Step 2: data read (CURRENT/DEFAULT/NVRAM) — fetch full page data.
     let mut page_buf = vec![0u8; page_buf_size];
     let req_read = ConfigRequest {
-        action: 0x01,    // MPI2_CONFIG_ACTION_PAGE_READ_CURRENT — mpi2_cnfg.h:357
-        sgl_flags: 0xC0, // END_OF_LIST + IOC_TO_HOST
+        action: data_action, // READ_CURRENT 0x01 / READ_DEFAULT 0x05 / READ_NVRAM 0x06
+        sgl_flags: 0xC0,     // END_OF_LIST + IOC_TO_HOST
         page_type,
         page_number,
         ext_page_type,
@@ -234,15 +314,15 @@ pub fn read_config_page(
     let req_bytes = req_read.serialize_to(2);
     transport
         .send_with_sge_offset(&req_bytes, 7, &mut reply_buf, Some(&mut page_buf), None)
-        .map_err(|e| format!("send READ_CURRENT failed: {}", e))?;
+        .map_err(|e| format!("send data-read (action {:#04x}) failed: {}", data_action, e))?;
 
     let reply_data =
         ConfigReply::parse(&reply_buf).map_err(|e| format!("CONFIG read parse failed: {}", e))?;
 
     if reply_data.ioc_status != IocStatus::Success {
         return Err(format!(
-            "READ_CURRENT failed with IOCStatus={:?} (page may not exist)",
-            reply_data.ioc_status
+            "data-read (action {:#04x}) failed with IOCStatus={:?}",
+            data_action, reply_data.ioc_status
         ));
     }
 
@@ -254,6 +334,96 @@ pub fn read_config_page(
         ext_page_type,
         bytes_hex: hex::encode(&page_buf),
     })
+}
+
+/// Write a full config page via Mpt3CtlTransport.
+///
+/// 2-step like the read: PAGE_HEADER (validate + size), then WRITE_CURRENT
+/// (0x02, volatile — reverts on IOC reset) or WRITE_NVRAM (0x04, persists),
+/// with the page bytes flowing host→IOC via `data_out` (the reverse of a read).
+/// `data` MUST be exactly PageLength*4 bytes — the full page including its
+/// 4-byte header (write back what you read, then mutate).
+///
+/// Safety: WRITE_NVRAM is persistent. Callers gate it behind explicit
+/// confirmation. WRITE_CURRENT is reversible by an IOC reset / power cycle.
+pub fn write_config_page(
+    transport: &mut dyn crate::mpt::MptTransport,
+    page_type: u8,
+    page_number: u8,
+    ext_page_type: Option<u8>,
+    page_address: u32,
+    data: &[u8],
+    persist: bool,
+) -> Result<(), String> {
+    use crate::mpi::messages::{ConfigReply, ConfigRequest, IocStatus};
+
+    // Step 1: PAGE_HEADER — get expected PageLength + validate type/number.
+    let mut header_buf = [0u8; 4];
+    let req_header = ConfigRequest {
+        action: action::PAGE_HEADER,
+        sgl_flags: 0xC0,
+        page_type,
+        page_number,
+        ext_page_type,
+        payload_buffer: &mut header_buf,
+        page_address,
+    };
+    let req_bytes = req_header.serialize_to(1);
+    let mut reply_buf = [0u8; 256];
+    transport
+        .send_with_sge_offset(&req_bytes, 7, &mut reply_buf, None, None)
+        .map_err(|e| format!("send PAGE_HEADER failed: {}", e))?;
+    let reply_header =
+        ConfigReply::parse(&reply_buf).map_err(|e| format!("CONFIG header parse failed: {}", e))?;
+    if reply_header.ioc_status != IocStatus::Success {
+        return Err(format!(
+            "PAGE_HEADER failed with IOCStatus={:?} (page may not exist)",
+            reply_header.ioc_status
+        ));
+    }
+    let page_hdr = PageHeader::parse(&reply_header.page_header);
+    let expected = page_hdr.length as usize * 4;
+    if expected == 0 {
+        return Err("PageLength=0 from firmware".to_string());
+    }
+    if data.len() != expected {
+        return Err(format!(
+            "write data length {} != page size {} (PageLength={} words)",
+            data.len(),
+            expected,
+            page_hdr.length
+        ));
+    }
+
+    // Step 2: WRITE_CURRENT / WRITE_NVRAM — page bytes flow host→IOC (data_out).
+    let mut page_buf = data.to_vec();
+    let write_action = if persist {
+        action::WRITE_NVRAM
+    } else {
+        action::WRITE_CURRENT
+    };
+    let req_write = ConfigRequest {
+        action: write_action,
+        sgl_flags: 0x80, // END_OF_LIST, host→IOC (kernel builds the real SGE from data_out)
+        page_type,
+        page_number,
+        ext_page_type,
+        payload_buffer: &mut page_buf,
+        page_address,
+    };
+    let req_bytes = req_write.serialize_to(2);
+    transport
+        .send_with_sge_offset(&req_bytes, 7, &mut reply_buf, None, Some(&mut page_buf))
+        .map_err(|e| format!("send write (action {:#04x}) failed: {}", write_action, e))?;
+    let reply_data =
+        ConfigReply::parse(&reply_buf).map_err(|e| format!("CONFIG write parse failed: {}", e))?;
+    if reply_data.ioc_status != IocStatus::Success {
+        return Err(format!(
+            "write (action {:#04x}) failed with IOCStatus={:?}",
+            write_action, reply_data.ioc_status
+        ));
+    }
+    Ok(())
 }
 
 /// Human hexdump output for a config page.
@@ -299,13 +469,33 @@ pub fn format_hexdump(result: &ConfigPageRead) -> String {
     out
 }
 
+/// Map an `--action` string to a data-read action constant.
+fn read_action_from_str(s: &str) -> Result<u8, String> {
+    match s.to_lowercase().as_str() {
+        "current" => Ok(action::READ_CURRENT),
+        "default" => Ok(action::READ_DEFAULT),
+        "nvram" => Ok(action::READ_NVRAM),
+        _ => Err(format!(
+            "Unknown read action '{}'. Use: current, default, nvram",
+            s
+        )),
+    }
+}
+
+fn parse_page_address(s: &str) -> Result<u32, crate::Error> {
+    u32::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)
+        .map_err(|e| crate::Error::Other(format!("Invalid page_address: {}", e)))
+}
+
 /// Run `config read` subcommand.
+#[allow(clippy::too_many_arguments)]
 pub fn run_read(
     bdf: String,
     page_type: String,
     page_number: u8,
     ext_page_type: Option<String>,
     page_address: String,
+    action_str: String,
     json_flag: bool,
 ) -> Result<(), crate::Error> {
     use crate::mpt::Mpt3CtlTransport;
@@ -321,16 +511,16 @@ pub fn run_read(
         None
     };
 
-    let page_address_val =
-        u32::from_str_radix(page_address.strip_prefix("0x").unwrap_or(&page_address), 16)
-            .map_err(|e| crate::Error::Other(format!("Invalid page_address: {}", e)))?;
+    let page_address_val = parse_page_address(&page_address)?;
+    let data_action = read_action_from_str(&action_str).map_err(crate::Error::Other)?;
 
-    let result = read_config_page(
+    let result = read_config_page_action(
         &mut transport,
         page_type_val,
         page_number,
         ext_page_type_val,
         page_address_val,
+        data_action,
     )
     .map_err(crate::Error::Other)?;
 
@@ -341,6 +531,106 @@ pub fn run_read(
     }
 
     Ok(())
+}
+
+/// Run `config write` subcommand.
+pub fn run_write(bdf: String, args: ConfigWriteArgs) -> Result<(), crate::Error> {
+    use crate::mpt::Mpt3CtlTransport;
+
+    let page_type_val = page_type_from_str(&args.page_type).map_err(crate::Error::Other)?;
+    let ext_page_type_val = if let Some(et) = &args.ext_page_type {
+        Some(ext_page_type_from_str(et).map_err(crate::Error::Other)?)
+    } else {
+        None
+    };
+    let page_address_val = parse_page_address(&args.page_address)?;
+    let data = hex::decode(args.from_hex.trim())
+        .map_err(|e| crate::Error::Other(format!("Invalid --from-hex: {}", e)))?;
+
+    if args.nvram && !args.yes {
+        return Err(crate::Error::Other(
+            "Refusing persistent NVRAM write without --yes. WRITE_NVRAM is permanent; \
+             re-run with --yes to confirm (or omit --nvram for a volatile WRITE_CURRENT)."
+                .to_string(),
+        ));
+    }
+
+    let mut transport = Mpt3CtlTransport::open(&bdf)
+        .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
+
+    write_config_page(
+        &mut transport,
+        page_type_val,
+        args.page_number,
+        ext_page_type_val,
+        page_address_val,
+        &data,
+        args.nvram,
+    )
+    .map_err(crate::Error::Other)?;
+
+    let mode = if args.nvram {
+        "WRITE_NVRAM (persisted)"
+    } else {
+        "WRITE_CURRENT (volatile — reverts on IOC reset)"
+    };
+    println!(
+        "OK: wrote {} bytes to {}#{} via {}",
+        data.len(),
+        page_type_name(page_type_val),
+        args.page_number,
+        mode
+    );
+    Ok(())
+}
+
+/// Run `config selftest` — zero-risk proof of the write path.
+///
+/// Reads a page, writes the IDENTICAL bytes back via WRITE_CURRENT (volatile),
+/// re-reads, and asserts the page is unchanged. This validates the write wire
+/// format (data direction, SGE, action) WITHOUT altering any persisted state —
+/// WRITE_CURRENT is volatile and we write back exactly what we read.
+pub fn run_selftest(bdf: String, args: ConfigSelftestArgs) -> Result<(), crate::Error> {
+    use crate::mpt::Mpt3CtlTransport;
+
+    let page_type_val = page_type_from_str(&args.page_type).map_err(crate::Error::Other)?;
+    let pn = args.page_number;
+
+    let mut transport = Mpt3CtlTransport::open(&bdf)
+        .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
+
+    println!(
+        "config selftest: idempotent WRITE_CURRENT round-trip on {}#{} (no state change)",
+        page_type_name(page_type_val),
+        pn
+    );
+
+    // 1. Read current.
+    let before = read_config_page(&mut transport, page_type_val, pn, None, 0)
+        .map_err(|e| crate::Error::Other(format!("read (before) failed: {}", e)))?;
+    println!("  read before:  {} bytes", before.bytes_hex.len() / 2);
+
+    // 2. Write identical bytes back via WRITE_CURRENT (volatile, idempotent).
+    let bytes = hex::decode(&before.bytes_hex)
+        .map_err(|e| crate::Error::Other(format!("decode: {}", e)))?;
+    write_config_page(&mut transport, page_type_val, pn, None, 0, &bytes, false)
+        .map_err(|e| crate::Error::Other(format!("WRITE_CURRENT failed: {}", e)))?;
+    println!("  WRITE_CURRENT: Success (idempotent — wrote back identical bytes)");
+
+    // 3. Re-read and compare.
+    let after = read_config_page(&mut transport, page_type_val, pn, None, 0)
+        .map_err(|e| crate::Error::Other(format!("read (after) failed: {}", e)))?;
+
+    if before.bytes_hex == after.bytes_hex {
+        println!("  read after:   identical ✓");
+        println!("PASS: write path validated, zero state change.");
+        Ok(())
+    } else {
+        Err(crate::Error::Other(format!(
+            "FAIL: page changed across idempotent write!\n  before: {}\n  after:  {}",
+            before.bytes_hex, after.bytes_hex
+        )))
+    }
 }
 
 /// Run `config dump` subcommand — enumerate every config page that exists.
@@ -451,13 +741,21 @@ pub fn run_dump(bdf: String, json_flag: bool) -> Result<(), crate::Error> {
 /// Config subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigSubCommand {
-    /// Read a single config page from the chip.
+    /// Read a single config page from the chip (--action current|default|nvram).
     #[clap(name = "read")]
     Read(ConfigReadArgs),
 
     /// Enumerate all existing config pages on the card.
     #[clap(name = "dump")]
     Dump(ConfigDumpArgs),
+
+    /// Write a full config page (volatile WRITE_CURRENT; --nvram --yes to persist).
+    #[clap(name = "write")]
+    Write(ConfigWriteArgs),
+
+    /// Zero-risk write-path proof: idempotent WRITE_CURRENT round-trip.
+    #[clap(name = "selftest")]
+    Selftest(ConfigSelftestArgs),
 }
 
 /// Entry point for config subcommand.
@@ -469,9 +767,12 @@ pub fn run(bdf: String, _sub: ConfigSubCommand) -> Result<(), crate::Error> {
             args.page_number,
             args.ext_page_type,
             args.page_address,
+            args.action,
             args.json,
         ),
         ConfigSubCommand::Dump(args) => run_dump(bdf, args.json),
+        ConfigSubCommand::Write(args) => run_write(bdf, args),
+        ConfigSubCommand::Selftest(args) => run_selftest(bdf, args),
     }
 }
 
@@ -546,7 +847,10 @@ mod tests {
         assert_eq!(wire[0x00], 0x01, "Action READ_CURRENT at offset 0x00");
         assert_eq!(wire[0x03], 0x04, "Function CONFIG (0x04) at offset 0x03");
         assert_eq!(wire[0x16], 0x00, "PageNumber at offset 0x16");
-        assert_eq!(wire[0x17], 0x09, "PageType manufacturing (0x09) at offset 0x17");
+        assert_eq!(
+            wire[0x17], 0x09,
+            "PageType manufacturing (0x09) at offset 0x17"
+        );
 
         let page_addr = u32::from_le_bytes([wire[0x18], wire[0x19], wire[0x1A], wire[0x1B]]);
         assert_eq!(
@@ -666,5 +970,76 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("IOCStatus"));
+    }
+
+    /// Mock that records the actions it saw and the bytes sent host→IOC.
+    struct WriteMock {
+        reply_buffer: Vec<u8>,
+        actions: Vec<u8>,
+        last_data_out: Vec<u8>,
+    }
+
+    impl WriteMock {
+        fn new(page_type: u8, page_number: u8, length: u8) -> Self {
+            let mut buf = vec![0u8; 256];
+            buf[20] = 0x00; // version
+            buf[21] = length; // PageLength (words)
+            buf[22] = page_number;
+            buf[23] = page_type;
+            Self {
+                reply_buffer: buf,
+                actions: Vec::new(),
+                last_data_out: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::mpt::MptTransport for WriteMock {
+        fn send_with_sge_offset(
+            &mut self,
+            request: &[u8],
+            _off: u32,
+            reply: &mut [u8],
+            _data_in: Option<&mut [u8]>,
+            data_out: Option<&mut [u8]>,
+        ) -> Result<usize, crate::mpt::TransportError> {
+            self.actions.push(request[0]); // Action @ 0x00
+            if let Some(out) = data_out {
+                self.last_data_out = out.to_vec();
+            }
+            let len = reply.len().min(self.reply_buffer.len());
+            reply[..len].copy_from_slice(&self.reply_buffer[..len]);
+            Ok(len)
+        }
+    }
+
+    /// WRITE_CURRENT: PAGE_HEADER then action 0x02, data sent via data_out.
+    #[test]
+    fn test_write_config_page_current() {
+        let mut t = WriteMock::new(0x09, 0x00, 2); // 2 words = 8 bytes
+        let data = vec![0xDEu8; 8];
+        write_config_page(&mut t, 0x09, 0x00, None, 0, &data, false).unwrap();
+        assert_eq!(t.actions, vec![action::PAGE_HEADER, action::WRITE_CURRENT]);
+        assert_eq!(
+            t.last_data_out, data,
+            "page bytes must flow host->IOC (data_out)"
+        );
+    }
+
+    /// WRITE_NVRAM uses action 0x04.
+    #[test]
+    fn test_write_config_page_nvram_action() {
+        let mut t = WriteMock::new(0x09, 0x00, 2);
+        write_config_page(&mut t, 0x09, 0x00, None, 0, &[0u8; 8], true).unwrap();
+        assert_eq!(t.actions, vec![action::PAGE_HEADER, action::WRITE_NVRAM]);
+    }
+
+    /// Wrong data length is rejected before any write is sent.
+    #[test]
+    fn test_write_config_page_length_mismatch() {
+        let mut t = WriteMock::new(0x09, 0x00, 2); // expects 8 bytes
+        let err = write_config_page(&mut t, 0x09, 0x00, None, 0, &[0u8; 4], false).unwrap_err();
+        assert!(err.contains("length"));
+        assert_eq!(t.actions, vec![action::PAGE_HEADER]); // never reached the write
     }
 }
