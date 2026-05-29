@@ -14,6 +14,18 @@ const MPI2_DCR_ADDRESS: usize = 0x3c;
 /// DCR data register offset in BAR1. Cites lsirec.c:41, 113-117.
 const MPI2_DCR_DATA: usize = 0x38;
 
+/// WRSEQ (write-sequence) register offset in BAR1. Cites lsirec.c:19.
+const MPI2_WRSEQ_OFFSET: usize = 0x04;
+
+/// DIAG register offset in BAR1. Cites lsirec.c:21.
+const MPI2_DIAG_OFFSET: usize = 0x08;
+
+/// DIAG write-enable status bit. Cites lsirec.c:29.
+const MPI2_DIAG_WRITE_ENABLE: u32 = 0x0080;
+
+/// DIAG read/write-enable bit (unlocks DCR/diag access). Cites lsirec.c:32.
+const MPI2_DIAG_RW_ENABLE: u32 = 0x0010;
+
 /// DCR_I2C_SELECT register offset. Cites lsirec.c:56.
 pub const DCR_I2C_SELECT: u32 = 0x307;
 
@@ -309,7 +321,51 @@ fn i2c_getbyte(bar1: &mut [u8]) -> u8 {
 
 /// Initialize I2C interface. Cites lsirec.c:498-533, 498-524 (addr/type detection).
 /// Returns Err on timeout if controller is wedged (bounded reset loop).
+/// Unlock the chip's diagnostic registers so DCR (BAR1 0x3c/0x38) reads return
+/// valid data. WITHOUT this, DCR reads are stale and EEPROM addr/type
+/// auto-detect picks the wrong values (observed on dev-1 2026-05-29:
+/// 0x50/type-2 instead of the correct 0x54/type-1, → "EEPROM did not ACK").
+/// Mirrors lsirec's `lsi_unlock` + diag-RW-enable. Cites lsirec.c:125-160.
+fn unlock_diag(bar1: &mut [u8]) -> Result<(), I2cError> {
+    if bar1.len() < MPI2_DIAG_OFFSET + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bar1 slice too small for diag unlock (len={})", bar1.len()),
+        )
+        .into());
+    }
+
+    // WRSEQ unlock sequence. Cites lsirec.c:125-133.
+    for v in [0x00u32, 0x04, 0x0b, 0x02, 0x07, 0x0d] {
+        let b = v.to_le_bytes();
+        bar1[MPI2_WRSEQ_OFFSET] = b[0];
+        bar1[MPI2_WRSEQ_OFFSET + 1] = b[1];
+        bar1[MPI2_WRSEQ_OFFSET + 2] = b[2];
+        bar1[MPI2_WRSEQ_OFFSET + 3] = b[3];
+    }
+
+    // If the unlock took (write-enable set), enable diag read/write. Cites lsirec.c:145-148.
+    let diag = u32::from_le_bytes([
+        bar1[MPI2_DIAG_OFFSET],
+        bar1[MPI2_DIAG_OFFSET + 1],
+        bar1[MPI2_DIAG_OFFSET + 2],
+        bar1[MPI2_DIAG_OFFSET + 3],
+    ]);
+    if diag & MPI2_DIAG_WRITE_ENABLE != 0 {
+        let nv = (diag | MPI2_DIAG_RW_ENABLE).to_le_bytes();
+        bar1[MPI2_DIAG_OFFSET] = nv[0];
+        bar1[MPI2_DIAG_OFFSET + 1] = nv[1];
+        bar1[MPI2_DIAG_OFFSET + 2] = nv[2];
+        bar1[MPI2_DIAG_OFFSET + 3] = nv[3];
+    }
+    Ok(())
+}
+
 pub fn i2c_init(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
+    // Unlock diagnostic registers BEFORE any DCR access (lsirec.c:125-160).
+    // Without this, DCR reads are stale → wrong EEPROM addr/type auto-detect.
+    unlock_diag(ctx.bar1)?;
+
     // Read DCR_SBR_CONFIG to determine addr and type (lsirec.c:501-514).
     let val = dcr_read32(ctx.bar1, DCR_SBR_CONFIG)?;
 
