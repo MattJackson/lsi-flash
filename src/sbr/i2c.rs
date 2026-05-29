@@ -401,28 +401,28 @@ pub fn i2c_read_sbr(
     // Send address byte (write mode). Cites lsirec.c:553-569.
     i2c_start(ctx.bar1);
     i2c_sendbyte(ctx.bar1, ctx.sbr_addr << 1);
-    if !i2c_getbit(ctx.bar1) {
+    if i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("address W"));
     }
 
     // Send offset (16-bit mode). Cites lsirec.c:560-564.
     if ctx.eep_type == EEPROM_TYPE_16BIT {
         i2c_sendbyte(ctx.bar1, (offset >> 8) as u8);
-        if !i2c_getbit(ctx.bar1) {
+        if i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("offset1"));
         }
     }
 
     // Send offset low byte. Cites lsirec.c:566-570.
     i2c_sendbyte(ctx.bar1, (offset & 0xff) as u8);
-    if !i2c_getbit(ctx.bar1) {
+    if i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("offset0"));
     }
 
     // Repeated START for read mode. Cites lsirec.c:572-576.
     i2c_start(ctx.bar1);
     i2c_sendbyte(ctx.bar1, (ctx.sbr_addr << 1) | 0x01);
-    if !i2c_getbit(ctx.bar1) {
+    if i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("address R"));
     }
 
@@ -456,24 +456,24 @@ pub fn i2c_write_sbr(ctx: &mut I2cContext<'_>, offset: usize, data: &[u8]) -> Re
 
         i2c_start(ctx.bar1);
         i2c_sendbyte(ctx.bar1, ctx.sbr_addr << 1);
-        if !i2c_getbit(ctx.bar1) {
+        if i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("address W"));
         }
 
         if ctx.eep_type == EEPROM_TYPE_16BIT {
             i2c_sendbyte(ctx.bar1, (abs_offset >> 8) as u8);
-            if !i2c_getbit(ctx.bar1) {
+            if i2c_getbit(ctx.bar1) {
                 return Err(I2cError::EepromNoAck("offset1"));
             }
         }
 
         i2c_sendbyte(ctx.bar1, (abs_offset & 0xff) as u8);
-        if !i2c_getbit(ctx.bar1) {
+        if i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("offset0"));
         }
 
         i2c_sendbyte(ctx.bar1, byte);
-        if !i2c_getbit(ctx.bar1) {
+        if i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("data"));
         }
 
@@ -533,9 +533,17 @@ mod tests {
             eep_type: EEPROM_TYPE_8BIT,
         };
 
-        // Should not return the "too small" error (will timeout on SCL but that's expected)
+        // A buffer of exactly MAX_GPIO_OFFSET must PASS the size guard. On a zeroed
+        // mock (no real EEPROM) the bit-bang reads all-zero and the idle-low SDA
+        // looks like a perpetual ACK, so it returns Ok — the point of this test is
+        // only that it does NOT hit the "too small" size-guard error.
         let result = i2c_read_sbr(&mut ctx, 0, 1);
-        assert!(result.is_err()); // Expected to fail with timeout or I/O, not size check
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("too small"),
+                "minimum-size buffer must not trip the size guard, got: {e}"
+            );
+        }
     }
 
     #[test]
