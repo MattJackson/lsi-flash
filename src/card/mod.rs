@@ -52,6 +52,9 @@ pub enum CardError {
     #[error("no cards found on PCI bus")]
     NoCardsFound,
 
+    #[error("multiple SAS2008 cards found; pass --pci <bdf> to choose one: {0:?}")]
+    AmbiguousCards(Vec<String>),
+
     #[error("unsupported card: VID:DID {0:04x}:{1:04x}")]
     UnsupportedCard(u16, u16),
 
@@ -192,6 +195,43 @@ pub trait Card: Send {
 /// For each device, reads vendor/device IDs and dispatches to MptCard::discover_one()
 /// per BDF found via `pci::discover_sas2008_devices_linux()`. Cards that can't be
 /// opened (mpt3sas not loaded) are skipped.
+/// Sentinel BDF that EXPLICITLY selects the mock backend. It is a syntactically
+/// impossible PCI address (real BDF is `domain:bus:dev.func`, all hex ≥ 0), so it
+/// can never collide with a real card and is unmistakable in any output. The mock
+/// is ONLY reachable via this sentinel — a hardware verb never silently falls back
+/// to mock. Output/manifests produced under mock are stamped with this BDF.
+pub const MOCK_BDF: &str = "-1:-1:-1:-1";
+
+/// True if `bdf` is the explicit mock sentinel.
+pub fn is_mock_bdf(bdf: &str) -> bool {
+    bdf == MOCK_BDF
+}
+
+/// Resolve which card a hardware verb should operate on. NEVER assumes mock.
+///
+/// - `Some(MOCK_BDF)` → returns the sentinel (caller routes to the mock + stamps
+///   output as fake). This is the ONLY path to the mock.
+/// - `Some(real_bdf)` → returns it verbatim.
+/// - `None` → auto-detect: exactly one SAS2008 card → its BDF; zero →
+///   `NoCardsFound`; more than one → `AmbiguousCards` (asks for `--pci`).
+///
+/// This is the single front door for every hardware verb so behavior is uniform
+/// and a missing `--pci` can never silently produce fake results.
+pub fn resolve_bdf(pci: Option<&str>) -> Result<String, CardError> {
+    if let Some(bdf) = pci {
+        return Ok(bdf.to_string());
+    }
+    let devs = crate::pci::discover_sas2008_devices_linux()
+        .map_err(|e| CardError::PciEnumeration(format!("{}", e)))?;
+    match devs.len() {
+        0 => Err(CardError::NoCardsFound),
+        1 => Ok(devs[0].bdf.clone()),
+        _ => Err(CardError::AmbiguousCards(
+            devs.iter().map(|d| d.bdf.clone()).collect(),
+        )),
+    }
+}
+
 pub fn discover() -> Result<Vec<Box<dyn Card>>, CardError> {
     let devs = crate::pci::discover_sas2008_devices_linux()
         .map_err(|e| CardError::PciEnumeration(format!("{}", e)))?;

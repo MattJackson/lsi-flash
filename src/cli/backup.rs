@@ -81,12 +81,31 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
         reply_descriptor_post_queue_address: 0,
     };
 
-    if let Some(bdf) = pci {
+    // Resolve the target card. NEVER silently mock: auto-detect the single card
+    // when --pci is omitted; the mock is reachable ONLY via the explicit sentinel
+    // BDF (crate::card::MOCK_BDF). A missing --pci can no longer produce a fake
+    // empty "backup".
+    let bdf = crate::card::resolve_bdf(pci.as_deref())
+        .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+
+    if crate::card::is_mock_bdf(&bdf) {
+        eprintln!(
+            "backup: ⚠ MOCK backend (sentinel {}) — artifacts are SYNTHETIC, NOT a real card.",
+            crate::card::MOCK_BDF
+        );
+        let mock_ioc = MockIoc::new(Personality::It);
+        let mut session = Session::new(mock_ioc);
+        session.raw_ioc_init(&init_req)?;
+        return run_backup_with_session(&mut session, &out_dir, json);
+    }
+
+    {
+        // Real hardware (auto-detected, or the explicit --pci <bdf>).
         // ADR-017: use MptCard for read-safe operations via kernel-mediated transport.
         // If mpt3sas isn't loaded or no IOC manages this BDF, fall back to VFIO+doorbell.
         match crate::card::discover_one(&bdf) {
             Ok(mut card) => {
-                eprintln!("backup: using MptCard via kernel-mediated transport");
+                eprintln!("backup: using MptCard via kernel-mediated transport ({})", bdf);
                 let report = card
                     .backup(&out_dir)
                     .map_err(|e| crate::Error::Other(format!("card.backup: {}", e)))?;
@@ -129,13 +148,8 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
             .map_err(|e| crate::Error::Other(format!("RealIoc::open({}) failed: {}", bdf, e)))?;
         let mut session = Session::new(real_ioc);
         let _ = session.raw_ioc_init(&init_req);
-        return run_backup_with_session(&mut session, &out_dir, json);
+        run_backup_with_session(&mut session, &out_dir, json)
     }
-
-    let mock_ioc = MockIoc::new(Personality::It);
-    let mut session = Session::new(mock_ioc);
-    session.raw_ioc_init(&init_req)?;
-    run_backup_with_session(&mut session, &out_dir, json)
 }
 
 /// Print backup report in human-readable or JSON format.

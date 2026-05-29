@@ -115,18 +115,10 @@ pub fn run(cmd: SbrCommand) -> Result<(), crate::Error> {
     }
 }
 
-/// Resolve the target BDF (explicit `--pci`, else default dev slot).
+/// Resolve the target BDF: explicit `--pci`, else auto-detect the single card.
+/// Delegates to the shared `crate::card::resolve_bdf` (never assumes a default).
 fn resolve_bdf(pci_bdf: Option<&str>) -> Result<String, crate::Error> {
-    match pci_bdf {
-        Some(b) => Ok(b.to_string()),
-        None => match crate::card::discover_one("0000:03:00.0") {
-            Ok(_) => Ok("0000:03:00.0".to_string()),
-            Err(crate::card::CardError::NoCardsFound) => {
-                Err(crate::Error::Other("No SAS2008 card found".to_string()))
-            }
-            Err(e) => Err(crate::Error::Other(format!("discover: {}", e))),
-        },
-    }
+    crate::card::resolve_bdf(pci_bdf).map_err(|e| crate::Error::Other(format!("{}", e)))
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -231,25 +223,8 @@ fn read_sbr_from_chip(
     output: Option<&std::path::Path>,
     json_output: bool,
 ) -> Result<(), crate::Error> {
-    // Discover card via Card trait dispatch — returns UnsupportedCard for unknown VID:DID
-    let bdf = if let Some(bdf) = pci_bdf {
-        bdf.to_string()
-    } else {
-        match crate::card::discover_one("0000:03:00.0") {
-            Ok(_) => "0000:03:00.0".to_string(), // Stub for now; real auto-discovery follows
-            Err(crate::card::CardError::NoCardsFound) => {
-                return Err(crate::Error::Other(
-                    "No SAS2008 card found on system".to_string(),
-                ));
-            }
-            Err(e) => {
-                return Err(crate::Error::Other(format!(
-                    "Failed to discover cards: {}",
-                    e
-                )));
-            }
-        }
-    };
+    // Resolve target: explicit --pci, else auto-detect the single card.
+    let bdf = resolve_bdf(pci_bdf)?;
 
     // Discover the specific card at BDF via Card trait dispatch.
     // Per ADR-017 §Decision, this returns MptCard for known chip families,

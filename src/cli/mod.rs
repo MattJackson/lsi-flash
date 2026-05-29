@@ -216,10 +216,8 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             wipe_mfg_pages,
         } => erase::run(cli.pci.clone(), yes, wipe_mfg_pages, cli.json),
         Command::Config { sub } => {
-            let bdf = cli
-                .pci
-                .clone()
-                .ok_or_else(|| crate::Error::Other("--pci <BDF> required".to_string()))?;
+            let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                .map_err(|e| crate::Error::Other(format!("{}", e)))?;
             config::run(bdf, sub)
         }
         Command::Firmware { sub } => match sub {

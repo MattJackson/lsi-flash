@@ -28,7 +28,8 @@ pub fn run(
         ));
     }
 
-    let bdf = bdf.unwrap_or_else(|| "0000:03:00.0".to_string());
+    let bdf = crate::card::resolve_bdf(bdf.as_deref())
+        .map_err(|e| crate::Error::Other(format!("{}", e)))?;
     let mut card = crate::card::discover_one(&bdf)
         .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
 
