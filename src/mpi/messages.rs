@@ -838,12 +838,20 @@ impl ConfigRequest<'_> {
     pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
         let mut buf = Vec::with_capacity(0x2C);
 
+        // Extended pages (PageType EXTENDED = 0x0F) carry their length in the
+        // U16 ExtPageLength field at 0x04; standard pages use the 1-byte
+        // PageLength at 0x15. Set whichever applies for the data (READ_CURRENT)
+        // step so the firmware DMAs the right number of dwords.
+        let len_dwords = (self.payload_buffer.len() / 4) as u16;
+        let is_ext = (self.page_type & 0x0F) == 0x0F; // MPI2_CONFIG_PAGETYPE_EXTENDED
+
         buf.push(self.action); // 0x00 Action — mpi2_cnfg.h:332
         buf.push(self.sgl_flags); // 0x01 SGLFlags
         buf.push(0x00); // 0x02 ChainOffset
         buf.push(MpiFunction::Config.as_u8()); // 0x03 Function = 0x04
 
-        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x04 ExtPageLength (IOC fills on ext reply)
+        // 0x04 ExtPageLength (U16) — dwords for ext pages, else 0
+        buf.extend_from_slice(&(if is_ext { len_dwords } else { 0 }).to_le_bytes());
         buf.push(self.ext_page_type.unwrap_or(0x00)); // 0x06 ExtPageType
         buf.push(0x00); // 0x07 MsgFlags
         buf.push(0x00); // 0x08 VP_ID
@@ -856,7 +864,8 @@ impl ConfigRequest<'_> {
 
         // 0x14 MPI2_CONFIG_PAGE_HEADER (mpi2_cnfg.h:158-165)
         buf.push(0x00); // 0x14 PageVersion (IOC fills on reply)
-        buf.push((self.payload_buffer.len() / 4) as u8); // 0x15 PageLength (in 4-byte words)
+        // 0x15 PageLength (dwords) for standard pages; 0 for ext (uses ExtPageLength)
+        buf.push(if is_ext { 0 } else { len_dwords as u8 });
         buf.push(self.page_number); // 0x16 PageNumber
         buf.push(self.page_type); // 0x17 PageType
 

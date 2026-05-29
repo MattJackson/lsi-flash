@@ -277,25 +277,52 @@ pub fn read_config_page_action(
 
     let page_hdr = PageHeader::parse(&reply_header.page_header);
 
-    // Sanity check: does returned type/number match request? The reply PageType
-    // carries attribute bits in the upper nibble (MPI2_CONFIG_PAGEATTR_*:
-    // READ_ONLY 0x00 / CHANGEABLE 0x10 / PERSISTENT 0x20 — mpi2_cnfg.h), so mask
-    // with MPI2_CONFIG_PAGETYPE_MASK (0x0F) before comparing. Manufacturing
-    // pages legitimately come back as 0x29 = PERSISTENT|MANUFACTURING.
-    const PAGETYPE_MASK: u8 = 0x0F; // MPI2_CONFIG_PAGETYPE_MASK — mpi2_cnfg.h
-    if (page_hdr.type_ & PAGETYPE_MASK) != (page_type & PAGETYPE_MASK)
-        || page_hdr.number != page_number
-    {
+    // The reply PageType carries attribute bits in the upper nibble
+    // (MPI2_CONFIG_PAGEATTR_*: READ_ONLY 0x00 / CHANGEABLE 0x10 / PERSISTENT 0x20),
+    // so mask with MPI2_CONFIG_PAGETYPE_MASK (0x0F) before comparing.
+    const PAGETYPE_MASK: u8 = 0x0F; // mpi2_cnfg.h
+    const PAGETYPE_EXTENDED: u8 = 0x0F; // MPI2_CONFIG_PAGETYPE_EXTENDED
+
+    // PageNumber always echoes.
+    if page_hdr.number != page_number {
         return Err(format!(
-            "Page header mismatch: requested {}/{} got {:#04x}/{}",
+            "Page number mismatch: requested {}/{} got {:#04x}/{}",
             page_type, page_number, page_hdr.type_, page_hdr.number
         ));
     }
 
-    // PageLength is in 4-byte words per mpi2_cnfg.h:161. Total bytes = length * 4.
-    let page_len_words = page_hdr.length as usize;
+    // Length source differs by page kind. Standard pages: 1-byte PageLength at
+    // reply 0x15 (page_hdr.length). EXTENDED pages (type 0x0F, e.g. FLASH_LAYOUT
+    // 0x14): U16 ExtPageLength at reply 0x04, and ExtPageType at reply 0x06.
+    let is_ext = (page_type & PAGETYPE_MASK) == PAGETYPE_EXTENDED;
+    let page_len_words = if is_ext {
+        if (page_hdr.type_ & PAGETYPE_MASK) != PAGETYPE_EXTENDED {
+            return Err(format!(
+                "expected EXTENDED page (0x0F), reply PageType={:#04x}",
+                page_hdr.type_
+            ));
+        }
+        let reply_ext_type = reply_buf[0x06];
+        if let Some(want) = ext_page_type {
+            if reply_ext_type != want {
+                return Err(format!(
+                    "ExtPageType mismatch: requested {:#04x} got {:#04x}",
+                    want, reply_ext_type
+                ));
+            }
+        }
+        u16::from_le_bytes([reply_buf[0x04], reply_buf[0x05]]) as usize
+    } else {
+        if (page_hdr.type_ & PAGETYPE_MASK) != (page_type & PAGETYPE_MASK) {
+            return Err(format!(
+                "Page type mismatch: requested {:#04x} got {:#04x}",
+                page_type, page_hdr.type_
+            ));
+        }
+        page_hdr.length as usize
+    };
     if page_len_words == 0 {
-        return Err("PageLength=0 from firmware".to_string());
+        return Err("page length = 0 from firmware".to_string());
     }
     let page_buf_size = page_len_words * 4;
 
@@ -330,7 +357,8 @@ pub fn read_config_page_action(
         page_type,
         page_number,
         page_version: Some(page_hdr.version),
-        page_length: Some(page_hdr.length),
+        // Real length in dwords (ext pages use ExtPageLength, not the 0x15 byte).
+        page_length: Some(page_len_words.min(255) as u8),
         ext_page_type,
         bytes_hex: hex::encode(&page_buf),
     })
