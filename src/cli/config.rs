@@ -1,71 +1,152 @@
 //! Config page reader — read ANY MPI config page via kernel-mediated Mpt3CtlTransport.
 //!
-//! Implements `lsi-flash config read` and `lsi-flash config dump` subcommands.
+//! Implements `lsi-flash config read` (all / group / single page) and
+//! `config write` / `config selftest` subcommands.
 //! Cites: mpi2_cnfg.h for constants/offsets, mpt3sas_config.c (_config_request)
 //! for the 2-step PAGE_HEADER + READ_CURRENT pattern.
 
-use clap::Args;
+use std::path::PathBuf;
+
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-/// CLI args for `config read` subcommand.
+/// A named config-page group — maps a human name to (page_type, ext_page_type)
+/// and the upper bound of its page-number range. Standard groups have
+/// `ext_page_type == None`; extended groups live under page type 0x0F.
+/// Names/values cite mpi2_cnfg.h:207-231. clap renders these kebab-case
+/// (IoUnit → `io-unit`, SasIoUnit → `sas-io-unit`) and lists them all in help.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PageGroup {
+    // Standard page types (mpi2_cnfg.h:207-213)
+    IoUnit,
+    Ioc,
+    Bios,
+    RaidVolume,
+    Manufacturing,
+    RaidPhysDisk,
+    // Extended page types under 0x0F (mpi2_cnfg.h:220-231)
+    SasIoUnit,
+    SasExpander,
+    SasDevice,
+    SasPhy,
+    Log,
+    Enclosure,
+    RaidConfig,
+    DriverMapping,
+    SasPort,
+    Ethernet,
+    ExtManufacturing,
+}
+
+impl PageGroup {
+    /// (page_type, ext_page_type) for this group.
+    fn ids(self) -> (u8, Option<u8>) {
+        match self {
+            PageGroup::IoUnit => (0x00, None),
+            PageGroup::Ioc => (0x01, None),
+            PageGroup::Bios => (0x02, None),
+            PageGroup::RaidVolume => (0x08, None),
+            PageGroup::Manufacturing => (0x09, None),
+            PageGroup::RaidPhysDisk => (0x0A, None),
+            PageGroup::SasIoUnit => (0x0F, Some(0x10)),
+            PageGroup::SasExpander => (0x0F, Some(0x11)),
+            PageGroup::SasDevice => (0x0F, Some(0x12)),
+            PageGroup::SasPhy => (0x0F, Some(0x13)),
+            PageGroup::Log => (0x0F, Some(0x14)),
+            PageGroup::Enclosure => (0x0F, Some(0x15)),
+            PageGroup::RaidConfig => (0x0F, Some(0x16)),
+            PageGroup::DriverMapping => (0x0F, Some(0x17)),
+            PageGroup::SasPort => (0x0F, Some(0x18)),
+            PageGroup::Ethernet => (0x0F, Some(0x19)),
+            PageGroup::ExtManufacturing => (0x0F, Some(0x1A)),
+        }
+    }
+
+    /// Upper bound (inclusive) of the page-number range probed for this group
+    /// when no explicit number is given. Generous; missing pages are skipped.
+    fn max_number(self) -> u8 {
+        match self {
+            PageGroup::Manufacturing => 63, // incl. Man Page 43 = ISTWI device table
+            PageGroup::IoUnit | PageGroup::Ioc => 15,
+            PageGroup::Bios => 7,
+            PageGroup::RaidVolume => 3,
+            PageGroup::RaidPhysDisk => 2,
+            _ => 3, // extended groups: small fixed range
+        }
+    }
+
+    /// All groups in declaration order — for enumerating the full inventory.
+    fn all() -> &'static [PageGroup] {
+        use PageGroup::*;
+        &[
+            IoUnit,
+            Ioc,
+            Bios,
+            RaidVolume,
+            Manufacturing,
+            RaidPhysDisk,
+            SasIoUnit,
+            SasExpander,
+            SasDevice,
+            SasPhy,
+            Log,
+            Enclosure,
+            RaidConfig,
+            DriverMapping,
+            SasPort,
+            Ethernet,
+            ExtManufacturing,
+        ]
+    }
+}
+
+/// CLI args for `config read` — `read` (every group) / `read <group>` (whole
+/// group) / `read <group> <number>` (a single page).
 #[derive(Args, Debug)]
 pub struct ConfigReadArgs {
-    /// Page type name or hex value (0xNN).
-    #[arg(long, value_name = "NAME|0xNN")]
-    pub page_type: String,
+    /// Page group (e.g. manufacturing, bios, sas-io-unit). Omit to read all groups.
+    #[arg(value_name = "GROUP")]
+    pub group: Option<PageGroup>,
 
-    /// Page number within the page type (0..=63).
-    #[arg(long)]
-    pub page_number: u8,
-
-    /// Extended page type for extended pages (type 0x0F).
-    #[arg(long, value_name = "0xNN")]
-    pub ext_page_type: Option<String>,
-
-    /// PageAddress field — defaults to 0. Cites mpi2_cnfg.h:347.
-    #[arg(long, value_name = "0xNNNNNNNN", default_value = "0")]
-    pub page_address: String,
+    /// Page number within the group. Omit to read every page in the group.
+    #[arg(value_name = "NUMBER")]
+    pub number: Option<u8>,
 
     /// Which copy to read: current (live), default (firmware built-in), or
     /// nvram (persisted). The default↔current delta = the OEM's customization.
     #[arg(long, value_name = "current|default|nvram", default_value = "current")]
     pub action: String,
 
-    /// Emit JSON output instead of hexdump.
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// CLI args for `config dump` subcommand.
-#[derive(Args, Debug)]
-pub struct ConfigDumpArgs {
     /// Emit JSON output instead of table/hexdump.
     #[arg(long)]
     pub json: bool,
 }
 
-/// CLI args for `config write` subcommand.
+/// CLI args for `config write` — surgical single-page write. Positional
+/// `<group> <number>` mirrors `config read`; bytes come from --from-hex or
+/// --from-file. There is deliberately NO write-all / write-group: most config
+/// pages are read-only runtime state, and whole-region restore is `restore`.
 #[derive(Args, Debug)]
 pub struct ConfigWriteArgs {
-    /// Page type name or hex value (0xNN).
-    #[arg(long, value_name = "NAME|0xNN")]
-    pub page_type: String,
+    /// Page group (e.g. manufacturing, bios, sas-io-unit).
+    #[arg(value_name = "GROUP")]
+    pub group: PageGroup,
 
-    /// Page number within the page type.
-    #[arg(long)]
-    pub page_number: u8,
-
-    /// Extended page type for extended pages (type 0x0F).
-    #[arg(long, value_name = "0xNN")]
-    pub ext_page_type: Option<String>,
+    /// Page number within the group.
+    #[arg(value_name = "NUMBER")]
+    pub number: u8,
 
     /// PageAddress field — defaults to 0.
     #[arg(long, value_name = "0xNNNNNNNN", default_value = "0")]
     pub page_address: String,
 
-    /// Full page bytes as hex (must equal PageLength*4 bytes, incl. 4-byte header).
-    #[arg(long, value_name = "HEX")]
-    pub from_hex: String,
+    /// Full page bytes as hex (must equal PageLength*4 bytes, incl. header).
+    #[arg(long, value_name = "HEX", conflicts_with = "from_file")]
+    pub from_hex: Option<String>,
+
+    /// File of raw page bytes to write (alternative to --from-hex).
+    #[arg(long, value_name = "PATH", conflicts_with = "from_hex")]
+    pub from_file: Option<PathBuf>,
 
     /// Persist to NVRAM (WRITE_NVRAM). Without this, writes are volatile
     /// (WRITE_CURRENT) and revert on IOC reset. Requires --yes.
@@ -114,31 +195,9 @@ fn page_type_from_str(s: &str) -> Result<u8, String> {
     }
 }
 
-/// Extended page type name to value mapping — cites mpi2_cnfg.h:220-231.
-fn ext_page_type_from_str(s: &str) -> Result<u8, String> {
-    let s_lower = s.to_lowercase();
-    match s_lower.as_str() {
-        "sas-io-unit" | "0x10" => Ok(0x10), // MPI2_CONFIG_EXTPAGETYPE_SAS_IO_UNIT — mpi2_cnfg.h:220
-        "sas-device" | "0x12" => Ok(0x12),  // MPI2_CONFIG_EXTPAGETYPE_SAS_DEVICE — mpi2_cnfg.h:222
-        "sas-phy" | "0x13" => Ok(0x13),     // MPI2_CONFIG_EXTPAGETYPE_SAS_PHY — mpi2_cnfg.h:223
-        "flash-layout" | "log" | "0x14" => Ok(0x14), // MPI2_CONFIG_EXTPAGETYPE_LOG — mpi2_cnfg.h:224
-        _ => {
-            if let Some(stripped) = s.strip_prefix("0x") {
-                u8::from_str_radix(stripped, 16)
-                    .map_err(|_| format!("Invalid hex ext page type: {}", s))
-            } else {
-                Err(format!(
-                    "Unknown extended page type '{}'. Use: sas-io-unit(0x10), sas-device(0x12)",
-                    s
-                ))
-            }
-        }
-    }
-}
-
-/// Human-readable name for a page type.
+/// Human-readable name for a standard page type — MPI2_CONFIG_PAGETYPE_* (mpi2_cnfg.h:207-213).
 fn page_type_name(pt: u8) -> &'static str {
-    match pt {
+    match pt & 0x0F {
         0x00 => "IO Unit",
         0x01 => "IOC",
         0x02 => "BIOS",
@@ -147,6 +206,32 @@ fn page_type_name(pt: u8) -> &'static str {
         0x0A => "RAID PhysDisk",
         0x0F => "Extended",
         _ => "Unknown",
+    }
+}
+
+/// Human-readable name for an extended page type — MPI2_CONFIG_EXTPAGETYPE_* (mpi2_cnfg.h:220-231).
+fn ext_page_type_name(et: u8) -> &'static str {
+    match et {
+        0x10 => "SAS IO Unit",
+        0x11 => "SAS Expander",
+        0x12 => "SAS Device",
+        0x13 => "SAS PHY",
+        0x14 => "LOG",
+        0x15 => "Enclosure",
+        0x16 => "RAID Config",
+        0x17 => "Driver Mapping",
+        0x18 => "SAS Port",
+        0x19 => "Ethernet",
+        0x1A => "Ext Manufacturing",
+        _ => "Unknown-Ext",
+    }
+}
+
+/// Full human label for a page: "Manufacturing" or "Extended/SAS IO Unit".
+fn page_label(page_type: u8, ext_page_type: Option<u8>) -> String {
+    match ext_page_type {
+        Some(et) => format!("Extended/{}", ext_page_type_name(et)),
+        None => page_type_name(page_type).to_string(),
     }
 }
 
@@ -454,49 +539,6 @@ pub fn write_config_page(
     Ok(())
 }
 
-/// Human hexdump output for a config page.
-pub fn format_hexdump(result: &ConfigPageRead) -> String {
-    let mut out = String::new();
-
-    // Header line
-    if let (Some(v), Some(l)) = (result.page_version, result.page_length) {
-        let ext_str = if let Some(et) = result.ext_page_type {
-            format!(" ext=0x{:02X}", et)
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "Page {}#{} v={} len={} words ({} bytes){}\n",
-            page_type_name(result.page_type),
-            result.page_number,
-            v,
-            l,
-            result.bytes_hex.len() / 2,
-            ext_str
-        ));
-    } else {
-        out.push_str(&format!(
-            "Page {}#{}\n",
-            page_type_name(result.page_type),
-            result.page_number
-        ));
-    }
-
-    // Hexdump in 16-byte rows (32 hex chars per row)
-    let bytes = hex::decode(&result.bytes_hex).unwrap_or_default();
-    for chunk in bytes.chunks(16) {
-        let hex_str: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
-
-        out.push_str(&format!(
-            "  {:04x}: {}\n",
-            (chunk.as_ptr() as usize - bytes.as_ptr() as usize),
-            hex_str
-        ));
-    }
-
-    out
-}
-
 /// Map an `--action` string to a data-read action constant.
 fn read_action_from_str(s: &str) -> Result<u8, String> {
     match s.to_lowercase().as_str() {
@@ -517,63 +559,108 @@ fn parse_page_address(s: &str) -> Result<u32, crate::Error> {
 
 /// Run `config read` subcommand.
 #[allow(clippy::too_many_arguments)]
-pub fn run_read(
-    bdf: String,
-    page_type: String,
-    page_number: u8,
-    ext_page_type: Option<String>,
-    page_address: String,
-    action_str: String,
-    json_flag: bool,
-) -> Result<(), crate::Error> {
+/// Run `config read` — enumerate config pages.
+///
+/// Three modes, by argument count:
+///   * no group        → probe every group (the old `config dump`)
+///   * `<group>`        → probe that group's full page-number range
+///   * `<group> <num>`  → read exactly one page
+///
+/// Non-existent (type, number) combos return a non-Success IOCStatus
+/// (INVALID_PAGE/INVALID_TYPE) and are skipped silently.
+pub fn run_read(bdf: String, args: ConfigReadArgs) -> Result<(), crate::Error> {
     use crate::mpt::Mpt3CtlTransport;
+
+    let data_action = read_action_from_str(&args.action).map_err(crate::Error::Other)?;
 
     let mut transport = Mpt3CtlTransport::open(&bdf)
         .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
 
-    let page_type_val = page_type_from_str(&page_type).map_err(crate::Error::Other)?;
-
-    let ext_page_type_val = if let Some(et) = &ext_page_type {
-        Some(ext_page_type_from_str(et).map_err(crate::Error::Other)?)
-    } else {
-        None
+    let groups: Vec<PageGroup> = match args.group {
+        Some(g) => vec![g],
+        None => PageGroup::all().to_vec(),
     };
 
-    let page_address_val = parse_page_address(&page_address)?;
-    let data_action = read_action_from_str(&action_str).map_err(crate::Error::Other)?;
+    let mut entries: Vec<ConfigDumpEntry> = Vec::new();
+    for g in groups {
+        let (pt, ext) = g.ids();
+        // A number is only meaningful when a single group was named.
+        let nums: Vec<u8> = match (args.group, args.number) {
+            (Some(_), Some(n)) => vec![n],
+            _ => (0..=g.max_number()).collect(),
+        };
+        for num in nums {
+            if let Ok(page) = read_config_page_action(&mut transport, pt, num, ext, 0, data_action)
+            {
+                entries.push(ConfigDumpEntry {
+                    page_type: pt,
+                    page_number: num,
+                    length: page.page_length.unwrap_or(0),
+                    ext_page_type: ext,
+                    bytes_hex: Some(page.bytes_hex),
+                });
+            }
+        }
+    }
 
-    let result = read_config_page_action(
-        &mut transport,
-        page_type_val,
-        page_number,
-        ext_page_type_val,
-        page_address_val,
-        data_action,
-    )
-    .map_err(crate::Error::Other)?;
-
-    if json_flag {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
-        println!("{}", format_hexdump(&result));
+        print_config_entries(&entries);
     }
 
     Ok(())
+}
+
+/// Render the inventory table + per-page hexdump for `config read`.
+fn print_config_entries(entries: &[ConfigDumpEntry]) {
+    println!("Config pages — {} found:", entries.len());
+    println!("  {:<28} {:>6} {:>8}", "GROUP", "NUMBER", "LEN(w)");
+    for e in entries {
+        println!(
+            "  {:<28} {:>6} {:>8}",
+            page_label(e.page_type, e.ext_page_type),
+            e.page_number,
+            e.length
+        );
+    }
+    println!();
+    for e in entries {
+        println!(
+            "== {}#{} (len={} words) ==",
+            page_label(e.page_type, e.ext_page_type),
+            e.page_number,
+            e.length
+        );
+        if let Some(hex_s) = &e.bytes_hex {
+            let bytes = hex::decode(hex_s).unwrap_or_default();
+            for (i, chunk) in bytes.chunks(16).enumerate() {
+                let hexs: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+                println!("  {:04x}: {}", i * 16, hexs);
+            }
+        }
+        println!();
+    }
 }
 
 /// Run `config write` subcommand.
 pub fn run_write(bdf: String, args: ConfigWriteArgs) -> Result<(), crate::Error> {
     use crate::mpt::Mpt3CtlTransport;
 
-    let page_type_val = page_type_from_str(&args.page_type).map_err(crate::Error::Other)?;
-    let ext_page_type_val = if let Some(et) = &args.ext_page_type {
-        Some(ext_page_type_from_str(et).map_err(crate::Error::Other)?)
-    } else {
-        None
-    };
+    let (page_type_val, ext_page_type_val) = args.group.ids();
     let page_address_val = parse_page_address(&args.page_address)?;
-    let data = hex::decode(args.from_hex.trim())
-        .map_err(|e| crate::Error::Other(format!("Invalid --from-hex: {}", e)))?;
+
+    let data = match (&args.from_hex, &args.from_file) {
+        (Some(h), None) => hex::decode(h.trim())
+            .map_err(|e| crate::Error::Other(format!("Invalid --from-hex: {}", e)))?,
+        (None, Some(p)) => std::fs::read(p)
+            .map_err(|e| crate::Error::Other(format!("read {}: {}", p.display(), e)))?,
+        _ => {
+            return Err(crate::Error::Other(
+                "Provide exactly one of --from-hex or --from-file.".to_string(),
+            ))
+        }
+    };
 
     if args.nvram && !args.yes {
         return Err(crate::Error::Other(
@@ -589,7 +676,7 @@ pub fn run_write(bdf: String, args: ConfigWriteArgs) -> Result<(), crate::Error>
     write_config_page(
         &mut transport,
         page_type_val,
-        args.page_number,
+        args.number,
         ext_page_type_val,
         page_address_val,
         &data,
@@ -605,8 +692,8 @@ pub fn run_write(bdf: String, args: ConfigWriteArgs) -> Result<(), crate::Error>
     println!(
         "OK: wrote {} bytes to {}#{} via {}",
         data.len(),
-        page_type_name(page_type_val),
-        args.page_number,
+        page_label(page_type_val, ext_page_type_val),
+        args.number,
         mode
     );
     Ok(())
@@ -661,123 +748,14 @@ pub fn run_selftest(bdf: String, args: ConfigSelftestArgs) -> Result<(), crate::
     }
 }
 
-/// Run `config dump` subcommand — enumerate every config page that exists.
-///
-/// Probes the known (type, number) space; pages that don't exist return a
-/// non-Success IOCStatus from `read_config_page` (INVALID_PAGE/INVALID_TYPE)
-/// and are skipped silently. Surfaces Manufacturing Page 43 (ISTWI device
-/// table) and everything else the card exposes.
-///
-/// NOTE: extended pages (type 0x0F, e.g. FLASH_LAYOUT 0x14) use an 8-byte
-/// ExtPageHeader; `read_config_page`/`PageHeader::parse` currently assume the
-/// 4-byte standard header, so extended results here are best-effort and may be
-/// length-truncated. Standard pages (Manufacturing/IO-Unit/IOC/BIOS) are exact.
-pub fn run_dump(bdf: String, json_flag: bool) -> Result<(), crate::Error> {
-    use crate::mpt::Mpt3CtlTransport;
-
-    let mut transport = Mpt3CtlTransport::open(&bdf)
-        .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
-
-    // Standard (type, max_number) probe space — generous upper bounds.
-    // Cites mpi2_cnfg.h:207-213 for the page-type values.
-    let standard: &[(u8, u8)] = &[
-        (0x00, 15), // IO Unit
-        (0x01, 15), // IOC
-        (0x02, 7),  // BIOS
-        (0x08, 3),  // RAID Volume
-        (0x09, 63), // Manufacturing (incl. Man Page 43 = ISTWI device table)
-        (0x0A, 2),  // RAID PhysDisk
-    ];
-    // Extended page types (under type 0x0F) — best-effort (see NOTE above).
-    let ext_types: &[u8] = &[0x10, 0x12, 0x13, 0x14];
-
-    let mut entries: Vec<ConfigDumpEntry> = Vec::new();
-
-    for &(pt, max_num) in standard {
-        for num in 0..=max_num {
-            if let Ok(page) = read_config_page(&mut transport, pt, num, None, 0) {
-                entries.push(ConfigDumpEntry {
-                    page_type: pt,
-                    page_number: num,
-                    length: page.page_length.unwrap_or(0),
-                    ext_page_type: None,
-                    bytes_hex: Some(page.bytes_hex),
-                });
-            }
-        }
-    }
-
-    for &et in ext_types {
-        for num in 0..=3u8 {
-            if let Ok(page) = read_config_page(&mut transport, 0x0F, num, Some(et), 0) {
-                entries.push(ConfigDumpEntry {
-                    page_type: 0x0F,
-                    page_number: num,
-                    length: page.page_length.unwrap_or(0),
-                    ext_page_type: Some(et),
-                    bytes_hex: Some(page.bytes_hex),
-                });
-            }
-        }
-    }
-
-    if json_flag {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else {
-        println!("Config page inventory — {} pages found:", entries.len());
-        println!("  {:<16} {:>6} {:>8}  EXT", "TYPE", "NUMBER", "LEN(w)");
-        for e in &entries {
-            let ext = e
-                .ext_page_type
-                .map(|x| format!("0x{:02X}", x))
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "  {:<16} {:>6} {:>8}  {}",
-                page_type_name(e.page_type),
-                e.page_number,
-                e.length,
-                ext
-            );
-        }
-        println!();
-        for e in &entries {
-            let ext_str = e
-                .ext_page_type
-                .map(|x| format!(" ext=0x{:02X}", x))
-                .unwrap_or_default();
-            println!(
-                "== {}#{}{} (len={} words) ==",
-                page_type_name(e.page_type),
-                e.page_number,
-                ext_str,
-                e.length
-            );
-            if let Some(hex_s) = &e.bytes_hex {
-                let bytes = hex::decode(hex_s).unwrap_or_default();
-                for (i, chunk) in bytes.chunks(16).enumerate() {
-                    let hexs: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
-                    println!("  {:04x}: {}", i * 16, hexs);
-                }
-            }
-            println!();
-        }
-    }
-
-    Ok(())
-}
-
 /// Config subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigSubCommand {
-    /// Read a single config page from the chip (--action current|default|nvram).
+    /// Read config pages: all / a group / one page (--action current|default|nvram).
     #[clap(name = "read")]
     Read(ConfigReadArgs),
 
-    /// Enumerate all existing config pages on the card.
-    #[clap(name = "dump")]
-    Dump(ConfigDumpArgs),
-
-    /// Write a full config page (volatile WRITE_CURRENT; --nvram --yes to persist).
+    /// Write a single config page (volatile WRITE_CURRENT; --nvram --yes to persist).
     #[clap(name = "write")]
     Write(ConfigWriteArgs),
 
@@ -787,18 +765,9 @@ pub enum ConfigSubCommand {
 }
 
 /// Entry point for config subcommand.
-pub fn run(bdf: String, _sub: ConfigSubCommand) -> Result<(), crate::Error> {
-    match _sub {
-        ConfigSubCommand::Read(args) => run_read(
-            bdf,
-            args.page_type,
-            args.page_number,
-            args.ext_page_type,
-            args.page_address,
-            args.action,
-            args.json,
-        ),
-        ConfigSubCommand::Dump(args) => run_dump(bdf, args.json),
+pub fn run(bdf: String, sub: ConfigSubCommand) -> Result<(), crate::Error> {
+    match sub {
+        ConfigSubCommand::Read(args) => run_read(bdf, args),
         ConfigSubCommand::Write(args) => run_write(bdf, args),
         ConfigSubCommand::Selftest(args) => run_selftest(bdf, args),
     }
@@ -828,19 +797,22 @@ mod tests {
         assert!(page_type_from_str("invalid").is_err());
     }
 
-    /// Test extended page type name parsing with mpi2_cnfg.h citations.
+    /// PageGroup maps each group name to the right (page_type, ext_page_type) —
+    /// cites mpi2_cnfg.h:207-231. NOTE: 0x14 is LOG, NOT "flash-layout"
+    /// (FLASH_LAYOUT is a firmware-IMAGE structure, ext image type 0x06).
     #[test]
-    fn test_ext_page_type_from_str() {
-        assert_eq!(ext_page_type_from_str("sas-io-unit").unwrap(), 0x10); // mpi2_cnfg.h:220
-        assert_eq!(ext_page_type_from_str("sas-device").unwrap(), 0x12); // mpi2_cnfg.h:222
-        assert_eq!(ext_page_type_from_str("sas-phy").unwrap(), 0x13); // mpi2_cnfg.h:223
-        assert_eq!(ext_page_type_from_str("flash-layout").unwrap(), 0x14); // mpi2_cnfg.h:224 (LOG)
-
-        // Hex variants
-        assert_eq!(ext_page_type_from_str("0x10").unwrap(), 0x10);
-
-        // Invalid
-        assert!(ext_page_type_from_str("invalid").is_err());
+    fn test_page_group_ids() {
+        // Standard groups (mpi2_cnfg.h:207-213)
+        assert_eq!(PageGroup::Manufacturing.ids(), (0x09, None)); // :211
+        assert_eq!(PageGroup::IoUnit.ids(), (0x00, None)); // :207
+        assert_eq!(PageGroup::Bios.ids(), (0x02, None)); // :209
+                                                         // Extended groups under 0x0F (mpi2_cnfg.h:220-231)
+        assert_eq!(PageGroup::SasIoUnit.ids(), (0x0F, Some(0x10))); // :220
+        assert_eq!(PageGroup::SasDevice.ids(), (0x0F, Some(0x12))); // :222
+        assert_eq!(PageGroup::Log.ids(), (0x0F, Some(0x14))); // :224 (LOG, not flash-layout)
+        assert_eq!(PageGroup::ExtManufacturing.ids(), (0x0F, Some(0x1A))); // :231
+                                                                           // all() covers every variant
+        assert_eq!(PageGroup::all().len(), 17);
     }
 
     /// Test PageHeader parsing from CONFIG reply.

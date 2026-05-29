@@ -496,9 +496,7 @@ mod tests {
             "0000:03:00.0",
             "config",
             "read",
-            "--page-type",
             "manufacturing",
-            "--page-number",
             "0",
         ])
         .unwrap();
@@ -511,12 +509,13 @@ mod tests {
     }
 
     #[test]
-    fn config_dump_parses() {
+    fn config_read_all_parses() {
+        // No group → read every group (the old `config dump`).
         let cli =
-            Cli::try_parse_from(["lsi-flash", "--pci", "0000:03:00.0", "config", "dump"]).unwrap();
+            Cli::try_parse_from(["lsi-flash", "--pci", "0000:03:00.0", "config", "read"]).unwrap();
         match cli.command {
             Command::Config { sub } => {
-                matches!(sub, config::ConfigSubCommand::Dump { .. });
+                matches!(sub, config::ConfigSubCommand::Read { .. });
             }
             _ => panic!("expected Config"),
         }
@@ -524,15 +523,7 @@ mod tests {
 
     #[test]
     fn config_read_requires_pci() {
-        let res = Cli::try_parse_from([
-            "lsi-flash",
-            "config",
-            "read",
-            "--page-type",
-            "manufacturing",
-            "--page-number",
-            "0",
-        ]);
+        let res = Cli::try_parse_from(["lsi-flash", "config", "read", "manufacturing", "0"]);
         assert!(res.is_ok()); // --pci is global, not required for parsing
     }
 }

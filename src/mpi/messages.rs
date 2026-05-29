@@ -864,7 +864,7 @@ impl ConfigRequest<'_> {
 
         // 0x14 MPI2_CONFIG_PAGE_HEADER (mpi2_cnfg.h:158-165)
         buf.push(0x00); // 0x14 PageVersion (IOC fills on reply)
-        // 0x15 PageLength (dwords) for standard pages; 0 for ext (uses ExtPageLength)
+                        // 0x15 PageLength (dwords) for standard pages; 0 for ext (uses ExtPageLength)
         buf.push(if is_ext { 0 } else { len_dwords as u8 });
         buf.push(self.page_number); // 0x16 PageNumber
         buf.push(self.page_type); // 0x17 PageType
