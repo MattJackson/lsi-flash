@@ -112,6 +112,22 @@ pub struct RestoreReport {
     pub regions: Vec<String>,
 }
 
+/// Result of a raw TOOLBOX_CLEAN probe — the firmware's exact reply.
+#[derive(Debug, Clone)]
+pub struct EraseReport {
+    /// TOOLBOX_CLEAN flags that were sent (e.g. CLEAN_FLASH = 0x04).
+    pub flags_sent: u32,
+    /// IOCStatus from the reply (0x0E), masked of the LOG_INFO flag bit.
+    pub ioc_status: u16,
+    /// True iff ioc_status == 0x0000 (firmware accepted/executed the clean).
+    pub success: bool,
+    /// IOCLogInfo from the reply (0x10) — vendor diagnostic word; nonzero often
+    /// pinpoints why a command was rejected.
+    pub ioc_log_info: u32,
+    /// First 24 bytes of the raw reply, hex — for forensic inspection.
+    pub raw_reply_hex: String,
+}
+
 /// Top-level trait for flash-capable cards.
 ///
 /// Per ADR-017, CLI verbs speak through this trait uniformly, enabling future
@@ -146,6 +162,14 @@ pub trait Card: Send {
     /// `sbr write` of the backup, or CH341A as last resort).
     fn sbr_write(&mut self, _data: &[u8; 256]) -> Result<(), CardError> {
         Err(CardError::NotImplemented("sbr_write"))
+    }
+
+    /// Send a raw MPI TOOLBOX_CLEAN and return the firmware's exact reply
+    /// (IOCStatus + IOCLogInfo). DESTRUCTIVE if the running firmware honors it
+    /// (erases the flash). Diagnostic purpose: capture the real reply that
+    /// sas2flsh/lsiutil hide behind exit-0. Default impl returns NotImplemented.
+    fn erase_flash(&mut self, _wipe_mfg_pages: bool) -> Result<EraseReport, CardError> {
+        Err(CardError::NotImplemented("erase_flash"))
     }
 
     /// Write a previously-captured backup's firmware regions back to THIS card

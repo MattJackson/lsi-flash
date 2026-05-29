@@ -765,37 +765,28 @@ pub struct ToolboxCleanRequest {
 impl ToolboxCleanRequest {
     /// Serialize TOOLBOX_CLEAN request to wire format.
     ///
-    /// Returns 20 bytes: header + CLEAN request body (no SGL needed).
-    pub fn serialize_to(&self, smid: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(30);
+    /// `MPI2_TOOLBOX_CLEAN_REQUEST` (mpi2_tool.h:76-90) IS the wire frame — there
+    /// is NO separate preceding MPI2_REQUEST_HEADER. Tool@0x00, Function@0x03,
+    /// Flags@0x0C; total 16 bytes. `_smid` is unused (the mpt3ctl kernel path
+    /// assigns the SMID/MsgContext).
+    ///
+    /// Fixed 2026-05-29: the prior version prepended a 10-byte generic header,
+    /// shifting Tool→0x0C / Flags→0x18 — the exact double-header bug also fixed
+    /// for ConfigRequest and FwUpload. It was latent (never sent on hardware).
+    pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16);
 
-        // MPI2_REQUEST_HEADER (10 bytes) — mpi-overview.md §1.2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // FunctionDependent1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::Toolbox.as_u8()); // Function = 0x17
-        buf.extend_from_slice(&smid.to_le_bytes()); // FunctionDependent2 (SMID)
-        buf.push(0x00); // FunctionDependent3
-
-        let msg_flags = 0x00; // Not used by CLEAN tool per toolbox-and-config.md §5
-        buf.push(msg_flags);
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
-
-        // MPI2_TOOLBOX_CLEAN_REQUEST body (10 bytes) — toolbox-and-config.md §5.1
-        buf.push(0x00); // Tool = CLEAN tool discriminator (mpi2_tool.h:41)
-        buf.push(0x00); // Reserved1
-        buf.push(0x00); // ChainOffset (repeated in body)
-        buf.push(MpiFunction::Toolbox.as_u8()); // Function (repeated)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-        buf.push(0x00); // Reserved3
-        buf.push(msg_flags); // MsgFlags
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved4
-
-        // Flags field (4 bytes) — toolbox-and-config.md §5.2
-        buf.extend_from_slice(&self.flags.bits().to_le_bytes());
+        buf.push(0x00); // 0x00 Tool = MPI2_TOOLBOX_CLEAN_TOOL (0x00) — mpi2_tool.h
+        buf.push(0x00); // 0x01 Reserved1
+        buf.push(0x00); // 0x02 ChainOffset
+        buf.push(MpiFunction::Toolbox.as_u8()); // 0x03 Function = 0x17
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x04 Reserved2
+        buf.push(0x00); // 0x06 Reserved3
+        buf.push(0x00); // 0x07 MsgFlags
+        buf.push(0x00); // 0x08 VP_ID
+        buf.push(0x00); // 0x09 VF_ID
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved4
+        buf.extend_from_slice(&self.flags.bits().to_le_bytes()); // 0x0C Flags (U32)
 
         buf
     }
@@ -2237,15 +2228,13 @@ mod tests {
 
         let bytes = req.serialize_to(1);
 
-        // Function at offset 0x03 should be 0x17 (TOOLBOX)
-        assert_eq!(bytes[3], MpiFunction::Toolbox.as_u8());
-
-        // Flags field at end of body (offset 0x18-0x1B = indices 24-27)
-        let flags_val = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
-        assert_eq!(flags_val, flags.bits());
-
-        // Total length should be 28 bytes (10 header + 18 body)
-        assert_eq!(bytes.len(), 28);
+        // MPI2_TOOLBOX_CLEAN_REQUEST is the wire frame (no preceding header):
+        // Tool@0x00, Function@0x03, Flags@0x0C. Total 16 bytes.
+        assert_eq!(bytes[0x00], 0x00, "Tool = CLEAN (0x00) at offset 0x00");
+        assert_eq!(bytes[0x03], MpiFunction::Toolbox.as_u8(), "Function 0x17 at 0x03");
+        let flags_val = u32::from_le_bytes([bytes[0x0C], bytes[0x0D], bytes[0x0E], bytes[0x0F]]);
+        assert_eq!(flags_val, flags.bits(), "Flags (U32) at offset 0x0C");
+        assert_eq!(bytes.len(), 16);
     }
 
     // ========================================================================

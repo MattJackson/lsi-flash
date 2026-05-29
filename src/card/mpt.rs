@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::card::{
-    BackupReport, Card, CardError, CardIdentity, ChipFamily, DetectReport, Personality,
-    RestoreReport,
+    BackupReport, Card, CardError, CardIdentity, ChipFamily, DetectReport, EraseReport,
+    Personality, RestoreReport,
 };
 use crate::mpi::messages::{FwDownloadReply, FwUploadReply, ImageType, IocStatus, MpiFunction};
 use crate::mpt::{Mpt3CtlTransport, MptTransport};
@@ -523,6 +523,46 @@ impl Card for MptCard {
         t.write_sbr(data)
             .map_err(|e| CardError::Transport(format!("sbr {} write: {}", t.name(), e)))?;
         Ok(())
+    }
+
+    /// Send a raw MPI TOOLBOX_CLEAN via the kernel `Mpt3CtlTransport` and capture
+    /// the firmware's exact reply (IOCStatus @0x0E + IOCLogInfo @0x10). Scoped to
+    /// CLEAN_FLASH (preserve Mfg pages) unless `wipe_mfg_pages`. DESTRUCTIVE if
+    /// the running firmware honors it. Diagnostic: surfaces the real reply that
+    /// sas2flsh/lsiutil discard behind exit-0.
+    fn erase_flash(&mut self, wipe_mfg_pages: bool) -> Result<EraseReport, CardError> {
+        use crate::mpi::messages::{ToolboxCleanFlags, ToolboxCleanRequest};
+
+        let flags = if wipe_mfg_pages {
+            ToolboxCleanFlags::FLASH | ToolboxCleanFlags::PERSIST_MANUFACT_PAGES
+        } else {
+            ToolboxCleanFlags::FLASH // CLEAN_FLASH only (0x04) — preserves Mfg pages
+        };
+        let req = ToolboxCleanRequest { flags };
+        let req_bytes = req.serialize_to(1);
+
+        // No data SGL (mirror the proven no-data IOC_FACTS send: offset 5, None/None).
+        let mut reply_buf = [0u8; 64];
+        let n = self
+            .transport
+            .send_with_sge_offset(&req_bytes, 5, &mut reply_buf, None, None)
+            .map_err(|e| CardError::Transport(format!("TOOLBOX_CLEAN send: {}", e)))?;
+
+        // Reply: IOCStatus @0x0E (U16 LE), IOCLogInfo @0x10 (U32 LE).
+        let ioc_status_raw = u16::from_le_bytes([reply_buf[0x0E], reply_buf[0x0F]]);
+        let ioc_status = ioc_status_raw & 0x7FFF; // mask LOG_INFO_AVAILABLE flag
+        let ioc_log_info =
+            u32::from_le_bytes([reply_buf[0x10], reply_buf[0x11], reply_buf[0x12], reply_buf[0x13]]);
+        let _ = n; // reply_buf is zero-initialized 64B; first 24B are the reply header
+        let raw_reply_hex = hex::encode(&reply_buf[..24]);
+
+        Ok(EraseReport {
+            flags_sent: flags.bits(),
+            ioc_status,
+            success: ioc_status == 0x0000,
+            ioc_log_info,
+            raw_reply_hex,
+        })
     }
 }
 
