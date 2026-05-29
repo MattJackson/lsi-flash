@@ -8,7 +8,9 @@
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:498-549 (i2c_init/close)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:551-629 (SBR read/write)
 
-use crate::mpi::doorbell::{read32, write32};
+use crate::mpi::doorbell::{
+    read32, write32, MPI2_DIAG_RW_ADDRESS_HIGH, MPI2_DIAG_RW_ADDRESS_LOW, MPI2_DIAG_RW_DATA,
+};
 
 /// DCR address register offset in BAR1. Cites lsirec.c:40, 113-117.
 const MPI2_DCR_ADDRESS: usize = 0x3c;
@@ -37,8 +39,9 @@ pub const DCR_SBR_CONFIG: u32 = 0x340;
 /// CHIP_I2C_BASE address. Cites lsirec.c:59.
 pub const CHIP_I2C_BASE: u32 = 0xC2100000;
 
-/// CHIP_I2C_PINS offset (BAR1 + 0x20). Cites lsirec.c:60.
-pub const CHIP_I2C_PINS_OFFSET: u32 = 0x20;
+/// CHIP_I2C_PINS — chip-memory address (CHIP_I2C_BASE + 0x20), reached via the
+/// DIAG RW window (NOT a direct BAR1 offset). Cites lsirec.c:60.
+pub const CHIP_I2C_PINS: u32 = CHIP_I2C_BASE + 0x20;
 
 /// CHIP_I2C_SCL_RD bit mask. Cites lsirec.c:61.
 pub const CHIP_I2C_SCL_RD: u32 = 0x01;
@@ -52,8 +55,9 @@ pub const CHIP_I2C_SCL_DRV: u32 = 0x04;
 /// CHIP_I2C_SDA_DRV bit mask. Cites lsirec.c:64.
 pub const CHIP_I2C_SDA_DRV: u32 = 0x08;
 
-/// CHIP_I2C_RESET offset (BAR1 + 0x24). Cites lsirec.c:65.
-pub const CHIP_I2C_RESET_OFFSET: u32 = 0x24;
+/// CHIP_I2C_RESET — chip-memory address (CHIP_I2C_BASE + 0x24), reached via the
+/// DIAG RW window (NOT a direct BAR1 offset). Cites lsirec.c:65.
+pub const CHIP_I2C_RESET: u32 = CHIP_I2C_BASE + 0x24;
 
 /// EEPROM address modes. Cites lsirec.c:67-68.
 pub const EEPROM_TYPE_16BIT: u8 = 0x01;
@@ -72,8 +76,10 @@ pub enum I2cError {
     EepromNoAck(&'static str),
 }
 
-/// Maximum GPIO register offset used (CHIP_I2C_RESET_OFFSET + 4 bytes).
-const MAX_GPIO_OFFSET: usize = (CHIP_I2C_RESET_OFFSET + 4) as usize;
+/// Highest *direct* BAR1 register offset touched (DCR_ADDRESS 0x3c + 4). All
+/// chip-memory (CHIP_I2C_*) access goes through the DIAG RW window at 0x10-0x18,
+/// also covered. Used for the entry-point slice-length guard.
+const MAX_GPIO_OFFSET: usize = MPI2_DCR_ADDRESS + 4;
 
 /// I2C context for bit-bang operations. Borrows live BAR1 MMIO slice.
 #[derive(Debug)]
@@ -98,6 +104,26 @@ fn dcr_write32(bar1: &mut [u8], offset: u32, data: u32) -> Result<(), I2cError> 
     Ok(())
 }
 
+/// Read a CHIP-memory register via the DIAG RW window. The I²C pin/reset
+/// registers live in chip address space (CHIP_I2C_BASE = 0xC2100000), NOT at a
+/// direct BAR1 offset — they're reached by writing the chip address to
+/// DIAG_RW_ADDRESS_{HIGH,LOW} then reading DIAG_RW_DATA. Mirrors lsirec's
+/// `chip_read32`. Cites lsirec.c:99-104. (Requires diag RW already enabled —
+/// `unlock_diag` does that in `i2c_init`.)
+fn chip_read32(bar1: &mut [u8], chip_addr: u32) -> u32 {
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
+    read32(bar1, MPI2_DIAG_RW_DATA)
+}
+
+/// Write a CHIP-memory register via the DIAG RW window. Mirrors lsirec's
+/// `chip_write32`. Cites lsirec.c:106-112.
+fn chip_write32(bar1: &mut [u8], chip_addr: u32, data: u32) {
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
+    write32(bar1, MPI2_DIAG_RW_DATA, data);
+}
+
 /// Delay for I2C timing. Cites lsirec.c:392-395.
 fn i2c_delay(_bar1: &[u8]) {
     std::thread::sleep(std::time::Duration::from_micros(5));
@@ -105,36 +131,36 @@ fn i2c_delay(_bar1: &[u8]) {
 
 /// Set SDA line. Cites lsirec.c:397-405.
 fn set_sda(bar1: &mut [u8], sda: bool) {
-    let val = read32(bar1, CHIP_I2C_PINS_OFFSET);
+    let val = chip_read32(bar1, CHIP_I2C_PINS);
     let new_val = if sda {
         val & !CHIP_I2C_SDA_DRV
     } else {
         val | CHIP_I2C_SDA_DRV
     };
-    write32(bar1, CHIP_I2C_PINS_OFFSET, new_val);
+    chip_write32(bar1, CHIP_I2C_PINS, new_val);
 }
 
 /// Set SCL line. Cites lsirec.c:407-415.
 fn set_scl(bar1: &mut [u8], scl: bool) {
-    let val = read32(bar1, CHIP_I2C_PINS_OFFSET);
+    let val = chip_read32(bar1, CHIP_I2C_PINS);
     let new_val = if scl {
         val & !CHIP_I2C_SCL_DRV
     } else {
         val | CHIP_I2C_SCL_DRV
     };
-    write32(bar1, CHIP_I2C_PINS_OFFSET, new_val);
+    chip_write32(bar1, CHIP_I2C_PINS, new_val);
 }
 
 /// Get SDA line state. Cites lsirec.c:417-420.
-fn get_sda(bar1: &[u8]) -> bool {
-    let val = read32(bar1, CHIP_I2C_PINS_OFFSET);
+fn get_sda(bar1: &mut [u8]) -> bool {
+    let val = chip_read32(bar1, CHIP_I2C_PINS);
     (val & CHIP_I2C_SDA_RD) != 0
 }
 
 /// Wait for SCL to go high. Cites lsirec.c:422-432.
-fn wait_scl(bar1: &[u8]) -> Result<(), I2cError> {
+fn wait_scl(bar1: &mut [u8]) -> Result<(), I2cError> {
     for _ in 0..100 {
-        let val = read32(bar1, CHIP_I2C_PINS_OFFSET);
+        let val = chip_read32(bar1, CHIP_I2C_PINS);
         if val & CHIP_I2C_SCL_RD != 0 {
             return Ok(());
         }
@@ -260,9 +286,9 @@ pub fn i2c_init(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     const MAX_RESET_ITERATIONS: u32 = 100_000;
 
     loop {
-        write32(ctx.bar1, CHIP_I2C_RESET_OFFSET, 1);
+        chip_write32(ctx.bar1, CHIP_I2C_RESET, 1);
         i2c_delay(ctx.bar1);
-        let reset_val = read32(ctx.bar1, CHIP_I2C_RESET_OFFSET);
+        let reset_val = chip_read32(ctx.bar1, CHIP_I2C_RESET);
         if reset_val & 1 == 0 {
             break;
         }
@@ -301,9 +327,9 @@ pub fn i2c_close(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     const MAX_RESET_ITERATIONS: u32 = 100_000;
 
     loop {
-        write32(ctx.bar1, CHIP_I2C_RESET_OFFSET, 1);
+        chip_write32(ctx.bar1, CHIP_I2C_RESET, 1);
         i2c_delay(ctx.bar1);
-        let reset_val = read32(ctx.bar1, CHIP_I2C_RESET_OFFSET);
+        let reset_val = chip_read32(ctx.bar1, CHIP_I2C_RESET);
         if reset_val & 1 == 0 {
             break;
         }
@@ -469,7 +495,8 @@ mod tests {
 
     #[test]
     fn test_bar1_minimum_size_ok() {
-        // CHIP_I2C_RESET_OFFSET is 0x24 = 36, so we need at least 40 bytes (offset + 4)
+        // MAX_GPIO_OFFSET = DCR_ADDRESS (0x3c) + 4 = 64, the highest direct BAR1
+        // register offset; chip-memory access uses the DIAG RW window (0x10-0x18).
         let mut bar1: [usize; MAX_GPIO_OFFSET / std::mem::size_of::<usize>()] =
             [0; MAX_GPIO_OFFSET / std::mem::size_of::<usize>()];
         let bar1_bytes: &mut [u8] = unsafe {
