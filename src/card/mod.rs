@@ -140,6 +140,14 @@ pub trait Card: Send {
         Err(CardError::NotImplemented("sbr_read"))
     }
 
+    /// Write the 256-byte SBR to the card's I2C EEPROM. Destructive (changes PCI
+    /// identity at next reset). Default impl returns NotImplemented so each Card
+    /// opts in. Callers MUST back up the current SBR first (recoverable via
+    /// `sbr write` of the backup, or CH341A as last resort).
+    fn sbr_write(&mut self, _data: &[u8; 256]) -> Result<(), CardError> {
+        Err(CardError::NotImplemented("sbr_write"))
+    }
+
     /// Write a previously-captured backup's firmware regions back to THIS card
     /// via FW_DOWNLOAD. Destructive. Per ADR-015 Rule 8 (non-destructive
     /// round-trip), restoring the same OEM firmware is the safe first write test.

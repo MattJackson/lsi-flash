@@ -510,6 +510,20 @@ impl Card for MptCard {
         Ok(bytes)
         */
     }
+
+    /// Write the 256-byte SBR via the proven direct BAR1 mmap transport (same
+    /// path as `sbr_read`: unbind mpt3sas → mmap resource1 → I²C bit-bang →
+    /// rebind + rescan on Drop, NO device reset). Destructive: the new identity
+    /// takes effect on the next chip reset / reboot. Caller must have a backup.
+    fn sbr_write(&mut self, data: &[u8; 256]) -> Result<(), CardError> {
+        use crate::sbr::transport::{Bar1MmapSbrTransport, SbrTransport};
+
+        let mut t = Bar1MmapSbrTransport::open(&self.identity.bdf)
+            .map_err(|e| CardError::Transport(format!("sbr transport: {}", e)))?;
+        t.write_sbr(data)
+            .map_err(|e| CardError::Transport(format!("sbr {} write: {}", t.name(), e)))?;
+        Ok(())
+    }
 }
 
 // ============================================================================

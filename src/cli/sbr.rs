@@ -67,6 +67,30 @@ pub enum SbrCommand {
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
+
+    /// Write a 256-byte SBR file to the chip's EEPROM (hardware-bound, DESTRUCTIVE).
+    /// Changes PCI identity at next chip reset/reboot. Back up first with `sbr read`.
+    Write {
+        /// PCI BDF of the card (e.g., `0000:03:00.0`).
+        #[arg(long, value_name = "BDF")]
+        pci: Option<String>,
+
+        /// Path to the 256-byte SBR file to write.
+        #[arg(long, value_name = "PATH")]
+        from_file: PathBuf,
+
+        /// Confirm this destructive write (required).
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Zero-risk write-path proof: read SBR, write identical bytes back, re-read,
+    /// assert unchanged. Validates the I²C write path with no identity change.
+    Selftest {
+        /// PCI BDF of the card (e.g., `0000:03:00.0`).
+        #[arg(long, value_name = "BDF")]
+        pci: Option<String>,
+    },
 }
 
 /// Entry point invoked from `cli::run`.
@@ -82,6 +106,117 @@ pub fn run(cmd: SbrCommand) -> Result<(), crate::Error> {
             sas_wwn,
             out,
         } => run_build(&identity, sas_wwn.as_deref(), out.as_deref()),
+        SbrCommand::Write {
+            pci,
+            from_file,
+            yes,
+        } => run_write(pci.as_deref(), &from_file, yes),
+        SbrCommand::Selftest { pci } => run_selftest(pci.as_deref()),
+    }
+}
+
+/// Resolve the target BDF (explicit `--pci`, else default dev slot).
+fn resolve_bdf(pci_bdf: Option<&str>) -> Result<String, crate::Error> {
+    match pci_bdf {
+        Some(b) => Ok(b.to_string()),
+        None => match crate::card::discover_one("0000:03:00.0") {
+            Ok(_) => Ok("0000:03:00.0".to_string()),
+            Err(crate::card::CardError::NoCardsFound) => {
+                Err(crate::Error::Other("No SAS2008 card found".to_string()))
+            }
+            Err(e) => Err(crate::Error::Other(format!("discover: {}", e))),
+        },
+    }
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+// ---- write ------------------------------------------------------------------
+
+/// Write a 256-byte SBR file to the chip (DESTRUCTIVE). Validates the file
+/// structure before writing; requires `--yes`.
+fn run_write(
+    pci_bdf: Option<&str>,
+    from_file: &std::path::Path,
+    yes: bool,
+) -> Result<(), crate::Error> {
+    let bytes = fs::read(from_file)
+        .map_err(|e| crate::Error::Other(format!("read {}: {}", from_file.display(), e)))?;
+    if bytes.len() != 256 {
+        return Err(crate::Error::Other(format!(
+            "SBR file must be exactly 256 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    // Structural sanity check before any destructive write.
+    parse_sbr(&bytes).map_err(|e| {
+        crate::Error::Other(format!(
+            "refusing to write: SBR file failed structural parse: {}",
+            e
+        ))
+    })?;
+
+    if !yes {
+        return Err(crate::Error::Other(format!(
+            "Refusing destructive SBR write without --yes. This changes PCI identity \
+             at next reset. File SHA256={}. Re-run with --yes to confirm.",
+            sha_hex(&bytes)
+        )));
+    }
+
+    let bdf = resolve_bdf(pci_bdf)?;
+    let mut card = crate::card::discover_one(&bdf)
+        .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
+
+    let mut arr = [0u8; 256];
+    arr.copy_from_slice(&bytes);
+    card.sbr_write(&arr)
+        .map_err(|e| crate::Error::Other(format!("card.sbr_write: {}", e)))?;
+
+    eprintln!(
+        "SBR written ({} bytes, SHA256={}). Takes effect on next chip reset/reboot.",
+        bytes.len(),
+        sha_hex(&bytes)
+    );
+    Ok(())
+}
+
+// ---- selftest ---------------------------------------------------------------
+
+/// Idempotent SBR write round-trip: read → write identical → re-read → compare.
+/// Proves the I²C write path with zero identity change.
+fn run_selftest(pci_bdf: Option<&str>) -> Result<(), crate::Error> {
+    let bdf = resolve_bdf(pci_bdf)?;
+    let mut card = crate::card::discover_one(&bdf)
+        .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
+
+    println!("sbr selftest: idempotent write round-trip on {bdf} (no identity change)");
+
+    let before = card
+        .sbr_read()
+        .map_err(|e| crate::Error::Other(format!("read (before): {}", e)))?;
+    println!("  read before:  SHA256={}", sha_hex(&before));
+
+    card.sbr_write(&before)
+        .map_err(|e| crate::Error::Other(format!("write (identical): {}", e)))?;
+    println!("  write:        Success (wrote back identical bytes)");
+
+    let after = card
+        .sbr_read()
+        .map_err(|e| crate::Error::Other(format!("read (after): {}", e)))?;
+    println!("  read after:   SHA256={}", sha_hex(&after));
+
+    if before == after {
+        println!("PASS: SBR write path validated, zero identity change.");
+        Ok(())
+    } else {
+        Err(crate::Error::Other(
+            "FAIL: SBR changed across idempotent write! Restore from backup.".to_string(),
+        ))
     }
 }
 

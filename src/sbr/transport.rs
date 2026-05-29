@@ -56,6 +56,13 @@ pub trait SbrTransport: Send {
     /// Read the 256-byte SBR EEPROM. Caller owns the choice of impl.
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError>;
 
+    /// Write the 256-byte SBR EEPROM. Default: unsupported (override per transport).
+    fn write_sbr(&mut self, _data: &[u8; 256]) -> Result<(), SbrTransportError> {
+        Err(SbrTransportError::NotImplemented(
+            "write_sbr not supported by this transport",
+        ))
+    }
+
     /// Short name for logging ("bar1-mmap-i2c" / "vfio-i2c" / "istwi" / etc.).
     /// Lets callers log which path was used without matching on concrete types.
     fn name(&self) -> &'static str;
@@ -344,6 +351,30 @@ impl SbrTransport for Bar1MmapSbrTransport {
         let _ = i2c_close(&mut ctx);
 
         Ok(arr)
+    }
+
+    fn write_sbr(&mut self, data: &[u8; 256]) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{i2c_close, i2c_init, i2c_write_sbr, I2cContext};
+
+        // SAFETY: `va` is valid for `len` bytes (guaranteed by mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        let mut ctx = I2cContext {
+            bar1,
+            sbr_addr: 0,
+            eep_type: 0,
+        };
+
+        // Auto-detect EEPROM address/type via i2c_init (lsirec.c:498-524).
+        i2c_init(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_init: {}", e)))?;
+
+        // Write all 256 bytes from offset 0 (byte-by-byte, 5ms write cycle each).
+        i2c_write_sbr(&mut ctx, 0, data)
+            .map_err(|e| SbrTransportError::Transport(format!("i2c_write_sbr: {}", e)))?;
+
+        // Best-effort restore of DCR_I2C_SELECT (lsirec.c:535-549).
+        let _ = i2c_close(&mut ctx);
+
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
