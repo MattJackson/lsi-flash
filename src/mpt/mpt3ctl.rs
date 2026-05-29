@@ -80,6 +80,49 @@ fn open_mpt_ctl_with_card(bdf: &str) -> Result<(File, u32), super::TransportErro
         .unwrap_or_else(|| super::TransportError::NotFound("no mpt control device found".into())))
 }
 
+/// `open_mpt_ctl_with_card` with a settle-retry.
+///
+/// After an SBR op (Bar1Mmap path) unbinds → rebinds mpt3sas, the IOC
+/// re-registers with the mpt3ctl layer ASYNCHRONOUSLY and lags the rebind. The
+/// Bar1Mmap Drop only waits for the SCSI host to reappear, not the mpt3ctl IOC —
+/// so a `discover_one` (→ this open) fired immediately after an SBR op can
+/// transiently find no IOC (`enumerated []`). Poll up to ~8s for it before
+/// giving up. The common case (IOC already present) returns on the first try
+/// with no delay; only the post-rebind window pays the poll.
+fn open_mpt_ctl_with_card_retry(bdf: &str) -> Result<(File, u32), super::TransportError> {
+    // Only poll when a control device actually EXISTS — i.e. the failure would be
+    // "IOC not registered yet" (the settle race), not "no driver / no device file"
+    // (which polling can't fix). This keeps no-hardware envs (tests, mac) fast.
+    let ctl_present =
+        std::path::Path::new(MPT2CTL_PATH).exists() || std::path::Path::new(MPT3CTL_PATH).exists();
+    if !ctl_present {
+        return open_mpt_ctl_with_card(bdf);
+    }
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(8);
+    let mut attempt = 0u32;
+    loop {
+        match open_mpt_ctl_with_card(bdf) {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e);
+                }
+                attempt += 1;
+                if attempt == 1 {
+                    eprintln!(
+                        "mpt3ctl: IOC for {} not registered yet (settling after driver rebind?) — polling up to {}s…",
+                        bdf,
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
 /// Parse a PCI BDF string into (segment, bus, device, function).
 ///
 /// Format: `[segment]:[bus]:[device].[function]` or `[bus]:[device].[function]`.
@@ -359,7 +402,7 @@ impl Mpt3CtlTransport {
     /// Returns `NotFound` if neither device file exists, OR if neither
     /// manages this BDF.
     pub fn open(bdf: &str) -> Result<Self, super::TransportError> {
-        let (fd, ioc_number) = open_mpt_ctl_with_card(bdf)?;
+        let (fd, ioc_number) = open_mpt_ctl_with_card_retry(bdf)?;
         Ok(Self { fd, ioc_number })
     }
 
