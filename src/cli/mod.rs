@@ -133,6 +133,29 @@ pub enum Command {
 
     /// DIAGNOSTIC: send a raw TOOLBOX_CLEAN and print the firmware's exact
     /// IOCStatus + IOCLogInfo. DESTRUCTIVE if the firmware honors it. --yes required.
+    /// Low-level RE / diagnostic commands. Hidden from normal help — these are
+    /// reverse-engineering instruments, not part of the normal flashing workflow.
+    #[command(hide = true)]
+    Debug {
+        #[command(subcommand)]
+        sub: DebugCommand,
+    },
+
+    /// Manipulator-grade firmware synthesis subcommands. Cites
+    /// `lsi-flash-notes/03-firmware-formats/mpt-firmware-format.md` §N (PHY-to-slot map).
+    Firmware {
+        #[command(subcommand)]
+        sub: FirmwareCommand,
+    },
+}
+
+/// Diagnostic / reverse-engineering commands (hidden). NOT part of the normal
+/// flashing workflow — erase is internal to `fw write`; this raw erase exists
+/// only to characterize firmware behavior (e.g. the Dell erase-lock IOCStatus).
+#[derive(Subcommand, Debug)]
+pub enum DebugCommand {
+    /// Send a raw MPI TOOLBOX_CLEAN and print the firmware's exact IOCStatus +
+    /// IOCLogInfo. DESTRUCTIVE if the firmware honors it. --yes required.
     Erase {
         /// Confirm this destructive flash-erase command.
         #[arg(long)]
@@ -141,13 +164,6 @@ pub enum Command {
         /// Also wipe Manufacturing pages (PERSIST_MANUFACT_PAGES). Default: off.
         #[arg(long)]
         wipe_mfg_pages: bool,
-    },
-
-    /// Manipulator-grade firmware synthesis subcommands. Cites
-    /// `lsi-flash-notes/03-firmware-formats/mpt-firmware-format.md` §N (PHY-to-slot map).
-    Firmware {
-        #[command(subcommand)]
-        sub: FirmwareCommand,
     },
 }
 
@@ -219,10 +235,12 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             dry_run,
         } => recover::run(backup_dir, yes, cli.json, cli.pci.clone(), dry_run),
         Command::Sbr { sub } => sbr::run(sub),
-        Command::Erase {
-            yes,
-            wipe_mfg_pages,
-        } => erase::run(cli.pci.clone(), yes, wipe_mfg_pages, cli.json),
+        Command::Debug { sub } => match sub {
+            DebugCommand::Erase {
+                yes,
+                wipe_mfg_pages,
+            } => erase::run(cli.pci.clone(), yes, wipe_mfg_pages, cli.json),
+        },
         Command::Config { sub } => {
             let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
                 .map_err(|e| crate::Error::Other(format!("{}", e)))?;
