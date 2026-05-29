@@ -347,20 +347,29 @@ impl Drop for Bar1MmapSbrTransport {
 /// shortly after rebind; give it a brief settle, then write the rescan trigger.
 /// Best-effort — never errors out of Drop.
 fn trigger_scsi_rescan(bdf: &str) {
-    // The driver re-creates the scsi_host asynchronously after bind; wait briefly.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    // The driver re-creates the scsi_host ASYNCHRONOUSLY after rebind (port-enable
+    // takes ~2-3s), so the scan file doesn't exist immediately. Poll for it (up to
+    // ~6s), then write the rescan trigger. "- - -" = scan all channels/targets/luns.
     let dev_dir = format!("/sys/bus/pci/devices/{}", bdf);
-    let Ok(entries) = std::fs::read_dir(&dev_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(stripped) = name.strip_prefix("host") {
-            // .../host<N>/scsi_host/host<N>/scan  ("- - -" = scan all channels/targets/luns)
-            let scan = format!("{dev_dir}/host{stripped}/scsi_host/host{stripped}/scan");
-            let _ = std::fs::write(&scan, "- - -\n");
+    for _ in 0..30 {
+        if let Ok(entries) = std::fs::read_dir(&dev_dir) {
+            let mut scanned = false;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(n) = name.strip_prefix("host") {
+                    let scan = format!("{dev_dir}/host{n}/scsi_host/host{n}/scan");
+                    if std::path::Path::new(&scan).exists() {
+                        let _ = std::fs::write(&scan, "- - -\n");
+                        scanned = true;
+                    }
+                }
+            }
+            if scanned {
+                return;
+            }
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
