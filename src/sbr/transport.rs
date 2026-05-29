@@ -102,20 +102,15 @@ impl SbrTransport for VfioI2cSbrTransport {
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError> {
         use crate::sbr::i2c::{i2c_read_sbr, I2cContext};
 
+        // Use live BAR1 slice directly (no copy).
         let bar1_slice = self.vfio.bar1();
-
-        // Create I2cContext with cloned BAR1 data.
         let mut ctx = I2cContext {
-            bar1: {
-                let mut arr = [0u8; 4096];
-                arr.copy_from_slice(bar1_slice);
-                Box::new(arr)
-            },
+            bar1: bar1_slice,
             sbr_addr: 0x50,
             eep_type: 0,
         };
 
-        // Call i2c_read_sbr directly (src/sbr/i2c.rs:289).
+        // Call i2c_read_sbr directly (src/sbr/i2c.rs).
         let bytes = i2c_read_sbr(&mut ctx, 0, 256)
             .map_err(|e| SbrTransportError::Transport(format!("i2c_read_sbr: {}", e)))?;
 

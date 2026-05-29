@@ -10,6 +10,7 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 ## [Unreleased]
 
 ### Fixed
+- VFIO+I²C `sbr read` panicked (4 KB copy vs 64 KB BAR1) and operated on a dead copy; now bit-bangs the live BAR1 MMIO slice. Cites: `src/sbr/i2c.rs` GPIO register offsets (CHIP_I2C_PINS_OFFSET=0x20, CHIP_I2C_RESET_OFFSET=0x24 per lsirec.c:60-65); `I2cContext<'a>` now borrows `&'a mut [u8]` instead of owning `Box<[u8; 4096]>`; `VfioI2cSbrTransport::read_sbr` uses `self.vfio.bar1()` directly (src/hw/vfio.rs:453) without copying.
 - MptCard::restore() — BUG 1: TotalImageSize now carries full file length on every FW_DOWNLOAD chunk (previously hardcoded to 0u32) per `fw-download-write-sequence.md` §4 and lsiutil.c:34703; line 364 computes `total_size = file_bytes.len() as u32`, line 384 writes it at offset 0x0C via `&total_size.to_le_bytes()`
 - MptCard::restore() — BUG 2: Added manifest integrity validation before any FW_DOWNLOAD (ADR-015 Rule 5); reads `manifest.toml`, verifies each region artifact's size and SHA256 match disk bytes, returns CardError on mismatch to prevent writing corrupted/truncated images; comment updated to clarify interim guard vs. OPEN live FLASH_LAYOUT capacity check (Rule 11a)
 ### Changed

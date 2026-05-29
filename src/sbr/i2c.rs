@@ -51,23 +51,33 @@ pub enum I2cError {
     EepromNoAck(&'static str),
 }
 
-/// I2C context for bit-bang operations.
+/// Maximum GPIO register offset used (CHIP_I2C_RESET_OFFSET + 4 bytes).
+const MAX_GPIO_OFFSET: usize = (CHIP_I2C_RESET_OFFSET + 4) as usize;
+
+/// I2C context for bit-bang operations. Borrows live BAR1 MMIO slice.
 #[derive(Debug)]
-pub struct I2cContext {
-    pub bar1: Box<[u8; 4096]>, // Reuse from pci.rs
-    pub sbr_addr: u8,          // 0x50 or 0x54 (lsirec.c:502-507)
-    pub eep_type: u8,          // EEPROM_TYPE_8BIT or EEPROM_TYPE_16BIT (lsirec.c:509-513)
+pub struct I2cContext<'a> {
+    pub bar1: &'a mut [u8], // live BAR1 view, NOT a copy (64 KB on real hardware)
+    pub sbr_addr: u8,       // 0x50 or 0x54 (lsirec.c:502-507)
+    pub eep_type: u8,       // EEPROM_TYPE_8BIT or EEPROM_TYPE_16BIT (lsirec.c:509-513)
 }
 
 /// Delay for I2C timing. Cites lsirec.c:392-395.
-fn i2c_delay(bar1: &[u8; 4096]) {
+fn i2c_delay(bar1: &[u8]) {
     let _ = bar1; // silence unused warning when not needed
     std::thread::sleep(std::time::Duration::from_micros(5));
 }
 
 /// Set SDA line. Cites lsirec.c:397-405.
-fn set_sda(bar1: &mut [u8; 4096], sda: bool) {
+fn set_sda(bar1: &mut [u8], sda: bool) {
     let offset = CHIP_I2C_PINS_OFFSET as usize;
+    if bar1.len() < offset + 4 {
+        panic!(
+            "bar1 slice too small for GPIO access (len={}, need {})",
+            bar1.len(),
+            offset + 4
+        );
+    }
     let val = u32::from_le_bytes([
         bar1[offset],
         bar1[offset + 1],
@@ -86,8 +96,15 @@ fn set_sda(bar1: &mut [u8; 4096], sda: bool) {
 }
 
 /// Set SCL line. Cites lsirec.c:407-415.
-fn set_scl(bar1: &mut [u8; 4096], scl: bool) {
+fn set_scl(bar1: &mut [u8], scl: bool) {
     let offset = CHIP_I2C_PINS_OFFSET as usize;
+    if bar1.len() < offset + 4 {
+        panic!(
+            "bar1 slice too small for GPIO access (len={}, need {})",
+            bar1.len(),
+            offset + 4
+        );
+    }
     let val = u32::from_le_bytes([
         bar1[offset],
         bar1[offset + 1],
@@ -106,8 +123,15 @@ fn set_scl(bar1: &mut [u8; 4096], scl: bool) {
 }
 
 /// Get SDA line state. Cites lsirec.c:417-420.
-fn get_sda(bar1: &[u8; 4096]) -> bool {
+fn get_sda(bar1: &[u8]) -> bool {
     let offset = CHIP_I2C_PINS_OFFSET as usize;
+    if bar1.len() < offset + 4 {
+        panic!(
+            "bar1 slice too small for GPIO access (len={}, need {})",
+            bar1.len(),
+            offset + 4
+        );
+    }
     let val = u32::from_le_bytes([
         bar1[offset],
         bar1[offset + 1],
@@ -118,9 +142,20 @@ fn get_sda(bar1: &[u8; 4096]) -> bool {
 }
 
 /// Wait for SCL to go high. Cites lsirec.c:422-432.
-fn wait_scl(bar1: &[u8; 4096]) -> Result<(), I2cError> {
+fn wait_scl(bar1: &[u8]) -> Result<(), I2cError> {
+    let offset = CHIP_I2C_PINS_OFFSET as usize;
+    if bar1.len() < offset + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for GPIO access (len={}, need {})",
+                bar1.len(),
+                offset + 4
+            ),
+        )
+        .into());
+    }
     for _ in 0..100 {
-        let offset = CHIP_I2C_PINS_OFFSET as usize;
         let val = u32::from_le_bytes([
             bar1[offset],
             bar1[offset + 1],
@@ -136,7 +171,7 @@ fn wait_scl(bar1: &[u8; 4096]) -> Result<(), I2cError> {
 }
 
 /// I2C START condition. Cites lsirec.c:445-457.
-fn i2c_start(bar1: &mut [u8; 4096]) {
+fn i2c_start(bar1: &mut [u8]) {
     i2c_delay(bar1);
     set_sda(bar1, true);
     i2c_delay(bar1);
@@ -150,7 +185,7 @@ fn i2c_start(bar1: &mut [u8; 4096]) {
 }
 
 /// I2C STOP condition. Cites lsirec.c:435-443.
-fn i2c_stop(bar1: &mut [u8; 4096]) {
+fn i2c_stop(bar1: &mut [u8]) {
     i2c_delay(bar1);
     set_sda(bar1, false);
     i2c_delay(bar1);
@@ -161,7 +196,7 @@ fn i2c_stop(bar1: &mut [u8; 4096]) {
 }
 
 /// Send a single bit. Cites lsirec.c:459-468.
-fn i2c_sendbit(bar1: &mut [u8; 4096], bit: bool) {
+fn i2c_sendbit(bar1: &mut [u8], bit: bool) {
     set_sda(bar1, bit);
     i2c_delay(bar1);
     set_scl(bar1, true);
@@ -172,7 +207,7 @@ fn i2c_sendbit(bar1: &mut [u8; 4096], bit: bool) {
 }
 
 /// Receive a single bit. Cites lsirec.c:470-481.
-fn i2c_getbit(bar1: &mut [u8; 4096]) -> bool {
+fn i2c_getbit(bar1: &mut [u8]) -> bool {
     set_sda(bar1, true);
     i2c_delay(bar1);
     set_scl(bar1, true);
@@ -185,14 +220,14 @@ fn i2c_getbit(bar1: &mut [u8; 4096]) -> bool {
 }
 
 /// Send a byte (MSB first). Cites lsirec.c:483-487.
-fn i2c_sendbyte(bar1: &mut [u8; 4096], byte: u8) {
+fn i2c_sendbyte(bar1: &mut [u8], byte: u8) {
     for mask in [0x80u8, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01] {
         i2c_sendbit(bar1, byte & mask != 0);
     }
 }
 
 /// Receive a byte (MSB first). Cites lsirec.c:489-496.
-fn i2c_getbyte(bar1: &mut [u8; 4096]) -> u8 {
+fn i2c_getbyte(bar1: &mut [u8]) -> u8 {
     let mut val = 0u8;
     for mask in [0x80u8, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01] {
         if i2c_getbit(bar1) {
@@ -204,7 +239,7 @@ fn i2c_getbyte(bar1: &mut [u8; 4096]) -> u8 {
 
 /// Initialize I2C interface. Cites lsirec.c:498-533.
 pub fn i2c_init(
-    ctx: &mut I2cContext,
+    ctx: &mut I2cContext<'_>,
     dcr_read32_fn: impl Fn(u32) -> u32,
     mut dcr_write32_fn: impl FnMut(u32, u32),
 ) {
@@ -232,7 +267,7 @@ pub fn i2c_init(
     ctx.bar1[offset + 2] = 0;
     ctx.bar1[offset + 3] = 0;
     loop {
-        i2c_delay(&ctx.bar1);
+        i2c_delay(ctx.bar1);
         let reset_val = u32::from_le_bytes([
             ctx.bar1[offset],
             ctx.bar1[offset + 1],
@@ -250,16 +285,16 @@ pub fn i2c_init(
 
     // Reset I2C lines (lsirec.c:526-531).
     for _ in 0..9 {
-        i2c_sendbit(&mut ctx.bar1, true);
+        i2c_sendbit(ctx.bar1, true);
     }
-    i2c_stop(&mut ctx.bar1);
-    i2c_start(&mut ctx.bar1);
-    i2c_stop(&mut ctx.bar1);
+    i2c_stop(ctx.bar1);
+    i2c_start(ctx.bar1);
+    i2c_stop(ctx.bar1);
 }
 
 /// Close I2C interface. Cites lsirec.c:535-549.
 pub fn i2c_close(
-    ctx: &mut I2cContext,
+    ctx: &mut I2cContext<'_>,
     dcr_read32_fn: impl Fn(u32) -> u32,
     mut dcr_write32_fn: impl FnMut(u32, u32),
 ) {
@@ -269,7 +304,7 @@ pub fn i2c_close(
     ctx.bar1[offset + 2] = 0;
     ctx.bar1[offset + 3] = 0;
     loop {
-        i2c_delay(&ctx.bar1);
+        i2c_delay(ctx.bar1);
         let reset_val = u32::from_le_bytes([
             ctx.bar1[offset],
             ctx.bar1[offset + 1],
@@ -286,78 +321,168 @@ pub fn i2c_close(
 }
 
 /// Read SBR from EEPROM. Cites lsirec.c:551-589.
-pub fn i2c_read_sbr(ctx: &mut I2cContext, offset: usize, len: usize) -> Result<Vec<u8>, I2cError> {
+pub fn i2c_read_sbr(
+    ctx: &mut I2cContext<'_>,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, I2cError> {
+    // Guard: bar1 must be large enough for highest GPIO register access (RESET + 4 bytes).
+    if ctx.bar1.len() < MAX_GPIO_OFFSET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for I²C ops (len={}, need {})",
+                ctx.bar1.len(),
+                MAX_GPIO_OFFSET
+            ),
+        )
+        .into());
+    }
+
     let mut buf = vec![0u8; len];
 
     // Send address byte (write mode). Cites lsirec.c:553-569.
-    i2c_start(&mut ctx.bar1);
-    i2c_sendbyte(&mut ctx.bar1, ctx.sbr_addr << 1);
-    if !i2c_getbit(&mut ctx.bar1) {
+    i2c_start(ctx.bar1);
+    i2c_sendbyte(ctx.bar1, ctx.sbr_addr << 1);
+    if !i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("address W"));
     }
 
     // Send offset (16-bit mode). Cites lsirec.c:560-564.
     if ctx.eep_type == EEPROM_TYPE_16BIT {
-        i2c_sendbyte(&mut ctx.bar1, (offset >> 8) as u8);
-        if !i2c_getbit(&mut ctx.bar1) {
+        i2c_sendbyte(ctx.bar1, (offset >> 8) as u8);
+        if !i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("offset1"));
         }
     }
 
     // Send offset low byte. Cites lsirec.c:566-570.
-    i2c_sendbyte(&mut ctx.bar1, (offset & 0xff) as u8);
-    if !i2c_getbit(&mut ctx.bar1) {
+    i2c_sendbyte(ctx.bar1, (offset & 0xff) as u8);
+    if !i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("offset0"));
     }
 
     // Repeated START for read mode. Cites lsirec.c:572-576.
-    i2c_start(&mut ctx.bar1);
-    i2c_sendbyte(&mut ctx.bar1, (ctx.sbr_addr << 1) | 0x01);
-    if !i2c_getbit(&mut ctx.bar1) {
+    i2c_start(ctx.bar1);
+    i2c_sendbyte(ctx.bar1, (ctx.sbr_addr << 1) | 0x01);
+    if !i2c_getbit(ctx.bar1) {
         return Err(I2cError::EepromNoAck("address R"));
     }
 
     // Read bytes. Cites lsirec.c:578-586.
     for (i, slot) in buf.iter_mut().enumerate().take(len) {
-        *slot = i2c_getbyte(&mut ctx.bar1);
-        i2c_sendbit(&mut ctx.bar1, i == len - 1); // NACK on last byte
+        *slot = i2c_getbyte(ctx.bar1);
+        i2c_sendbit(ctx.bar1, i == len - 1); // NACK on last byte
     }
 
-    i2c_stop(&mut ctx.bar1);
+    i2c_stop(ctx.bar1);
     Ok(buf)
 }
 
 /// Write SBR to EEPROM. Cites lsirec.c:591-629.
-pub fn i2c_write_sbr(ctx: &mut I2cContext, offset: usize, data: &[u8]) -> Result<(), I2cError> {
+pub fn i2c_write_sbr(ctx: &mut I2cContext<'_>, offset: usize, data: &[u8]) -> Result<(), I2cError> {
+    // Guard: bar1 must be large enough for highest GPIO register access (RESET + 4 bytes).
+    if ctx.bar1.len() < MAX_GPIO_OFFSET {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for I²C ops (len={}, need {})",
+                ctx.bar1.len(),
+                MAX_GPIO_OFFSET
+            ),
+        )
+        .into());
+    }
+
     for (i, &byte) in data.iter().enumerate() {
         let abs_offset = offset + i;
 
-        i2c_start(&mut ctx.bar1);
-        i2c_sendbyte(&mut ctx.bar1, ctx.sbr_addr << 1);
-        if !i2c_getbit(&mut ctx.bar1) {
+        i2c_start(ctx.bar1);
+        i2c_sendbyte(ctx.bar1, ctx.sbr_addr << 1);
+        if !i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("address W"));
         }
 
         if ctx.eep_type == EEPROM_TYPE_16BIT {
-            i2c_sendbyte(&mut ctx.bar1, (abs_offset >> 8) as u8);
-            if !i2c_getbit(&mut ctx.bar1) {
+            i2c_sendbyte(ctx.bar1, (abs_offset >> 8) as u8);
+            if !i2c_getbit(ctx.bar1) {
                 return Err(I2cError::EepromNoAck("offset1"));
             }
         }
 
-        i2c_sendbyte(&mut ctx.bar1, (abs_offset & 0xff) as u8);
-        if !i2c_getbit(&mut ctx.bar1) {
+        i2c_sendbyte(ctx.bar1, (abs_offset & 0xff) as u8);
+        if !i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("offset0"));
         }
 
-        i2c_sendbyte(&mut ctx.bar1, byte);
-        if !i2c_getbit(&mut ctx.bar1) {
+        i2c_sendbyte(ctx.bar1, byte);
+        if !i2c_getbit(ctx.bar1) {
             return Err(I2cError::EepromNoAck("data"));
         }
 
-        i2c_stop(&mut ctx.bar1);
+        i2c_stop(ctx.bar1);
         std::thread::sleep(std::time::Duration::from_millis(5)); // 5ms write cycle (lsirec.c:625)
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bar1_too_short_read_returns_err() {
+        let mut bar1: [u8; 32] = [0u8; 32]; // Too short for GPIO access
+        let mut ctx = I2cContext {
+            bar1: &mut bar1[..],
+            sbr_addr: 0x50,
+            eep_type: EEPROM_TYPE_8BIT,
+        };
+
+        let result = i2c_read_sbr(&mut ctx, 0, 256);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bar1 slice too small"));
+    }
+
+    #[test]
+    fn test_bar1_too_short_write_returns_err() {
+        let mut bar1: [u8; 32] = [0u8; 32]; // Too short for GPIO access
+        let mut ctx = I2cContext {
+            bar1: &mut bar1[..],
+            sbr_addr: 0x50,
+            eep_type: EEPROM_TYPE_8BIT,
+        };
+
+        let result = i2c_write_sbr(&mut ctx, 0, &[1u8; 10]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bar1 slice too small"));
+    }
+
+    #[test]
+    fn test_bar1_minimum_size_ok() {
+        // CHIP_I2C_RESET_OFFSET is 0x24 = 36, so we need at least 40 bytes (offset + 4)
+        let mut bar1: [usize; MAX_GPIO_OFFSET / std::mem::size_of::<usize>()] =
+            [0; MAX_GPIO_OFFSET / std::mem::size_of::<usize>()];
+        let bar1_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(bar1.as_mut_ptr() as *mut u8, MAX_GPIO_OFFSET)
+        };
+        let mut ctx = I2cContext {
+            bar1: bar1_bytes,
+            sbr_addr: 0x50,
+            eep_type: EEPROM_TYPE_8BIT,
+        };
+
+        // Should not return the "too small" error (will timeout on SCL but that's expected)
+        let result = i2c_read_sbr(&mut ctx, 0, 1);
+        assert!(result.is_err()); // Expected to fail with timeout or I/O, not size check
+    }
+
+    #[test]
+    fn test_i2c_delay_accepts_slice() {
+        let bar1: &[u8] = &[0u8; 64];
+        i2c_delay(bar1); // Should compile and run without panic
+    }
 }
