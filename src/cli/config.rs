@@ -197,10 +197,17 @@ pub fn read_config_page(
 
     let page_hdr = PageHeader::parse(&reply_header.page_header);
 
-    // Sanity check: does returned type/number match request?
-    if page_hdr.type_ != page_type || page_hdr.number != page_number {
+    // Sanity check: does returned type/number match request? The reply PageType
+    // carries attribute bits in the upper nibble (MPI2_CONFIG_PAGEATTR_*:
+    // READ_ONLY 0x00 / CHANGEABLE 0x10 / PERSISTENT 0x20 — mpi2_cnfg.h), so mask
+    // with MPI2_CONFIG_PAGETYPE_MASK (0x0F) before comparing. Manufacturing
+    // pages legitimately come back as 0x29 = PERSISTENT|MANUFACTURING.
+    const PAGETYPE_MASK: u8 = 0x0F; // MPI2_CONFIG_PAGETYPE_MASK — mpi2_cnfg.h
+    if (page_hdr.type_ & PAGETYPE_MASK) != (page_type & PAGETYPE_MASK)
+        || page_hdr.number != page_number
+    {
         return Err(format!(
-            "Page header mismatch: requested {}/{} got {}/{}",
+            "Page header mismatch: requested {}/{} got {:#04x}/{}",
             page_type, page_number, page_hdr.type_, page_hdr.number
         ));
     }
