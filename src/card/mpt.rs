@@ -184,9 +184,18 @@ impl Card for MptCard {
             if std::env::var("LSI_DEBUG").is_ok() {
                 let rb = &reply_buf[..32.min(reply_buf.len())];
                 let ioc_status_raw = u16::from_le_bytes([reply_buf[14], reply_buf[15]]);
-                let log_info =
-                    u32::from_le_bytes([reply_buf[16], reply_buf[17], reply_buf[18], reply_buf[19]]);
-                let asz = u32::from_le_bytes([reply_buf[20], reply_buf[21], reply_buf[22], reply_buf[23]]);
+                let log_info = u32::from_le_bytes([
+                    reply_buf[16],
+                    reply_buf[17],
+                    reply_buf[18],
+                    reply_buf[19],
+                ]);
+                let asz = u32::from_le_bytes([
+                    reply_buf[20],
+                    reply_buf[21],
+                    reply_buf[22],
+                    reply_buf[23],
+                ]);
                 eprintln!(
                     "[LSI_DEBUG] FW_UPLOAD type={:?} bytes_written={} IOCStatus=0x{:04x} IOCLogInfo=0x{:08x} ActualImageSize=0x{:08x} reply[0..32]={}",
                     image_type, bytes_written, ioc_status_raw, log_info, asz, hex::encode(rb)
@@ -563,8 +572,12 @@ impl Card for MptCard {
         // Reply: IOCStatus @0x0E (U16 LE), IOCLogInfo @0x10 (U32 LE).
         let ioc_status_raw = u16::from_le_bytes([reply_buf[0x0E], reply_buf[0x0F]]);
         let ioc_status = ioc_status_raw & 0x7FFF; // mask LOG_INFO_AVAILABLE flag
-        let ioc_log_info =
-            u32::from_le_bytes([reply_buf[0x10], reply_buf[0x11], reply_buf[0x12], reply_buf[0x13]]);
+        let ioc_log_info = u32::from_le_bytes([
+            reply_buf[0x10],
+            reply_buf[0x11],
+            reply_buf[0x12],
+            reply_buf[0x13],
+        ]);
         let _ = n; // reply_buf is zero-initialized 64B; first 24B are the reply header
         let raw_reply_hex = hex::encode(&reply_buf[..24]);
 

@@ -105,7 +105,10 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
         // If mpt3sas isn't loaded or no IOC manages this BDF, fall back to VFIO+doorbell.
         match crate::card::discover_one(&bdf) {
             Ok(mut card) => {
-                eprintln!("backup: using MptCard via kernel-mediated transport ({})", bdf);
+                eprintln!(
+                    "backup: using MptCard via kernel-mediated transport ({})",
+                    bdf
+                );
                 let report = card
                     .backup(&out_dir)
                     .map_err(|e| crate::Error::Other(format!("card.backup: {}", e)))?;

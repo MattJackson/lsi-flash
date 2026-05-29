@@ -2231,7 +2231,11 @@ mod tests {
         // MPI2_TOOLBOX_CLEAN_REQUEST is the wire frame (no preceding header):
         // Tool@0x00, Function@0x03, Flags@0x0C. Total 16 bytes.
         assert_eq!(bytes[0x00], 0x00, "Tool = CLEAN (0x00) at offset 0x00");
-        assert_eq!(bytes[0x03], MpiFunction::Toolbox.as_u8(), "Function 0x17 at 0x03");
+        assert_eq!(
+            bytes[0x03],
+            MpiFunction::Toolbox.as_u8(),
+            "Function 0x17 at 0x03"
+        );
         let flags_val = u32::from_le_bytes([bytes[0x0C], bytes[0x0D], bytes[0x0E], bytes[0x0F]]);
         assert_eq!(flags_val, flags.bits(), "Flags (U32) at offset 0x0C");
         assert_eq!(bytes.len(), 16);
