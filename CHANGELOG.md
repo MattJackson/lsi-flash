@@ -9,6 +9,9 @@ Until v1.0, breaking changes may happen on any 0.x release (per ADR-008).
 
 ## [Unreleased]
 
+### Added
+- sbr read: new `Bar1MmapSbrTransport` (direct `/sys/.../resource1` mmap, no VFIO reset) is now the default — eliminates the SAS-link drop / reboot the VFIO path caused. `VfioI2cSbrTransport` retained as a lockdown-kernel fallback. Cites lsirec.c:205-213.
+
 ### Fixed
 - sbr read: corrected inverted I2C ACK polarity (checked `if !i2c_getbit()`; ACK = SDA pulled LOW = getbit()==false, so we errored exactly when the EEPROM ACKed). With this + the volatile-MMIO + chip-memory-window fixes, `sbr read` now reads the real 256-byte SBR on dev-1 hardware, byte-identical to `lsirec readsbr` (sha `fede2809...`). Cites lsirec.c lsi_i2c_read_sbr ACK checks.
 - i2c.rs used non-volatile byte-wise BAR1 access; chip registers only latch on 32-bit volatile access, so diag-unlock/DCR never worked → wrong EEPROM addr/type. Now uses doorbell::read32/write32 (volatile u32) throughout. Cites `src/mpi/doorbell.rs:248-259` pattern (lsirec.c:89-97).

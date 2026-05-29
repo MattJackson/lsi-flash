@@ -456,19 +456,33 @@ impl Card for MptCard {
     /// - IOCStatus at offset 0x0E (U16 LE) — 0 = SUCCESS
     /// - IstwiStatus at offset 0x16 (U8)
     ///
-    /// Transport: uses VfioI2cSbrTransport (VFIO+I²C bit-bang via BAR1).
+    /// Transport: uses Bar1MmapSbrTransport (DIRECT BAR1 mmap, NO VFIO RESET).
+    /// Direct `/sys/.../resource1` mmap via lsirec-style pattern — unbinds mpt3sas
+    /// briefly (~1s blip), reads SBR via I²C bit-bang on BAR1, rebinds on Drop.
+    /// NO device reset → SAS PHY links stay up (no reboot required).
+    ///
+    /// Fallback: VfioI2cSbrTransport retained for kernel-lockdown / SecureBoot
+    /// systems where raw resource1 mmap is blocked. NOT the default due to
+    /// disk yank / reboot cost of VFIO bind dance.
     fn sbr_read(&mut self) -> Result<[u8; 256], CardError> {
-        use crate::sbr::transport::{SbrTransport, VfioI2cSbrTransport};
+        use crate::sbr::transport::{Bar1MmapSbrTransport, SbrTransport};
 
-        // Today: VFIO+I²C bit-bang is the only working path.
-        // When IstwiSbrTransport's wire format is solved (DevIndex/Action for SAS2008),
-        // change this to try ISTWI first (no disk yank) and fall back to VFIO on failure.
-        let mut t = VfioI2cSbrTransport::open(&self.identity.bdf)
+        // PRIMARY: direct BAR1 mmap (lsirec.c:205-213 style). NO VFIO, NO reset.
+        let mut t = Bar1MmapSbrTransport::open(&self.identity.bdf)
             .map_err(|e| CardError::Transport(format!("sbr transport: {}", e)))?;
         let bytes = t
             .read_sbr()
             .map_err(|e| CardError::Transport(format!("sbr {}: {}", t.name(), e)))?;
         Ok(bytes)
+
+        /* Fallback (kernel-lockdown / SecureBoot): uncomment if resource1 mmap fails:
+        use crate::sbr::transport::{SbrTransport, VfioI2cSbrTransport};
+        let mut t = VfioI2cSbrTransport::open(&self.identity.bdf)
+            .map_err(|e| CardError::Transport(format!("vfio fallback sbr transport: {}", e)))?;
+        let bytes = t.read_sbr()
+            .map_err(|e| CardError::Transport(format!("sbr {}: {}", t.name(), e)))?;
+        Ok(bytes)
+        */
     }
 }
 
