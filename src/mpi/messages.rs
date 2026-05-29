@@ -825,68 +825,54 @@ pub struct ConfigRequest<'a> {
 impl ConfigRequest<'_> {
     /// Serialize CONFIG request to wire format.
     ///
-    /// Returns ~32 bytes: header + body + SGE for page buffer.
-    pub fn serialize_to(&self, smid: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40);
+    /// `MPI2_CONFIG_REQUEST` (mpi2_cnfg.h:330-348) IS the wire frame — there is
+    /// NO separate preceding `MPI2_REQUEST_HEADER`. `Action` is at offset 0x00,
+    /// `Function` at 0x03, the page Header at 0x14, PageAddress at 0x18, and the
+    /// PageBufferSGE at 0x1C. Returns 0x2C bytes (header + 16-byte SGE slot).
+    ///
+    /// Hardware bug fixed 2026-05-29 (dev-1): the prior version prepended a
+    /// 10-byte generic header, shifting the page Header from 0x14 → 0x1A so the
+    /// chip read PageType from a zero byte and returned the type-0 page for
+    /// every request (`requested 9/0 got 0/0`). Same class as the FwUpload
+    /// ImageType=0 bug. `_smid` is unused: on the mpt3ctl kernel path the driver
+    /// assigns the SMID/MsgContext; CONFIG has no SMID field at 0x04 (that is
+    /// ExtPageLength). The SGE bytes are a placeholder the kernel overwrites at
+    /// `data_sge_offset_words` (= 7 = 0x1C/4); callers MUST pass 7.
+    pub fn serialize_to(&self, _smid: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(0x2C);
 
-        // MPI2_REQUEST_HEADER (10 bytes) — mpi-overview.md §1.2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // FunctionDependent1
-        buf.push(0x00); // ChainOffset
-        buf.push(MpiFunction::Config.as_u8()); // Function = 0x04
-        buf.extend_from_slice(&smid.to_le_bytes()); // FunctionDependent2 (SMID)
-        buf.push(0x00); // FunctionDependent3
+        buf.push(self.action); // 0x00 Action — mpi2_cnfg.h:332
+        buf.push(self.sgl_flags); // 0x01 SGLFlags
+        buf.push(0x00); // 0x02 ChainOffset
+        buf.push(MpiFunction::Config.as_u8()); // 0x03 Function = 0x04
 
-        let msg_flags = 0x00;
-        buf.push(msg_flags);
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x04 ExtPageLength (IOC fills on ext reply)
+        buf.push(self.ext_page_type.unwrap_or(0x00)); // 0x06 ExtPageType
+        buf.push(0x00); // 0x07 MsgFlags
+        buf.push(0x00); // 0x08 VP_ID
+        buf.push(0x00); // 0x09 VF_ID
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x0A Reserved1
+        buf.push(0x00); // 0x0C Reserved2
+        buf.push(0x00); // 0x0D ProxyVF_ID
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0x0E Reserved4
+        buf.extend_from_slice(&0u32.to_le_bytes()); // 0x10 Reserved3
 
-        // MPI2_CONFIG_REQUEST body (22 bytes) — toolbox-and-config.md §6.1
-        buf.push(self.action); // Action field
-        buf.push(self.sgl_flags); // SGLFlags
+        // 0x14 MPI2_CONFIG_PAGE_HEADER (mpi2_cnfg.h:158-165)
+        buf.push(0x00); // 0x14 PageVersion (IOC fills on reply)
+        buf.push((self.payload_buffer.len() / 4) as u8); // 0x15 PageLength (in 4-byte words)
+        buf.push(self.page_number); // 0x16 PageNumber
+        buf.push(self.page_type); // 0x17 PageType
 
-        buf.extend_from_slice(&0u16.to_le_bytes()); // ExtPageLength (0 unless ext page)
-
-        if let Some(ext_type) = self.ext_page_type {
-            buf.push(ext_type); // ExtPageType
-        } else {
-            buf.push(0x00); // No extended page type
-        }
-
-        buf.push(msg_flags); // MsgFlags
-        buf.push(0x00); // VP_ID
-        buf.push(0x00); // VF_ID
-
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved1
-        buf.push(0x00); // Reserved2
-        buf.push(0x00); // ProxyVF_ID (not used)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved4
-
-        // Page header (4 bytes) — toolbox-and-config.md §6.2
-        // Offset 0x14: MPI2_CONFIG_PAGE_HEADER per mpi2_cnfg.h:346
-        buf.push(0x00); // PageVersion (IOC will fill on reply)
-        buf.push(self.payload_buffer.len() as u8); // PageLength (request max size)
-        buf.push(self.page_number); // PageNumber at offset 0x16
-        buf.push(self.page_type); // PageType at offset 0x17
-
-        // PageAddress (4 bytes) — mpi2_cnfg.h:347, offset 0x18.
-        // For plain pages (Manufacturing/IO Unit/IOC/BIOS), PageAddress MUST be 0.
-        // The page type+number live in the page header at 0x14-0x17.
-        // PageAddress is only nonzero for "addressed" pages with FORM/handle:
-        //   - RAID Volume: mpi2_cnfg.h:238-246 (HANDLE or GET_NEXT_HANDLE)
-        //   - SAS Device: mpi2_cnfg.h:267-275 (HANDLE or GET_NEXT_HANDLE)
-        //   - SAS Expander: mpi2_cnfg.h:257-265 (HNDL/PHY_NUM or GET_NEXT_HNDL)
-        // See mpi2_cnfg.h:237-298 for all PageAddress format encodings.
+        // 0x18 PageAddress — mpi2_cnfg.h:347. MUST be 0 for plain pages
+        // (Manufacturing/IO Unit/IOC/BIOS); nonzero only for "addressed" pages
+        // with a FORM/handle (RAID Volume / SAS Device / SAS Expander),
+        // mpi2_cnfg.h:237-298.
         buf.extend_from_slice(&self.page_address.to_le_bytes());
 
-        // SGE for page buffer (16 bytes IEEE format) — toolbox-and-config.md §6.5
-        let sge = IeeeSgeSimple64::with_flags(
-            self.payload_buffer.as_ptr() as u64,
-            self.payload_buffer.len().min(256) as u32, // Conservative max for header read
-            0xC0, // END_OF_LIST + IOC_TO_HOST (reading from IOC)
-        );
-        sge.serialize_to(&mut buf);
+        // 0x1C PageBufferSGE — placeholder; the mpt3ctl kernel path overwrites
+        // this with its own bounce-buffer SGE at data_sge_offset_words=7. 16
+        // zero bytes so the user buffer has room for the kernel-inserted SGE.
+        buf.extend_from_slice(&[0u8; 16]);
 
         buf
     }
@@ -2275,15 +2261,14 @@ mod tests {
 
         let bytes = req.serialize_to(1);
 
-        // Function at offset 0x03 should be 0x04 (CONFIG)
-        assert_eq!(bytes[3], MpiFunction::Config.as_u8());
-
-        // Action field at body start (offset 12)
-        assert_eq!(bytes[12], 0x01);
-
-        // PageNumber and PageType in page header section (offsets 28-29)
-        assert_eq!(bytes[28], 5); // PageNumber
-        assert_eq!(bytes[29], 0x09); // PageType (MANUFACTURING)
+        // MPI2_CONFIG_REQUEST is the wire frame (no preceding header):
+        // Action@0x00, Function@0x03, PageHeader@0x14 (Num@0x16, Type@0x17),
+        // PageAddress@0x18, SGE@0x1C. Total 0x2C bytes.
+        assert_eq!(bytes[0x00], 0x01); // Action = READ_CURRENT
+        assert_eq!(bytes[0x03], MpiFunction::Config.as_u8()); // Function = CONFIG (0x04)
+        assert_eq!(bytes[0x16], 5); // PageNumber
+        assert_eq!(bytes[0x17], 0x09); // PageType (MANUFACTURING)
+        assert_eq!(bytes.len(), 0x2C); // header (0x1C) + 16-byte SGE slot
     }
 
     // ========================================================================

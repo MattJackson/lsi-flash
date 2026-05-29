@@ -181,7 +181,7 @@ pub fn read_config_page(
     let mut reply_buf = [0u8; 256]; // generous for CONFIG reply (26 bytes base)
 
     transport
-        .send_with_sge_offset(&req_bytes, 32 / 4, &mut reply_buf, None, None)
+        .send_with_sge_offset(&req_bytes, 7, &mut reply_buf, None, None)
         .map_err(|e| format!("send PAGE_HEADER failed: {}", e))?;
 
     let reply_header =
@@ -226,13 +226,7 @@ pub fn read_config_page(
 
     let req_bytes = req_read.serialize_to(2);
     transport
-        .send_with_sge_offset(
-            &req_bytes,
-            32 / 4,
-            &mut reply_buf,
-            None,
-            Some(&mut page_buf),
-        )
+        .send_with_sge_offset(&req_bytes, 7, &mut reply_buf, Some(&mut page_buf), None)
         .map_err(|e| format!("send READ_CURRENT failed: {}", e))?;
 
     let reply_data =
@@ -540,14 +534,14 @@ mod tests {
 
         let wire = req.serialize_to(1);
 
-        // Wire format: header (10B) + body (~20B before PageHeader) + SGE = ~46 bytes total
-        // Based on actual serialization:
-        //   Offset 26-29: PageHeader (version, length, number, type)
-        //   Offset 30-33: PageAddress
+        // MPI2_CONFIG_REQUEST (no preceding header): Action@0x00, Function@0x03,
+        // PageHeader@0x14 (Ver,Len,Num,Type at 0x14..0x17), PageAddress@0x18.
+        assert_eq!(wire[0x00], 0x01, "Action READ_CURRENT at offset 0x00");
+        assert_eq!(wire[0x03], 0x04, "Function CONFIG (0x04) at offset 0x03");
+        assert_eq!(wire[0x16], 0x00, "PageNumber at offset 0x16");
+        assert_eq!(wire[0x17], 0x09, "PageType manufacturing (0x09) at offset 0x17");
 
-        assert_eq!(wire[29], 0x09, "PageType should be manufacturing (0x09)");
-
-        let page_addr = u32::from_le_bytes([wire[30], wire[31], wire[32], wire[33]]);
+        let page_addr = u32::from_le_bytes([wire[0x18], wire[0x19], wire[0x1A], wire[0x1B]]);
         assert_eq!(
             page_addr, 0x0000_0000,
             "PageAddress must be 0 for plain pages per mpi2_cnfg.h:347"
@@ -575,8 +569,8 @@ mod tests {
 
         let wire = req.serialize_to(1);
 
-        // PageAddress at byte index 30-33 in wire format (offsets 0x1E-0x21 from body start)
-        let page_addr = u32::from_le_bytes([wire[30], wire[31], wire[32], wire[33]]);
+        // PageAddress at offset 0x18 (mpi2_cnfg.h:347).
+        let page_addr = u32::from_le_bytes([wire[0x18], wire[0x19], wire[0x1A], wire[0x1B]]);
 
         assert_eq!(
             page_addr, 0x1000_1234,
@@ -621,17 +615,15 @@ mod tests {
             let len = std::cmp::min(reply.len(), self.reply_buffer.len());
             reply[..len].copy_from_slice(&self.reply_buffer[..len]);
 
-            // Echo payload back in data_out if provided (for READ_CURRENT)
-            if let Some(out_buf) = data_out {
-                let page_len_words = self.reply_buffer[21] as usize;
-                let page_len_bytes = page_len_words * 4;
-                let len = out_buf.len().min(page_len_bytes);
-                out_buf[..len].fill(0xAA); // canned page data
+            // READ_CURRENT page data flows IOC→host via data_in (mirrors FW_UPLOAD).
+            if let Some(in_buf) = data_in {
+                let page_len_bytes = self.reply_buffer[21] as usize * 4;
+                let len = in_buf.len().min(page_len_bytes);
+                in_buf[..len].fill(0xAA); // canned page data
             }
 
-            if let Some(_in_buf) = data_in {
-                // PAGE_HEADER doesn't use data_in, just ignore
-            }
+            // CONFIG reads never use data_out (that is host→IOC, e.g. FW_DOWNLOAD).
+            debug_assert!(data_out.is_none(), "CONFIG read must not use data_out");
 
             Ok(len)
         }
