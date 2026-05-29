@@ -342,6 +342,111 @@ pub fn run_read(
     Ok(())
 }
 
+/// Run `config dump` subcommand — enumerate every config page that exists.
+///
+/// Probes the known (type, number) space; pages that don't exist return a
+/// non-Success IOCStatus from `read_config_page` (INVALID_PAGE/INVALID_TYPE)
+/// and are skipped silently. Surfaces Manufacturing Page 43 (ISTWI device
+/// table) and everything else the card exposes.
+///
+/// NOTE: extended pages (type 0x0F, e.g. FLASH_LAYOUT 0x14) use an 8-byte
+/// ExtPageHeader; `read_config_page`/`PageHeader::parse` currently assume the
+/// 4-byte standard header, so extended results here are best-effort and may be
+/// length-truncated. Standard pages (Manufacturing/IO-Unit/IOC/BIOS) are exact.
+pub fn run_dump(bdf: String, json_flag: bool) -> Result<(), crate::Error> {
+    use crate::mpt::Mpt3CtlTransport;
+
+    let mut transport = Mpt3CtlTransport::open(&bdf)
+        .map_err(|e| crate::Error::Other(format!("mpt3ctl open: {}", e)))?;
+
+    // Standard (type, max_number) probe space — generous upper bounds.
+    // Cites mpi2_cnfg.h:207-213 for the page-type values.
+    let standard: &[(u8, u8)] = &[
+        (0x00, 15), // IO Unit
+        (0x01, 15), // IOC
+        (0x02, 7),  // BIOS
+        (0x08, 3),  // RAID Volume
+        (0x09, 63), // Manufacturing (incl. Man Page 43 = ISTWI device table)
+        (0x0A, 2),  // RAID PhysDisk
+    ];
+    // Extended page types (under type 0x0F) — best-effort (see NOTE above).
+    let ext_types: &[u8] = &[0x10, 0x12, 0x13, 0x14];
+
+    let mut entries: Vec<ConfigDumpEntry> = Vec::new();
+
+    for &(pt, max_num) in standard {
+        for num in 0..=max_num {
+            if let Ok(page) = read_config_page(&mut transport, pt, num, None, 0) {
+                entries.push(ConfigDumpEntry {
+                    page_type: pt,
+                    page_number: num,
+                    length: page.page_length.unwrap_or(0),
+                    ext_page_type: None,
+                    bytes_hex: Some(page.bytes_hex),
+                });
+            }
+        }
+    }
+
+    for &et in ext_types {
+        for num in 0..=3u8 {
+            if let Ok(page) = read_config_page(&mut transport, 0x0F, num, Some(et), 0) {
+                entries.push(ConfigDumpEntry {
+                    page_type: 0x0F,
+                    page_number: num,
+                    length: page.page_length.unwrap_or(0),
+                    ext_page_type: Some(et),
+                    bytes_hex: Some(page.bytes_hex),
+                });
+            }
+        }
+    }
+
+    if json_flag {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        println!("Config page inventory — {} pages found:", entries.len());
+        println!("  {:<16} {:>6} {:>8}  EXT", "TYPE", "NUMBER", "LEN(w)");
+        for e in &entries {
+            let ext = e
+                .ext_page_type
+                .map(|x| format!("0x{:02X}", x))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<16} {:>6} {:>8}  {}",
+                page_type_name(e.page_type),
+                e.page_number,
+                e.length,
+                ext
+            );
+        }
+        println!();
+        for e in &entries {
+            let ext_str = e
+                .ext_page_type
+                .map(|x| format!(" ext=0x{:02X}", x))
+                .unwrap_or_default();
+            println!(
+                "== {}#{}{} (len={} words) ==",
+                page_type_name(e.page_type),
+                e.page_number,
+                ext_str,
+                e.length
+            );
+            if let Some(hex_s) = &e.bytes_hex {
+                let bytes = hex::decode(hex_s).unwrap_or_default();
+                for (i, chunk) in bytes.chunks(16).enumerate() {
+                    let hexs: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+                    println!("  {:04x}: {}", i * 16, hexs);
+                }
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
 /// Config subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigSubCommand {
@@ -365,9 +470,7 @@ pub fn run(bdf: String, _sub: ConfigSubCommand) -> Result<(), crate::Error> {
             args.page_address,
             args.json,
         ),
-        ConfigSubCommand::Dump(_) => Err(crate::Error::Other(
-            "config dump not yet implemented".to_string(),
-        )),
+        ConfigSubCommand::Dump(args) => run_dump(bdf, args.json),
     }
 }
 
