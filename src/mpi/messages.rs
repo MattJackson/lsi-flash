@@ -327,8 +327,14 @@ impl IocStatus {
     }
 
     /// Parse raw u16 into IocStatus enum. Returns UnknownIocStatus for undefined codes.
+    ///
+    /// Bit 15 (0x8000) is `MPI2_IOCSTATUS_FLAG_LOG_INFO_AVAILABLE` — a flag, not
+    /// part of the status code. The real status is bits 0-14
+    /// (`MPI2_IOCSTATUS_MASK = 0x7FFF`). dev-1 returned 0x8022 for a missing
+    /// config page (LOG_INFO | CONFIG_INVALID_PAGE); without masking, that
+    /// decoded as UnknownIocStatus instead of the real ConfigInvalidPage.
     pub fn from_u16(raw: u16) -> Result<Self, MpiError> {
-        match raw {
+        match raw & 0x7FFF {
             0x0000 => Ok(Self::Success),
             0x0001 => Ok(Self::InvalidFunction),
             0x0002 => Ok(Self::Busy),
