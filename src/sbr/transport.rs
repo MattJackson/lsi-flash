@@ -72,13 +72,60 @@ pub struct IstwiSbrTransport {
 
 impl SbrTransport for IstwiSbrTransport {
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError> {
-        // TODO(istwi): chip returns IOCStatus 0x8004 (INTERNAL_ERROR) with
-        // DevIndex=0, Action=READ_DATA(0x01), TxDataLength=0, RxDataLength=256.
-        Err(SbrTransportError::NotImplemented(
-            "istwi: SAS2008 DevIndex/Action combo unsolved; chip returns INTERNAL_ERROR",
-        ))
+        // ATTEMPT A — MPI **1.x** ToolboxIstwiReadWrite layout (mpi_tool.h:150-173),
+        // which carries the slave address + offset that the MPI 2.0 struct lacks.
+        // The 2.0 DevIndex/Action form returned IOCStatus 0x8004 because it cannot
+        // express "slave 0x54, write 2-byte offset, read 256". Per
+        // 04-mpi-protocol/istwi-sbr-wire-format.md. Mirrors lsiutil.c:22881-22890
+        // (SFP read: same struct, DeviceAddr=0xa0/NumAddressBytes=1).
+        //
+        // Fixed request frame = 28 bytes (0x00..0x1C); SGL appended at word 7.
+        let mut req = [0u8; 0x1C];
+        req[0x00] = 0x03; // Tool = MPI_TOOLBOX_ISTWI_READ_WRITE_TOOL (mpi_tool.h:37)
+        req[0x03] = 0x17; // Function = MPI_FUNCTION_TOOLBOX (mpi.h:294)
+        req[0x0C] = 0x01; // Flags = MPI_TB_ISTWI_FLAGS_READ (mpi_tool.h:176)
+        req[0x0D] = 0x00; // BusNum = 0
+        req[0x10] = 0x02; // NumAddressBytes = 2 (16-bit EEPROM offset)
+        req[0x12..0x14].copy_from_slice(&256u16.to_le_bytes()); // DataLength
+        req[0x14] = 0xA8; // DeviceAddr = slave 0x54 << 1 (8-bit bus byte)
+        req[0x15] = 0x00; // Addr1 = offset hi
+        req[0x16] = 0x00; // Addr2 = offset lo
 
-        /* Wire-format research from src/card/mpt.rs::sbr_read (commit 8fd35ff): */
+        let mut data_in = vec![0u8; 256]; // IOC → host SBR bytes
+        let mut reply = [0u8; 64];
+        let n = self
+            .transport
+            .send_with_sge_offset(&req, 7, &mut reply, Some(&mut data_in), None)
+            .map_err(|e| SbrTransportError::Transport(format!("istwi send: {}", e)))?;
+
+        // Reply: IOCStatus @ 0x0E (U16 LE), IOCLogInfo @ 0x10 (U32 LE) (mpi_tool.h:57-58).
+        let ioc_status = if n >= 0x10 {
+            u16::from_le_bytes([reply[0x0E], reply[0x0F]])
+        } else {
+            0xFFFF
+        };
+        let ioc_log_info = if n >= 0x14 {
+            u32::from_le_bytes([reply[0x10], reply[0x11], reply[0x12], reply[0x13]])
+        } else {
+            0
+        };
+        // IstwiStatus byte (MPI2 reply @0x16; capture for diagnosis if present).
+        let istwi_status = if n > 0x16 { reply[0x16] } else { 0 };
+
+        if ioc_status & 0x7FFF != 0 {
+            return Err(SbrTransportError::Transport(format!(
+                "istwi: IOCStatus=0x{:04x} IOCLogInfo=0x{:08x} IstwiStatus=0x{:02x} \
+                 (reply[0..24]={:02x?})",
+                ioc_status,
+                ioc_log_info,
+                istwi_status,
+                &reply[..24.min(n)]
+            )));
+        }
+
+        let mut arr = [0u8; 256];
+        arr.copy_from_slice(&data_in);
+        Ok(arr)
     }
 
     fn name(&self) -> &'static str {

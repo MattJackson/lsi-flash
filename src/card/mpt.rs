@@ -467,6 +467,32 @@ impl Card for MptCard {
     fn sbr_read(&mut self) -> Result<[u8; 256], CardError> {
         use crate::sbr::transport::{Bar1MmapSbrTransport, SbrTransport};
 
+        // Transport override for experimentation: LSI_SBR_TRANSPORT=istwi|vfio
+        // (default = bar1-mmap). ISTWI is kernel-mediated (mpt3sas stays bound,
+        // no disk disruption) — used to prove out the zero-disruption path.
+        match std::env::var("LSI_SBR_TRANSPORT").as_deref() {
+            Ok("istwi") => {
+                use crate::sbr::transport::IstwiSbrTransport;
+                let transport = crate::mpt::Mpt3CtlTransport::open(&self.identity.bdf)
+                    .map_err(|e| CardError::Transport(format!("istwi mpt3ctl open: {}", e)))?;
+                let mut t = IstwiSbrTransport {
+                    transport: Box::new(transport),
+                };
+                return t
+                    .read_sbr()
+                    .map_err(|e| CardError::Transport(format!("sbr {}: {}", t.name(), e)));
+            }
+            Ok("vfio") => {
+                use crate::sbr::transport::VfioI2cSbrTransport;
+                let mut t = VfioI2cSbrTransport::open(&self.identity.bdf)
+                    .map_err(|e| CardError::Transport(format!("vfio sbr transport: {}", e)))?;
+                return t
+                    .read_sbr()
+                    .map_err(|e| CardError::Transport(format!("sbr {}: {}", t.name(), e)));
+            }
+            _ => {}
+        }
+
         // PRIMARY: direct BAR1 mmap (lsirec.c:205-213 style). NO VFIO, NO reset.
         let mut t = Bar1MmapSbrTransport::open(&self.identity.bdf)
             .map_err(|e| CardError::Transport(format!("sbr transport: {}", e)))?;
