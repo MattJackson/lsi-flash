@@ -9,6 +9,7 @@ pub mod config;
 pub mod detect;
 pub mod erase;
 pub mod flash;
+pub mod fw;
 pub mod recover;
 pub mod region;
 pub mod safety;
@@ -283,13 +284,9 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             FwCommand::Write(a) => {
                 let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
                     .map_err(|e| crate::Error::Other(format!("{}", e)))?;
-                region::run_write(
-                    bdf,
-                    crate::mpi::messages::ImageType::Fw,
-                    "fw",
-                    &a.from_file,
-                    a.yes,
-                )
+                // fw write goes through the validated, wizard-style path (5-point
+                // gate); bios/nvdata stay on the raw region writer.
+                fw::run_write(bdf, &a.from_file, a.yes)
             }
             FwCommand::ReversePhy { input, output } => {
                 let data = std::fs::read(&input)?;

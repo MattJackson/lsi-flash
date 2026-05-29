@@ -73,6 +73,9 @@ pub enum FwError {
 
     #[error("Invalid firmware signature2 (expected 0x{expected:08X}, got 0x{got:08X})")]
     InvalidSignature2 { expected: u32, got: u32 },
+
+    #[error("No FLASH_LAYOUT extended image found in firmware")]
+    NoFlashLayout,
 }
 
 /// Parse firmware header from binary. Cites mpi2_ioc.h + golden file test.
@@ -165,6 +168,29 @@ pub fn parse_fw_header(data: &[u8]) -> Result<FwHeader, FwError> {
                 .unwrap(),
         ),
     })
+}
+
+/// Verify the firmware's file-level U32 checksum: the sum of all little-endian
+/// U32 words over `ImageSize` must equal 0 (mod 2^32). Empirically confirmed
+/// across the SAS2008 corpus (lsi-flash-notes/02-hardware/flash-regions.md,
+/// 2026-05-29). Inverse of `synthesize::fix_file_checksum`. Returns false on a
+/// malformed header or a truncated image (fail-closed).
+pub fn verify_file_checksum(data: &[u8]) -> bool {
+    let hdr = match parse_fw_header(data) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let n = (hdr.image_size as usize) / 4;
+    if n == 0 || n * 4 > data.len() {
+        return false;
+    }
+    let mut sum: u32 = 0;
+    for i in 0..n {
+        sum = sum.wrapping_add(u32::from_le_bytes(
+            data[i * 4..i * 4 + 4].try_into().unwrap(),
+        ));
+    }
+    sum == 0
 }
 
 /// Inspect firmware file and print human-readable info.
