@@ -27,8 +27,10 @@ pub struct Cli {
     pub json: bool,
 
     /// Disambiguate which card to operate on (e.g. `0000:03:00.0`).
-    /// Required only when multiple SAS2008 cards are present.
-    #[arg(long, global = true, value_name = "BDF")]
+    /// Required only when multiple SAS2008 cards are present. The impossible
+    /// sentinel `-1:-1:-1:-1` explicitly selects the synthetic mock backend.
+    /// `allow_hyphen_values` lets the sentinel be passed as `--pci -1:-1:-1:-1`.
+    #[arg(long, global = true, value_name = "BDF", allow_hyphen_values = true)]
     pub pci: Option<String>,
 }
 
