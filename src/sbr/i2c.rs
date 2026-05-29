@@ -251,20 +251,8 @@ fn unlock_diag(bar1: &mut [u8]) -> Result<(), I2cError> {
 
     // If the unlock took (write-enable set), enable diag read/write. Cites lsirec.c:145-148.
     let diag = read32(bar1, MPI2_DIAG_OFFSET as u32);
-    eprintln!(
-        "[i2c-debug] DIAG after WRSEQ = 0x{:08x} (WRITE_ENABLE={}, RW_ENABLE={})",
-        diag,
-        diag & MPI2_DIAG_WRITE_ENABLE != 0,
-        diag & MPI2_DIAG_RW_ENABLE != 0
-    );
     if diag & MPI2_DIAG_WRITE_ENABLE != 0 {
         write32(bar1, MPI2_DIAG_OFFSET as u32, diag | MPI2_DIAG_RW_ENABLE);
-        let diag2 = read32(bar1, MPI2_DIAG_OFFSET as u32);
-        eprintln!("[i2c-debug] DIAG after RW_ENABLE write = 0x{:08x}", diag2);
-    } else {
-        eprintln!(
-            "[i2c-debug] WRITE_ENABLE NOT set after unlock — diag RW NOT enabled; chip-memory (I2C pins) access will read/write garbage"
-        );
     }
     Ok(())
 }
@@ -328,19 +316,6 @@ pub fn i2c_init(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     i2c_stop(ctx.bar1);
     i2c_start(ctx.bar1);
     i2c_stop(ctx.bar1);
-
-    // [i2c-debug] live register readback to compare against `lsirec info`.
-    let dcr_cfg = dcr_read32(ctx.bar1, DCR_SBR_CONFIG)?;
-    let dcr_sel = dcr_read32(ctx.bar1, DCR_I2C_SELECT)?;
-    let pins = chip_read32(ctx.bar1, CHIP_I2C_PINS);
-    eprintln!(
-        "[i2c-debug] DCR_SBR_CONFIG=0x{:08x} DCR_I2C_SELECT=0x{:08x} CHIP_I2C_PINS=0x{:08x} (SCL_RD={}, SDA_RD={})",
-        dcr_cfg,
-        dcr_sel,
-        pins,
-        pins & CHIP_I2C_SCL_RD != 0,
-        pins & CHIP_I2C_SDA_RD != 0
-    );
 
     Ok(())
 }
