@@ -100,15 +100,18 @@ impl VfioI2cSbrTransport {
 
 impl SbrTransport for VfioI2cSbrTransport {
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError> {
-        use crate::sbr::i2c::{i2c_read_sbr, I2cContext};
+        use crate::sbr::i2c::{i2c_close, i2c_init, i2c_read_sbr, I2cContext};
 
         // Use live BAR1 slice directly (no copy).
-        let bar1_slice = self.vfio.bar1();
+        let bar1 = self.vfio.bar1();
         let mut ctx = I2cContext {
-            bar1: bar1_slice,
-            sbr_addr: 0x50,
+            bar1,
+            sbr_addr: 0,
             eep_type: 0,
         };
+
+        // Auto-detect EEPROM address/type via i2c_init (lsirec.c:498-524).
+        i2c_init(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_init: {}", e)))?;
 
         // Call i2c_read_sbr directly (src/sbr/i2c.rs).
         let bytes = i2c_read_sbr(&mut ctx, 0, 256)
@@ -123,6 +126,10 @@ impl SbrTransport for VfioI2cSbrTransport {
 
         let mut arr = [0u8; 256];
         arr.copy_from_slice(&bytes);
+
+        // Best-effort restore of DCR_I2C_SELECT (lsirec.c:535-549).
+        let _ = i2c_close(&mut ctx);
+
         Ok(arr)
     }
 

@@ -1,11 +1,18 @@
 //! I2C bit-bang module for EEPROM access.
 //! Port of lsirec.c:392-629 (i2c_delay through lsi_i2c_write_sbr).
+//! Cites: references/upstream/lsirec-marcan/lsirec.c:40-41, 113-122 (DCR_ADDRESS/DATA for BAR1 register access)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:56-57 (DCR_I2C_SELECT, DCR_SBR_CONFIG)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:59-65 (CHIP_I2C_BASE/PINS/RESET offsets and bit masks)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:67-68 (EEPROM_TYPE_16BIT, EEPROM_TYPE_8BIT)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:392-496 (bit-bang primitives)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:498-549 (i2c_init/close)
 //! Cites: references/upstream/lsirec-marcan/lsirec.c:551-629 (SBR read/write)
+
+/// DCR address register offset in BAR1. Cites lsirec.c:40, 113-117.
+const MPI2_DCR_ADDRESS: usize = 0x3c;
+
+/// DCR data register offset in BAR1. Cites lsirec.c:41, 113-117.
+const MPI2_DCR_DATA: usize = 0x38;
 
 /// DCR_I2C_SELECT register offset. Cites lsirec.c:56.
 pub const DCR_I2C_SELECT: u32 = 0x307;
@@ -60,6 +67,69 @@ pub struct I2cContext<'a> {
     pub bar1: &'a mut [u8], // live BAR1 view, NOT a copy (64 KB on real hardware)
     pub sbr_addr: u8,       // 0x50 or 0x54 (lsirec.c:502-507)
     pub eep_type: u8,       // EEPROM_TYPE_8BIT or EEPROM_TYPE_16BIT (lsirec.c:509-513)
+}
+
+/// DCR read32 helper. Cites lsirec.c:40-41, 113-117.
+/// Writes offset to MPI2_DCR_ADDRESS, reads value from MPI2_DCR_DATA.
+fn dcr_read32(bar1: &mut [u8], offset: u32) -> Result<u32, I2cError> {
+    if bar1.len() < MPI2_DCR_ADDRESS + 4 || bar1.len() < MPI2_DCR_DATA + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for DCR access (len={}, need at least {})",
+                bar1.len(),
+                MPI2_DCR_ADDRESS.max(MPI2_DCR_DATA) + 4
+            ),
+        )
+        .into());
+    }
+
+    // Write the DCR register offset to MPI2_DCR_ADDRESS.
+    let addr_bytes = offset.to_le_bytes();
+    bar1[MPI2_DCR_ADDRESS] = addr_bytes[0];
+    bar1[MPI2_DCR_ADDRESS + 1] = addr_bytes[1];
+    bar1[MPI2_DCR_ADDRESS + 2] = addr_bytes[2];
+    bar1[MPI2_DCR_ADDRESS + 3] = addr_bytes[3];
+
+    // Read the value from MPI2_DCR_DATA.
+    Ok(u32::from_le_bytes([
+        bar1[MPI2_DCR_DATA],
+        bar1[MPI2_DCR_DATA + 1],
+        bar1[MPI2_DCR_DATA + 2],
+        bar1[MPI2_DCR_DATA + 3],
+    ]))
+}
+
+/// DCR write32 helper. Cites lsirec.c:40-41, 113-117.
+/// Writes offset to MPI2_DCR_ADDRESS, writes data to MPI2_DCR_DATA.
+fn dcr_write32(bar1: &mut [u8], offset: u32, data: u32) -> Result<(), I2cError> {
+    if bar1.len() < MPI2_DCR_ADDRESS + 4 || bar1.len() < MPI2_DCR_DATA + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for DCR access (len={}, need at least {})",
+                bar1.len(),
+                MPI2_DCR_ADDRESS.max(MPI2_DCR_DATA) + 4
+            ),
+        )
+        .into());
+    }
+
+    // Write the DCR register offset to MPI2_DCR_ADDRESS.
+    let addr_bytes = offset.to_le_bytes();
+    bar1[MPI2_DCR_ADDRESS] = addr_bytes[0];
+    bar1[MPI2_DCR_ADDRESS + 1] = addr_bytes[1];
+    bar1[MPI2_DCR_ADDRESS + 2] = addr_bytes[2];
+    bar1[MPI2_DCR_ADDRESS + 3] = addr_bytes[3];
+
+    // Write the data value to MPI2_DCR_DATA.
+    let data_bytes = data.to_le_bytes();
+    bar1[MPI2_DCR_DATA] = data_bytes[0];
+    bar1[MPI2_DCR_DATA + 1] = data_bytes[1];
+    bar1[MPI2_DCR_DATA + 2] = data_bytes[2];
+    bar1[MPI2_DCR_DATA + 3] = data_bytes[3];
+
+    Ok(())
 }
 
 /// Delay for I2C timing. Cites lsirec.c:392-395.
@@ -237,14 +307,11 @@ fn i2c_getbyte(bar1: &mut [u8]) -> u8 {
     val
 }
 
-/// Initialize I2C interface. Cites lsirec.c:498-533.
-pub fn i2c_init(
-    ctx: &mut I2cContext<'_>,
-    dcr_read32_fn: impl Fn(u32) -> u32,
-    mut dcr_write32_fn: impl FnMut(u32, u32),
-) {
+/// Initialize I2C interface. Cites lsirec.c:498-533, 498-524 (addr/type detection).
+/// Returns Err on timeout if controller is wedged (bounded reset loop).
+pub fn i2c_init(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     // Read DCR_SBR_CONFIG to determine addr and type (lsirec.c:501-514).
-    let val = dcr_read32_fn(DCR_SBR_CONFIG);
+    let val = dcr_read32(ctx.bar1, DCR_SBR_CONFIG)?;
 
     if val & 2 != 0 {
         ctx.sbr_addr = 0x54; // 16-bit addressed EEPROM
@@ -262,11 +329,28 @@ pub fn i2c_init(
 
     // Reset I2C controller (lsirec.c:516-519).
     let offset = CHIP_I2C_RESET_OFFSET as usize;
-    ctx.bar1[offset] = 1;
-    ctx.bar1[offset + 1] = 0;
-    ctx.bar1[offset + 2] = 0;
-    ctx.bar1[offset + 3] = 0;
+    if ctx.bar1.len() < offset + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for I²C reset (len={}, need {})",
+                ctx.bar1.len(),
+                offset + 4
+            ),
+        )
+        .into());
+    }
+
+    // Reset loop with bounded iterations to prevent infinite hang (OPEN: wedged controller must error).
+    let mut iter = 0u32;
+    const MAX_RESET_ITERATIONS: u32 = 100_000;
+
     loop {
+        ctx.bar1[offset] = 1;
+        ctx.bar1[offset + 1] = 0;
+        ctx.bar1[offset + 2] = 0;
+        ctx.bar1[offset + 3] = 0;
+
         i2c_delay(ctx.bar1);
         let reset_val = u32::from_le_bytes([
             ctx.bar1[offset],
@@ -277,11 +361,22 @@ pub fn i2c_init(
         if reset_val & 1 == 0 {
             break;
         }
+
+        iter += 1;
+        if iter >= MAX_RESET_ITERATIONS {
+            return Err(I2cError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "I²C reset timeout after {} iterations (controller may be wedged)",
+                    MAX_RESET_ITERATIONS
+                ),
+            )));
+        }
     }
 
     // Enable I2C select in DCR (lsirec.c:521-524).
-    let val = dcr_read32_fn(DCR_I2C_SELECT);
-    dcr_write32_fn(DCR_I2C_SELECT, val | 0x800000);
+    let val = dcr_read32(ctx.bar1, DCR_I2C_SELECT)?;
+    dcr_write32(ctx.bar1, DCR_I2C_SELECT, val | 0x800000)?;
 
     // Reset I2C lines (lsirec.c:526-531).
     for _ in 0..9 {
@@ -290,20 +385,36 @@ pub fn i2c_init(
     i2c_stop(ctx.bar1);
     i2c_start(ctx.bar1);
     i2c_stop(ctx.bar1);
+
+    Ok(())
 }
 
 /// Close I2C interface. Cites lsirec.c:535-549.
-pub fn i2c_close(
-    ctx: &mut I2cContext<'_>,
-    dcr_read32_fn: impl Fn(u32) -> u32,
-    mut dcr_write32_fn: impl FnMut(u32, u32),
-) {
+pub fn i2c_close(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     let offset = CHIP_I2C_RESET_OFFSET as usize;
-    ctx.bar1[offset] = 1;
-    ctx.bar1[offset + 1] = 0;
-    ctx.bar1[offset + 2] = 0;
-    ctx.bar1[offset + 3] = 0;
+
+    if ctx.bar1.len() < offset + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bar1 slice too small for I²C reset (len={}, need {})",
+                ctx.bar1.len(),
+                offset + 4
+            ),
+        )
+        .into());
+    }
+
+    // Reset loop with bounded iterations to prevent infinite hang.
+    let mut iter = 0u32;
+    const MAX_RESET_ITERATIONS: u32 = 100_000;
+
     loop {
+        ctx.bar1[offset] = 1;
+        ctx.bar1[offset + 1] = 0;
+        ctx.bar1[offset + 2] = 0;
+        ctx.bar1[offset + 3] = 0;
+
         i2c_delay(ctx.bar1);
         let reset_val = u32::from_le_bytes([
             ctx.bar1[offset],
@@ -314,10 +425,23 @@ pub fn i2c_close(
         if reset_val & 1 == 0 {
             break;
         }
+
+        iter += 1;
+        if iter >= MAX_RESET_ITERATIONS {
+            return Err(I2cError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "I²C reset timeout after {} iterations (controller may be wedged)",
+                    MAX_RESET_ITERATIONS
+                ),
+            )));
+        }
     }
 
-    let val = dcr_read32_fn(DCR_I2C_SELECT);
-    dcr_write32_fn(DCR_I2C_SELECT, val & !0x800000);
+    let val = dcr_read32(ctx.bar1, DCR_I2C_SELECT)?;
+    dcr_write32(ctx.bar1, DCR_I2C_SELECT, val & !0x800000)?;
+
+    Ok(())
 }
 
 /// Read SBR from EEPROM. Cites lsirec.c:551-589.
@@ -484,5 +608,59 @@ mod tests {
     fn test_i2c_delay_accepts_slice() {
         let bar1: &[u8] = &[0u8; 64];
         i2c_delay(bar1); // Should compile and run without panic
+    }
+
+    #[test]
+    fn test_dcr_read32_write32_roundtrip() {
+        let mut bar1 = vec![0u8; 0x100];
+
+        // Write offset to MPI2_DCR_ADDRESS (0x3c) and value to MPI2_DCR_DATA (0x38).
+        let test_offset: u32 = 0x12345678;
+        let test_value: u32 = 0xDEADBEEF;
+
+        dcr_write32(&mut bar1, test_offset, test_value).expect("dcr_write32 should succeed");
+
+        // Read it back.
+        let read_val = dcr_read32(&mut bar1, test_offset).expect("dcr_read32 should succeed");
+
+        assert_eq!(read_val, test_value, "DCR round-trip value mismatch");
+    }
+
+    #[test]
+    fn test_dcr_read32_write32_bounds_check() {
+        // Too small buffer for DCR access (need at least 0x3c + 4 = 64 bytes).
+        let mut bar1 = vec![0u8; 32];
+
+        let result = dcr_read32(&mut bar1, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bar1 slice too small for DCR access"));
+
+        let result = dcr_write32(&mut bar1, 0, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bar1 slice too small for DCR access"));
+    }
+
+    #[test]
+    fn test_dcr_read32_write32_multiple_values() {
+        let mut bar1 = vec![0u8; 0x100];
+
+        // Test multiple offset/value pairs.
+        let pairs = [
+            (0x00000000, 0x11111111),
+            (0xFFFFFFFF, 0xFEDCBA98),
+            (0x340, 0xC2100000), // DCR_SBR_CONFIG example
+        ];
+
+        for (offset, value) in pairs.iter() {
+            dcr_write32(&mut bar1, *offset, *value).expect("dcr_write32 should succeed");
+            let read_val = dcr_read32(&mut bar1, *offset).expect("dcr_read32 should succeed");
+            assert_eq!(
+                read_val, *value,
+                "DCR round-trip failed for offset 0x{:08X}",
+                offset
+            );
+        }
     }
 }
