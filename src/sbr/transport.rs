@@ -328,8 +328,39 @@ impl Drop for Bar1MmapSbrTransport {
             let _ = std::fs::write("/sys/bus/pci/drivers_probe", format!("{}\n", bdf));
         }
 
+        // Step 4: trigger a SCSI rescan so disks behind the HBA re-enumerate
+        // automatically (the rebind re-creates the scsi_host, but target
+        // discovery is not always immediate — without this, /dev/sdX needs a
+        // manual rescan). Best-effort; only meaningful when a driver was rebound.
+        if self.original_driver.is_some() {
+            trigger_scsi_rescan(bdf);
+        }
+
         // Note: We DO NOT panic if any step fails — Drop runs even on panic,
         // and logging via eprintln is the best we can do for recovery.
+    }
+}
+
+/// After rebinding the HBA driver, re-scan its SCSI host(s) so SAS targets
+/// (e.g. `/dev/sdb`) re-enumerate without a manual rescan or reboot. The host
+/// re-appears under `/sys/bus/pci/devices/<bdf>/host*/scsi_host/host*/scan`
+/// shortly after rebind; give it a brief settle, then write the rescan trigger.
+/// Best-effort — never errors out of Drop.
+fn trigger_scsi_rescan(bdf: &str) {
+    // The driver re-creates the scsi_host asynchronously after bind; wait briefly.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let dev_dir = format!("/sys/bus/pci/devices/{}", bdf);
+    let Ok(entries) = std::fs::read_dir(&dev_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(stripped) = name.strip_prefix("host") {
+            // .../host<N>/scsi_host/host<N>/scan  ("- - -" = scan all channels/targets/luns)
+            let scan = format!("{dev_dir}/host{stripped}/scsi_host/host{stripped}/scan");
+            let _ = std::fs::write(&scan, "- - -\n");
+        }
     }
 }
 
