@@ -19,6 +19,18 @@ use crate::card::{
 use crate::mpi::messages::{FwDownloadReply, FwUploadReply, ImageType, IocStatus, MpiFunction};
 use crate::mpt::{Mpt3CtlTransport, MptTransport};
 
+// --- MPI protocol constants (no magic numbers in the wire code below) ---
+
+/// FW_UPLOAD ImageType (ITYPE) values — mpi2_ioc.h:1244-1245.
+/// The chip holds two FW images; these select which one FW_UPLOAD returns.
+pub const FW_UPLOAD_ITYPE_FW_CURRENT: u8 = 0x00; // the running image (RAM)
+pub const FW_UPLOAD_ITYPE_FW_FLASH: u8 = 0x01; // the persisted copy in flash
+
+/// FW_DOWNLOAD MsgFlags: LAST_SEGMENT marks the final chunk — mpi2_ioc.h.
+const FW_DOWNLOAD_MSGFLAGS_LAST_SEGMENT: u8 = 0x01;
+/// FW_UPLOAD/DOWNLOAD bounce-buffer size (2 MB ≥ any SAS2008 region).
+const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
+
 /// `Card` impl for Fusion-MPT chips (SAS2008, SAS2208, SAS3008, etc.).
 /// Wraps a pluggable `MptTransport` per ADR-017.
 pub struct MptCard {
@@ -130,13 +142,17 @@ impl Card for MptCard {
     }
 
     fn read_region(&mut self, image_type: ImageType) -> Result<Vec<u8>, CardError> {
+        // For FW, as_u8()==0x01 == MPI2_FW_UPLOAD_ITYPE_FW_FLASH (the flash copy).
+        self.read_region_itype(image_type.as_u8())
+    }
+
+    fn read_region_itype(&mut self, itype: u8) -> Result<Vec<u8>, CardError> {
         // MPI 2.0 FW_UPLOAD: 20-byte header + 16-byte TCSGE (36 bytes), data SGE
         // inserted by the kernel at word 9. data_in is the IOC→host bounce buffer.
-        const UPLOAD_BUF_SIZE: usize = 2 * 1024 * 1024;
         let mut data_in = vec![0u8; UPLOAD_BUF_SIZE];
 
         let mut req = Vec::with_capacity(36);
-        req.push(image_type.as_u8()); // 0x00 ImageType
+        req.push(itype); // 0x00 ImageType (0x00=FW_CURRENT/running, 0x01=FW_FLASH)
         req.push(0x00); // 0x01 Reserved1
         req.push(0x00); // 0x02 ChainOffset
         req.push(MpiFunction::FwUpload.as_u8()); // 0x03 Function
@@ -161,15 +177,15 @@ impl Card for MptCard {
             .transport
             .send_with_sge_offset(&req, 9, &mut reply_buf, Some(&mut data_in), None)
             .map_err(|e| {
-                CardError::Transport(format!("FW_UPLOAD type={:?} send: {}", image_type, e))
+                CardError::Transport(format!("FW_UPLOAD itype=0x{:02x} send: {}", itype, e))
             })?;
         let reply = FwUploadReply::parse(&reply_buf[..n.min(reply_buf.len())]).map_err(|e| {
-            CardError::Transport(format!("FW_UPLOAD type={:?} parse: {}", image_type, e))
+            CardError::Transport(format!("FW_UPLOAD itype=0x{:02x} parse: {}", itype, e))
         })?;
         if reply.ioc_status != IocStatus::Success {
             return Err(CardError::Transport(format!(
-                "FW_UPLOAD type={:?} returned status 0x{:04x}",
-                image_type, reply.ioc_status as u16
+                "FW_UPLOAD itype=0x{:02x} returned status 0x{:04x}",
+                itype, reply.ioc_status as u16
             )));
         }
         let actual = (reply.actual_image_size as usize).min(data_in.len());
@@ -193,7 +209,11 @@ impl Card for MptCard {
             let mut req = [0u8; 36];
             req[0] = image_type.as_u8(); // 0x00 ImageType
             req[3] = MpiFunction::FwDownload.as_u8(); // 0x03 Function
-            req[7] = if last { 0x01 } else { 0x00 }; // 0x07 MsgFlags LAST_SEGMENT
+            req[7] = if last {
+                FW_DOWNLOAD_MSGFLAGS_LAST_SEGMENT
+            } else {
+                0
+            }; // 0x07 MsgFlags
             req[12..16].copy_from_slice(&total.to_le_bytes()); // 0x0C TotalImageSize
             req[22] = 0x0C; // 0x16 TCSGE DetailsLength=12
             req[28..32].copy_from_slice(&(offset as u32).to_le_bytes()); // 0x1C ImageOffset

@@ -15,7 +15,7 @@ pub mod region;
 pub mod safety;
 pub mod sbr;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Cross-flash LSI SAS2008-based HBAs.
 #[derive(Parser, Debug)]
@@ -169,11 +169,24 @@ pub enum Command {
     },
 }
 
+/// Args for `fw read` — flash copy by default, running image with `--running`.
+#[derive(Args, Debug)]
+pub struct FwReadArgs {
+    /// Output file for the raw region bytes. Default: stdout.
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<std::path::PathBuf>,
+    /// Read the RUNNING image (FW_CURRENT 0x00) instead of the flash copy
+    /// (FW_FLASH 0x01). They differ when a write is in flash but not yet booted.
+    #[arg(long)]
+    pub running: bool,
+}
+
 /// `fw` — firmware image region + offline manipulation.
 #[derive(Subcommand, Debug)]
 pub enum FwCommand {
-    /// Read the firmware region from the chip (FW_UPLOAD).
-    Read(region::RegionReadArgs),
+    /// Read the firmware region (FW_UPLOAD). Default = the flash copy
+    /// (FW_FLASH 0x01); `--running` = the running image (FW_CURRENT 0x00).
+    Read(FwReadArgs),
     /// Write the firmware region to the chip (FW_DOWNLOAD). DESTRUCTIVE — --yes.
     Write(region::RegionWriteArgs),
     /// Offline: synthesize a PHY-reversed firmware blob (Port 0↔7 / 1↔6 / 2↔5 / 3↔4).
@@ -200,6 +213,49 @@ pub enum DebugCommand {
         /// Also wipe Manufacturing pages (PERSIST_MANUFACT_PAGES). Default: off.
         #[arg(long)]
         wipe_mfg_pages: bool,
+    },
+
+    /// Read CHIP-INTERNAL memory via the DIAG RW window (IOC-free; works on a
+    /// faulted chip). For RE/diagnostics — hunt for firmware/NVDATA/MRAM in chip
+    /// address space (e.g. 0xC2100000 = I²C peripheral). Read-only.
+    ChipRead {
+        /// Chip-internal address (hex, e.g. 0xC2100000).
+        #[arg(long, value_name = "0xNNNNNNNN")]
+        addr: String,
+        /// Number of bytes to read.
+        #[arg(long, default_value = "256")]
+        len: usize,
+        /// Output file for raw bytes. Default: stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
+
+    /// SCAN the chip-internal bus: one 32-bit word at `addr + i*stride`, `count`
+    /// times, printing each line flushed. Maps the peripheral grid (e.g. around
+    /// the I²C block 0xC2100000) and pinpoints any address that hangs the bus
+    /// (the last printed line = the offender). IOC-free; works on a faulted chip.
+    ChipScan {
+        /// Base chip-internal address (hex, e.g. 0xC2000000).
+        #[arg(long, value_name = "0xNNNNNNNN")]
+        addr: String,
+        /// Stride between reads in bytes (hex or dec, e.g. 0x10000).
+        #[arg(long, default_value = "0x10000")]
+        stride: String,
+        /// Number of words to read.
+        #[arg(long, default_value = "256")]
+        count: usize,
+    },
+
+    /// SCAN the PowerPC DCR register bus (separate from chip memory). Reads one
+    /// word at `addr + i` for `count` iterations. lsirec only touches 0x307 and
+    /// 0x340; the rest is unexplored boot/config state. IOC-free.
+    DcrScan {
+        /// Base DCR offset (hex, e.g. 0x300).
+        #[arg(long, default_value = "0x300")]
+        addr: String,
+        /// Number of DCR words to read.
+        #[arg(long, default_value = "256")]
+        count: usize,
     },
 }
 
@@ -274,12 +330,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             FwCommand::Read(a) => {
                 let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
                     .map_err(|e| crate::Error::Other(format!("{}", e)))?;
-                region::run_read(
-                    bdf,
-                    crate::mpi::messages::ImageType::Fw,
-                    "fw",
-                    a.out.as_deref(),
-                )
+                fw::run_read(bdf, a.running, a.out.as_deref())
             }
             FwCommand::Write(a) => {
                 let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
@@ -317,6 +368,82 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                 yes,
                 wipe_mfg_pages,
             } => erase::run(cli.pci.clone(), yes, wipe_mfg_pages, cli.json),
+            DebugCommand::ChipRead { addr, len, out } => {
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                let chip_addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
+                    .map_err(|e| crate::Error::Other(format!("bad --addr {}: {}", addr, e)))?;
+                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
+                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
+                let bytes = t
+                    .read_chip_mem(chip_addr, len)
+                    .map_err(|e| crate::Error::Other(format!("chip read: {}", e)))?;
+                eprintln!(
+                    "chipread @0x{:08x}: {} bytes, sha256={}",
+                    chip_addr,
+                    bytes.len(),
+                    {
+                        use sha2::{Digest, Sha256};
+                        let mut h = Sha256::new();
+                        h.update(&bytes);
+                        format!("{:x}", h.finalize())
+                    }
+                );
+                match out {
+                    Some(p) => std::fs::write(&p, &bytes)?,
+                    None => {
+                        use std::io::Write;
+                        std::io::stdout().lock().write_all(&bytes)?;
+                    }
+                }
+                Ok(())
+            }
+            DebugCommand::ChipScan {
+                addr,
+                stride,
+                count,
+            } => {
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                let parse = |s: &str| {
+                    let t = s.trim_start_matches("0x");
+                    u32::from_str_radix(t, 16).or_else(|_| s.parse::<u32>())
+                };
+                let base =
+                    parse(&addr).map_err(|e| crate::Error::Other(format!("bad --addr: {}", e)))?;
+                let step = parse(&stride)
+                    .map_err(|e| crate::Error::Other(format!("bad --stride: {}", e)))?;
+                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
+                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
+                eprintln!(
+                    "chip-scan base=0x{:08x} stride=0x{:x} count={} (last printed addr = any hang)",
+                    base, step, count
+                );
+                use std::io::Write;
+                t.scan_chip_mem(base, step, count, |a, v| {
+                    println!("0x{:08x} : 0x{:08x}", a, v);
+                    let _ = std::io::stdout().flush();
+                })
+                .map_err(|e| crate::Error::Other(format!("chip scan: {}", e)))?;
+                Ok(())
+            }
+            DebugCommand::DcrScan { addr, count } => {
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                let base = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
+                    .or_else(|_| addr.parse::<u32>())
+                    .map_err(|e| crate::Error::Other(format!("bad --addr: {}", e)))?;
+                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
+                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
+                eprintln!("dcr-scan base=0x{:x} count={}", base, count);
+                use std::io::Write;
+                t.scan_dcr(base, count, |off, v| {
+                    println!("DCR 0x{:04x} : 0x{:08x}", off, v);
+                    let _ = std::io::stdout().flush();
+                })
+                .map_err(|e| crate::Error::Other(format!("dcr scan: {}", e)))?;
+                Ok(())
+            }
         },
         Command::Config { sub } => {
             let bdf = crate::card::resolve_bdf(cli.pci.as_deref())

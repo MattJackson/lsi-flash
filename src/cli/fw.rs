@@ -18,6 +18,53 @@ fn sha_hex(b: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// First `MPTFW-<ver>-<suffix>` banner in a firmware blob, for human-readable
+/// version/personality identification (e.g. `MPTFW-20.00.07.00-IE`).
+fn fw_banner(data: &[u8]) -> Option<String> {
+    let needle = b"MPTFW-";
+    let pos = data.windows(needle.len()).position(|w| w == needle)?;
+    let end = data[pos..]
+        .iter()
+        .position(|&b| b == 0 || b == b' ')
+        .map(|e| pos + e)
+        .unwrap_or(data.len());
+    std::str::from_utf8(&data[pos..end]).ok().map(String::from)
+}
+
+/// `fw read` — read the firmware region. By default reads the **flash** copy
+/// (FW_UPLOAD ITYPE 0x01 = FW_FLASH, the persisted image); `--running` reads
+/// the **running** image (ITYPE 0x00 = FW_CURRENT, what the chip booted). The
+/// two differ when a `fw write` landed in flash but the chip hasn't reset —
+/// comparing them verifies a write without a reboot.
+pub fn run_read(bdf: String, running: bool, out: Option<&Path>) -> Result<(), crate::Error> {
+    use crate::card::mpt::{FW_UPLOAD_ITYPE_FW_CURRENT, FW_UPLOAD_ITYPE_FW_FLASH};
+    let (itype, label) = if running {
+        (FW_UPLOAD_ITYPE_FW_CURRENT, "running (FW_CURRENT 0x00)")
+    } else {
+        (FW_UPLOAD_ITYPE_FW_FLASH, "flash (FW_FLASH 0x01)")
+    };
+    let mut card = crate::card::discover_one(&bdf)
+        .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
+    let data = card
+        .read_region_itype(itype)
+        .map_err(|e| crate::Error::Other(format!("fw read [{}]: {}", label, e)))?;
+    eprintln!(
+        "fw read [{}]: {} bytes, sha256={}, banner={}",
+        label,
+        data.len(),
+        sha_hex(&data),
+        fw_banner(&data).unwrap_or_else(|| "?".into())
+    );
+    match out {
+        Some(p) => std::fs::write(p, &data)?,
+        None => {
+            use std::io::Write;
+            std::io::stdout().lock().write_all(&data)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validated firmware write: pre-flight checks 1-4, wizard confirm, write,
 /// then read-back verify (check 5).
 pub fn run_write(bdf: String, from_file: &Path, yes: bool) -> Result<(), crate::Error> {

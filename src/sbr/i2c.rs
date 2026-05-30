@@ -30,6 +30,10 @@ const MPI2_DIAG_WRITE_ENABLE: u32 = 0x0080;
 /// DIAG read/write-enable bit (unlocks DCR/diag access). Cites lsirec.c:32.
 const MPI2_DIAG_RW_ENABLE: u32 = 0x0010;
 
+/// WRSEQ flush/lock key — writing this to WRSEQ re-locks the diagnostic
+/// write-enable. Cites mpi2.h:199 (MPI2_WRSEQ_FLUSH_KEY_VALUE = 0x0).
+const MPI2_WRSEQ_FLUSH: u32 = 0x00;
+
 /// DCR_I2C_SELECT register offset. Cites lsirec.c:56.
 pub const DCR_I2C_SELECT: u32 = 0x307;
 
@@ -91,7 +95,7 @@ pub struct I2cContext<'a> {
 
 /// DCR read32 helper. Cites lsirec.c:40-41, 113-117.
 /// Writes offset to MPI2_DCR_ADDRESS, reads value from MPI2_DCR_DATA.
-fn dcr_read32(bar1: &mut [u8], offset: u32) -> Result<u32, I2cError> {
+pub(crate) fn dcr_read32(bar1: &mut [u8], offset: u32) -> Result<u32, I2cError> {
     write32(bar1, MPI2_DCR_ADDRESS as u32, offset);
     Ok(read32(bar1, MPI2_DCR_DATA as u32))
 }
@@ -109,8 +113,8 @@ fn dcr_write32(bar1: &mut [u8], offset: u32, data: u32) -> Result<(), I2cError> 
 /// direct BAR1 offset — they're reached by writing the chip address to
 /// DIAG_RW_ADDRESS_{HIGH,LOW} then reading DIAG_RW_DATA. Mirrors lsirec's
 /// `chip_read32`. Cites lsirec.c:99-104. (Requires diag RW already enabled —
-/// `unlock_diag` does that in `i2c_init`.)
-fn chip_read32(bar1: &mut [u8], chip_addr: u32) -> u32 {
+/// `unlock_diag` does that in `i2c_open`.)
+pub(crate) fn chip_read32(bar1: &mut [u8], chip_addr: u32) -> u32 {
     write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
     write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
     read32(bar1, MPI2_DIAG_RW_DATA)
@@ -243,7 +247,7 @@ fn i2c_getbyte(bar1: &mut [u8]) -> u8 {
 /// auto-detect picks the wrong values (observed on dev-1 2026-05-29:
 /// 0x50/type-2 instead of the correct 0x54/type-1, → "EEPROM did not ACK").
 /// Mirrors lsirec's `lsi_unlock` + diag-RW-enable. Cites lsirec.c:125-160.
-fn unlock_diag(bar1: &mut [u8]) -> Result<(), I2cError> {
+pub(crate) fn unlock_diag(bar1: &mut [u8]) -> Result<(), I2cError> {
     // WRSEQ unlock sequence. Cites lsirec.c:125-133.
     for &v in &[0x00u32, 0x04, 0x0b, 0x02, 0x07, 0x0d] {
         write32(bar1, MPI2_WRSEQ_OFFSET as u32, v);
@@ -257,7 +261,7 @@ fn unlock_diag(bar1: &mut [u8]) -> Result<(), I2cError> {
     Ok(())
 }
 
-pub fn i2c_init(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
+pub fn i2c_open(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
     // Unlock diagnostic registers BEFORE any DCR access (lsirec.c:125-160).
     // Without this, DCR reads are stale → wrong EEPROM addr/type auto-detect.
     unlock_diag(ctx.bar1)?;
@@ -346,10 +350,33 @@ pub fn i2c_close(ctx: &mut I2cContext<'_>) -> Result<(), I2cError> {
         }
     }
 
+    // Step 2: un-route the I²C pins (mirror of i2c_open's I2C_SELECT set). Must
+    // run while the diag RW window is still open (DCR access needs RW_ENABLE).
     let val = dcr_read32(ctx.bar1, DCR_I2C_SELECT)?;
     dcr_write32(ctx.bar1, DCR_I2C_SELECT, val & !0x800000)?;
 
+    // Steps 3+4: close the diag RW window + re-lock WRSEQ (shared with the diag
+    // chip-memory reader). LOCK-ONLY exit — NO RESET_ADAPTER (operator decision
+    // 2026-05-30): chip stays operational, new SBR goes live on next reboot.
+    relock_diag(ctx.bar1);
+
     Ok(())
+}
+
+/// Re-lock the diagnostic registers: clear the RW-enable bit, then flush WRSEQ
+/// (0x00) to drop write-enable. Exact inverse of `unlock_diag`. Shared by
+/// `i2c_close` and the diag chip-memory reader so every diag-window user has a
+/// symmetric enter/exit (no chip left in maintenance mode).
+pub(crate) fn relock_diag(bar1: &mut [u8]) {
+    let diag = read32(bar1, MPI2_DIAG_OFFSET as u32);
+    write32(bar1, MPI2_DIAG_OFFSET as u32, diag & !MPI2_DIAG_RW_ENABLE);
+    write32(bar1, MPI2_WRSEQ_OFFSET as u32, MPI2_WRSEQ_FLUSH);
+}
+
+/// True if the chip is still in maintenance mode (diag RW window open) — i.e.
+/// an `i2c_open` that has not been `i2c_close`d. Used to assert clean teardown.
+pub fn is_open(bar1: &mut [u8]) -> bool {
+    read32(bar1, MPI2_DIAG_OFFSET as u32) & MPI2_DIAG_RW_ENABLE != 0
 }
 
 /// Read SBR from EEPROM. Cites lsirec.c:551-589.
@@ -522,6 +549,18 @@ mod tests {
     }
 
     #[test]
+    fn test_is_open_reflects_rw_enable() {
+        // is_open() reports maintenance state via the DIAG RW_ENABLE bit.
+        let mut bar1 = vec![0u8; 0x100];
+        assert!(!is_open(&mut bar1), "clean bar1 must read as closed");
+        write32(&mut bar1, MPI2_DIAG_OFFSET as u32, MPI2_DIAG_RW_ENABLE);
+        assert!(is_open(&mut bar1), "RW_ENABLE set must read as open");
+        // Clearing it (as i2c_close's re-lock does) returns to closed.
+        write32(&mut bar1, MPI2_DIAG_OFFSET as u32, 0);
+        assert!(!is_open(&mut bar1), "cleared RW_ENABLE must read as closed");
+    }
+
+    #[test]
     fn test_i2c_delay_accepts_slice() {
         let bar1: &[u8] = &[0u8; 64];
         i2c_delay(bar1); // Should compile and run without panic
@@ -546,7 +585,10 @@ mod tests {
     #[test]
     fn test_dcr_read32_write32_bounds_check() {
         // DCR helpers no longer perform bounds checks; entry points guard bar1 length.
-        let mut bar1 = vec![0u8; 32];
+        // Buffer must cover the DCR register offsets (DATA 0x38, ADDRESS 0x3c) — a
+        // 32-byte buffer made these writes land OOB (raw volatile), which "passed"
+        // only by heap luck and flaked under parallel test runs. 0x40 covers both.
+        let mut bar1 = vec![0u8; 0x40];
 
         // These should succeed on RAM (volatile semantics don't change runtime behavior)
         dcr_write32(&mut bar1, 0x12345678, 0xDEADBEEF).expect("dcr_write32 should succeed");

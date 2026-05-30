@@ -164,7 +164,7 @@ impl VfioI2cSbrTransport {
 
 impl SbrTransport for VfioI2cSbrTransport {
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError> {
-        use crate::sbr::i2c::{i2c_close, i2c_init, i2c_read_sbr, I2cContext};
+        use crate::sbr::i2c::{i2c_close, i2c_open, i2c_read_sbr, I2cContext};
 
         // Use live BAR1 slice directly (no copy).
         let bar1 = self.vfio.bar1();
@@ -174,12 +174,17 @@ impl SbrTransport for VfioI2cSbrTransport {
             eep_type: 0,
         };
 
-        // Auto-detect EEPROM address/type via i2c_init (lsirec.c:498-524).
-        i2c_init(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_init: {}", e)))?;
+        // Enter maintenance (unlock diag + route I²C pins; auto-detect addr/type).
+        i2c_open(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_open: {}", e)))?;
 
-        // Call i2c_read_sbr directly (src/sbr/i2c.rs).
-        let bytes = i2c_read_sbr(&mut ctx, 0, 256)
+        // Do the read, then ALWAYS close (even on error) — never leave the chip
+        // in maintenance mode; surface a close failure rather than swallow it.
+        let read_result = i2c_read_sbr(&mut ctx, 0, 256);
+        let close_result = i2c_close(&mut ctx);
+
+        let bytes = read_result
             .map_err(|e| SbrTransportError::Transport(format!("i2c_read_sbr: {}", e)))?;
+        close_result.map_err(|e| SbrTransportError::Transport(format!("i2c_close: {}", e)))?;
 
         if bytes.len() != 256 {
             return Err(SbrTransportError::Transport(format!(
@@ -190,10 +195,6 @@ impl SbrTransport for VfioI2cSbrTransport {
 
         let mut arr = [0u8; 256];
         arr.copy_from_slice(&bytes);
-
-        // Best-effort restore of DCR_I2C_SELECT (lsirec.c:535-549).
-        let _ = i2c_close(&mut ctx);
-
         Ok(arr)
     }
 
@@ -316,11 +317,123 @@ impl Bar1MmapSbrTransport {
             fd,
         })
     }
+
+    /// Diagnostic: read an arbitrary span of the I²C config EEPROM (NOT just the
+    /// 256-byte SBR). The SAS2008 uses a 16-bit-addressed EEPROM (type 1) that is
+    /// larger than 256 B; regions past the SBR may hold Manufacturing/NVDATA
+    /// config the firmware reads at init. This path is IOC-free (pure I²C bit-bang
+    /// on BAR1), so it works on a faulted chip where FW_UPLOAD/CONFIG cannot.
+    /// open → sequential read → close (always); close errors surfaced.
+    pub fn read_eeprom(&mut self, offset: usize, len: usize) -> Result<Vec<u8>, SbrTransportError> {
+        use crate::sbr::i2c::{i2c_close, i2c_open, i2c_read_sbr, I2cContext};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        let mut ctx = I2cContext {
+            bar1,
+            sbr_addr: 0,
+            eep_type: 0,
+        };
+        i2c_open(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_open: {}", e)))?;
+        let read = i2c_read_sbr(&mut ctx, offset, len);
+        let close = i2c_close(&mut ctx);
+        let bytes =
+            read.map_err(|e| SbrTransportError::Transport(format!("i2c_read_sbr: {}", e)))?;
+        close.map_err(|e| SbrTransportError::Transport(format!("i2c_close: {}", e)))?;
+        Ok(bytes)
+    }
+
+    /// Diagnostic: read `len` bytes of CHIP-INTERNAL memory via the DIAG RW
+    /// window (NOT the I²C EEPROM). `chip_addr` is a SAS2008 internal-bus address
+    /// (e.g. 0xC2100000 = I²C peripheral). This is the same mechanism lsirec uses
+    /// to reach the I²C pins, generalized to arbitrary chip addresses — IOC-free,
+    /// works on a faulted chip. Used to hunt for firmware/NVDATA/MRAM in chip RAM.
+    ///
+    /// Symmetric enter/exit: `unlock_diag` → word reads → `relock_diag`. NO RESET.
+    /// NOTE: some chip MMIO has read side-effects — intended for diagnostics on a
+    /// known/expendable card, not a routine path.
+    pub fn read_chip_mem(
+        &mut self,
+        chip_addr: u32,
+        len: usize,
+    ) -> Result<Vec<u8>, SbrTransportError> {
+        use crate::sbr::i2c::{chip_read32, relock_diag, unlock_diag};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        let words = len.div_ceil(4);
+        let mut out = Vec::with_capacity(words * 4);
+        for i in 0..words {
+            let v = chip_read32(bar1, chip_addr.wrapping_add((i as u32) * 4));
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        relock_diag(bar1);
+        out.truncate(len);
+        Ok(out)
+    }
+
+    /// Diagnostic SCAN of the chip-internal bus: unlock diag ONCE, then read one
+    /// 32-bit word at `base + i*stride` for `count` iterations, invoking `cb(addr,
+    /// word)` after EACH read. The callback lets the caller flush per-line so that
+    /// if an unmapped address hangs the chip's internal bus (observed at
+    /// 0x20000000), the last printed line pinpoints the offending address instead
+    /// of losing the whole run. Relocks diag at the end (only reached if no hang).
+    /// IOC-free; works on a faulted chip. Read-only.
+    pub fn scan_chip_mem<F: FnMut(u32, u32)>(
+        &mut self,
+        base: u32,
+        stride: u32,
+        count: usize,
+        mut cb: F,
+    ) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{chip_read32, relock_diag, unlock_diag};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        for i in 0..count {
+            let addr = base.wrapping_add((i as u32).wrapping_mul(stride));
+            let v = chip_read32(bar1, addr);
+            cb(addr, v);
+        }
+        relock_diag(bar1);
+        Ok(())
+    }
+
+    /// Diagnostic SCAN of the PowerPC DCR bus (a small, separate register file
+    /// reached via MPI2_DCR_ADDRESS/DATA — NOT the chip memory bus). lsirec only
+    /// ever touches DCR_I2C_SELECT (0x307) and DCR_SBR_CONFIG (0x340); the rest is
+    /// unexplored boot/config state. Reads one word at `base + i` for `count`
+    /// iterations, `cb(offset, word)` per read. Unlock diag once, relock at end.
+    pub fn scan_dcr<F: FnMut(u32, u32)>(
+        &mut self,
+        base: u32,
+        count: usize,
+        mut cb: F,
+    ) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{dcr_read32, relock_diag, unlock_diag};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        for i in 0..count {
+            let off = base.wrapping_add(i as u32);
+            let v = dcr_read32(bar1, off)
+                .map_err(|e| SbrTransportError::Transport(format!("dcr_read32: {}", e)))?;
+            cb(off, v);
+        }
+        relock_diag(bar1);
+        Ok(())
+    }
 }
 
 impl SbrTransport for Bar1MmapSbrTransport {
     fn read_sbr(&mut self) -> Result<[u8; 256], SbrTransportError> {
-        use crate::sbr::i2c::{i2c_close, i2c_init, i2c_read_sbr, I2cContext};
+        use crate::sbr::i2c::{i2c_close, i2c_open, i2c_read_sbr, I2cContext};
 
         // SAFETY: `va` is valid for `len` bytes (guaranteed by mmap success + fstat).
         let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
@@ -330,12 +443,18 @@ impl SbrTransport for Bar1MmapSbrTransport {
             eep_type: 0,
         };
 
-        // Auto-detect EEPROM address/type via i2c_init (lsirec.c:498-524).
-        i2c_init(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_init: {}", e)))?;
+        // Enter maintenance (unlock diag + route I²C pins; auto-detect addr/type).
+        i2c_open(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_open: {}", e)))?;
 
-        // Call i2c_read_sbr directly (src/sbr/i2c.rs).
-        let bytes = i2c_read_sbr(&mut ctx, 0, 256)
+        // Do the read, then ALWAYS close (even if the read errored) so the chip
+        // is never left in maintenance mode. Surface the close error too — it is
+        // NOT best-effort: a failed close is exactly what wedged the chip before.
+        let read_result = i2c_read_sbr(&mut ctx, 0, 256);
+        let close_result = i2c_close(&mut ctx);
+
+        let bytes = read_result
             .map_err(|e| SbrTransportError::Transport(format!("i2c_read_sbr: {}", e)))?;
+        close_result.map_err(|e| SbrTransportError::Transport(format!("i2c_close: {}", e)))?;
 
         if bytes.len() != 256 {
             return Err(SbrTransportError::Transport(format!(
@@ -346,15 +465,11 @@ impl SbrTransport for Bar1MmapSbrTransport {
 
         let mut arr = [0u8; 256];
         arr.copy_from_slice(&bytes);
-
-        // Best-effort restore of DCR_I2C_SELECT (lsirec.c:535-549).
-        let _ = i2c_close(&mut ctx);
-
         Ok(arr)
     }
 
     fn write_sbr(&mut self, data: &[u8; 256]) -> Result<(), SbrTransportError> {
-        use crate::sbr::i2c::{i2c_close, i2c_init, i2c_write_sbr, I2cContext};
+        use crate::sbr::i2c::{i2c_close, i2c_open, i2c_write_sbr, I2cContext};
 
         // SAFETY: `va` is valid for `len` bytes (guaranteed by mmap success + fstat).
         let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
@@ -364,15 +479,17 @@ impl SbrTransport for Bar1MmapSbrTransport {
             eep_type: 0,
         };
 
-        // Auto-detect EEPROM address/type via i2c_init (lsirec.c:498-524).
-        i2c_init(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_init: {}", e)))?;
+        // Enter maintenance (unlock diag + route I²C pins; auto-detect addr/type).
+        i2c_open(&mut ctx).map_err(|e| SbrTransportError::Transport(format!("i2c_open: {}", e)))?;
 
-        // Write all 256 bytes from offset 0 (byte-by-byte, 5ms write cycle each).
-        i2c_write_sbr(&mut ctx, 0, data)
-            .map_err(|e| SbrTransportError::Transport(format!("i2c_write_sbr: {}", e)))?;
+        // Do the write, then ALWAYS close (even if the write errored) so the chip
+        // is never left in maintenance mode. Surface the close error too — a
+        // failed close is exactly what left the chip wedged + hung POST before.
+        let write_result = i2c_write_sbr(&mut ctx, 0, data);
+        let close_result = i2c_close(&mut ctx);
 
-        // Best-effort restore of DCR_I2C_SELECT (lsirec.c:535-549).
-        let _ = i2c_close(&mut ctx);
+        write_result.map_err(|e| SbrTransportError::Transport(format!("i2c_write_sbr: {}", e)))?;
+        close_result.map_err(|e| SbrTransportError::Transport(format!("i2c_close: {}", e)))?;
 
         Ok(())
     }

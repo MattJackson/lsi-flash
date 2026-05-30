@@ -91,6 +91,24 @@ pub enum SbrCommand {
         #[arg(long, value_name = "BDF")]
         pci: Option<String>,
     },
+
+    /// Diagnostic: dump an arbitrary span of the config EEPROM (not just the
+    /// 256-byte SBR) via direct BAR1 I²C — works on a faulted IOC. Use to inspect
+    /// Manufacturing/NVDATA config that may live past the SBR.
+    Dump {
+        /// PCI BDF of the card (e.g., `0000:03:00.0`).
+        #[arg(long, value_name = "BDF")]
+        pci: Option<String>,
+        /// Start offset in the EEPROM (default 0).
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Number of bytes to read (default 2048 — well past the 256-byte SBR).
+        #[arg(long, default_value = "2048")]
+        len: usize,
+        /// Output file for the raw bytes. Default: stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Entry point invoked from `cli::run`.
@@ -112,7 +130,47 @@ pub fn run(cmd: SbrCommand) -> Result<(), crate::Error> {
             yes,
         } => run_write(pci.as_deref(), &from_file, yes),
         SbrCommand::Selftest { pci } => run_selftest(pci.as_deref()),
+        SbrCommand::Dump {
+            pci,
+            offset,
+            len,
+            out,
+        } => run_dump(pci.as_deref(), offset, len, out.as_deref()),
     }
+}
+
+/// Dump an arbitrary EEPROM span via direct BAR1 I²C — bypasses discover_one /
+/// mpt3ctl so it works on a faulted IOC (the only read path that does).
+fn run_dump(
+    pci_bdf: Option<&str>,
+    offset: usize,
+    len: usize,
+    out: Option<&std::path::Path>,
+) -> Result<(), crate::Error> {
+    use crate::sbr::transport::Bar1MmapSbrTransport;
+
+    let bdf = resolve_bdf(pci_bdf)?;
+    let mut t = Bar1MmapSbrTransport::open(&bdf)
+        .map_err(|e| crate::Error::Other(format!("bar1 transport open: {}", e)))?;
+    let bytes = t
+        .read_eeprom(offset, len)
+        .map_err(|e| crate::Error::Other(format!("eeprom read: {}", e)))?;
+
+    eprintln!(
+        "EEPROM dump: offset 0x{:x}, {} bytes, sha256={}",
+        offset,
+        bytes.len(),
+        sha_hex(&bytes)
+    );
+    match out {
+        Some(p) => fs::write(p, &bytes)
+            .map_err(|e| crate::Error::Other(format!("write {}: {}", p.display(), e)))?,
+        None => std::io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(|e| crate::Error::Other(format!("stdout: {}", e)))?,
+    }
+    Ok(())
 }
 
 /// Resolve the target BDF: explicit `--pci`, else auto-detect the single card.

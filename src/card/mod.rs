@@ -176,6 +176,16 @@ pub trait Card: Send {
         Err(CardError::NotImplemented("read_region"))
     }
 
+    /// Read a region via FW_UPLOAD with an explicit raw ITYPE. This distinguishes
+    /// the two FW images the chip holds (mpi2_ioc.h:1244-1245):
+    ///   0x00 = MPI2_FW_UPLOAD_ITYPE_FW_CURRENT — the *running* image (RAM)
+    ///   0x01 = MPI2_FW_UPLOAD_ITYPE_FW_FLASH   — the persisted copy in flash
+    /// so a caller can compare flash-vs-running and verify a `fw write` landed
+    /// in flash WITHOUT a reboot. `read_region(Fw)` is the 0x01 (flash) case.
+    fn read_region_itype(&mut self, _itype: u8) -> Result<Vec<u8>, CardError> {
+        Err(CardError::NotImplemented("read_region_itype"))
+    }
+
     /// Write one flash-chip region (FW / BIOS / NVDATA) via FW_DOWNLOAD.
     /// DESTRUCTIVE. Shared primitive for `restore` and `fw/bios/nvdata write`.
     /// (Erase-if-personality-change and HCB-on-lock live in the higher-level
