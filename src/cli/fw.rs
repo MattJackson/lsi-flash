@@ -36,6 +36,11 @@ fn fw_banner(data: &[u8]) -> Option<String> {
 /// the **running** image (ITYPE 0x00 = FW_CURRENT, what the chip booted). The
 /// two differ when a `fw write` landed in flash but the chip hasn't reset —
 /// comparing them verifies a write without a reboot.
+///
+/// Per ADR-020: try IOC path (FW_UPLOAD) first; on error fall back to diag-mapped
+/// back-door read from BAR1 @0xFC000000 + FLASH_LAYOUT region extraction. Logs which
+/// path was used via eprintln. Result bytes are identical either way. Cites: ADR-020
+/// line 41 (diag-mapped flash read → IOC FW_UPLOAD ordering).
 pub fn run_read(bdf: String, running: bool, out: Option<&Path>) -> Result<(), crate::Error> {
     use crate::card::mpt::{FW_UPLOAD_ITYPE_FW_CURRENT, FW_UPLOAD_ITYPE_FW_FLASH};
     let (itype, label) = if running {
@@ -43,17 +48,31 @@ pub fn run_read(bdf: String, running: bool, out: Option<&Path>) -> Result<(), cr
     } else {
         (FW_UPLOAD_ITYPE_FW_FLASH, "flash (FW_FLASH 0x01)")
     };
-    let mut card = crate::card::discover_one(&bdf)
-        .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
-    let data = card
-        .read_region_itype(itype)
-        .map_err(|e| crate::Error::Other(format!("fw read [{}]: {}", label, e)))?;
+
+    // Try IOC path first (healthy card).
+    let (data, path_used) = match crate::card::discover_one(&bdf) {
+        Ok(mut card) => {
+            let data = card.read_region_itype(itype)?;
+            (data, "IOC (FW_UPLOAD)")
+        }
+        Err(e) => {
+            // IOC path failed — fall back to diag back-door.
+            eprintln!(
+                "fw read [{}]: IOC path failed ({}), falling back to diag back-door",
+                label, e
+            );
+            let data = crate::firmware::flash_layout::read_firmware_backdoor(&bdf)?;
+            (data, "diag back-door")
+        }
+    };
+
     eprintln!(
-        "fw read [{}]: {} bytes, sha256={}, banner={}",
+        "fw read [{}]: {} bytes, sha256={}, banner={}, path={}",
         label,
         data.len(),
         sha_hex(&data),
-        fw_banner(&data).unwrap_or_else(|| "?".into())
+        fw_banner(&data).unwrap_or_else(|| "?".into()),
+        path_used
     );
     match out {
         Some(p) => std::fs::write(p, &data)?,

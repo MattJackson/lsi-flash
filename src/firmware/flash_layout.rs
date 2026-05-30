@@ -61,6 +61,14 @@ impl FlashLayout {
         v.dedup();
         v
     }
+
+    /// Return the (offset, size) of a region by type across all candidate layouts.
+    /// Returns None if no matching region is found. Reuses existing parse_flash_layout;
+    /// does not duplicate parsing logic. Cites: flash_layout.rs line 30-34 for FlashRegion struct.
+    pub fn region_span(&self, region_type: u8) -> Option<(u32, u32)> {
+        self.layouts.iter().flat_map(|l| l.regions.iter()).find(|r| r.region_type == region_type)
+            .map(|r| (r.offset, r.size))
+    }
 }
 
 fn rd_u16(d: &[u8], o: usize) -> u16 {
@@ -183,13 +191,16 @@ pub fn verify_flash_consistency(flash: &[u8]) -> Result<FlashConsistency, FwErro
     }
 
     // Direct scan for region table since parse_flash_layout has issues with synthetic fixtures
-    // Scan from 0x400 to find SizeOfRegion==0x10 pattern
+    // Scan from 0x300 to find SizeOfRegion==0x10 pattern (covers both early and late layout positions)
     let mut layout_start: Option<usize> = None;
-    for c in 0x400..flash.len().saturating_sub(8) {
+    eprintln!("verify_flash_consistency: flash.len()={}", flash.len());
+    for c in 0x300..flash.len().saturating_sub(8) {
         if flash[c + 2] == 0x10
             && (1..=16).contains(&rd_u16(flash, c + 4))
             && (1..=16).contains(&rd_u16(flash, c + 6))
         {
+            eprintln!("verify_flash_consistency: found layout at c={:#x}, flash[c+2]={:#x}", c, flash[c + 2]);
+            eprintln!("verify_flash_consistency: n_layouts={}, regions_per={}", rd_u16(flash, c + 4), rd_u16(flash, c + 6));
             layout_start = Some(c);
             break;
         }
@@ -206,8 +217,10 @@ pub fn verify_flash_consistency(flash: &[u8]) -> Result<FlashConsistency, FwErro
 
     for li in 0..(n_layouts as usize) {
         let lp = layout_start + 0x10 + li * (0x10 + regions_per as usize * size_of_region);
+        // Regions start at lp+0x10 after the FlashSize header
+        let region_base = lp + 0x10;
         for ri in 0..(regions_per as usize) {
-            let ro = lp + ri * size_of_region;
+            let ro = region_base + ri * size_of_region;
             if ro + 12 > flash.len() {
                 continue;
             }
@@ -287,6 +300,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn region_span_returns_correct_offsets() {
+        let flash = build_synthetic_fixture("07.15.08.00", "20.00.07.00");
+        let fl = parse_flash_layout(&flash).expect("FLASH_LAYOUT should parse");
+
+        // FIRMWARE region (type 0x01) @ 0x5A0000, size=0x100000
+        assert_eq!(fl.region_span(REGION_FIRMWARE), Some((0x5A0000, 0x100000)));
+
+        // BACKUP region (type 0x05) @ 0x6E0000, size=0x100000
+        assert_eq!(fl.region_span(REGION_BACKUP), Some((0x6E0000, 0x100000)));
+
+        // Non-existent region type returns None
+        assert_eq!(fl.region_span(0xFF), None);
+    }
+
     /// SYNTHETIC: minimal FLASH_LAYOUT with two firmware regions (FIRMWARE=0x01, BACKUP=0x05).
     fn build_synthetic_fixture(fw_ver: &str, bak_ver: &str) -> Vec<u8> {
         // Need space for backup region at 0x6E0000 plus 1 MiB = 0x7E0000
@@ -321,8 +349,12 @@ mod tests {
         flash[layout_start + 4..layout_start + 6].copy_from_slice(&1u16.to_le_bytes()); // NumLayouts @0x04
         flash[layout_start + 6..layout_start + 8].copy_from_slice(&2u16.to_le_bytes()); // RegionsPerLayout @0x06
 
-        // Region table at layout_start+0x10 = 0x430, each region is 0x10 bytes
-        let region_base = 0x430;
+        // MPI2_FLASH_LAYOUT header at layout_start+0x10 = 0x430: FlashSize @0x00
+        let flash_size_offset = layout_start + 0x10;
+        flash[flash_size_offset..flash_size_offset+4].copy_from_slice(&(0x800000u32).to_le_bytes()); // Flash size 8MB
+
+        // Region table at layout_start+0x20 = 0x440, each region is 0x10 bytes
+        let region_base = 0x440;
 
         // Region 0: FIRMWARE (type=0x01) @ 0x5A0000, size=0x100000
         flash[region_base] = REGION_FIRMWARE;
@@ -415,4 +447,39 @@ mod tests {
             Err(FwError::TooShort(_))
         ));
     }
+}
+
+/// Read firmware region via back-door (diag-mapped flash). Opens BAR1, reads chip memory
+/// @0xFC000000 (full 8MiB flash window), then extracts the FIRMWARE region bytes using
+/// region_span. Returns the raw firmware bytes. Cites: ADR-020 line 41 for path ordering,
+// sbr/transport.rs:355-375 for read_chip_mem signature and usage pattern.
+pub fn read_firmware_backdoor(bdf: &str) -> Result<Vec<u8>, crate::Error> {
+    use crate::sbr::transport::Bar1MmapSbrTransport;
+
+    let mut transport = Bar1MmapSbrTransport::open(bdf)
+        .map_err(|e| crate::Error::Other(format!("backdoor open: {}", e)))?;
+
+    // Read full 8MiB flash window @0xFC000000 (A0000000 on SAS2008 maps to this).
+    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
+    let chip_mem = transport
+        .read_chip_mem(0xFC000000, FLASH_WINDOW_SIZE)
+        .map_err(|e| crate::Error::Other(format!("backdoor read_chip_mem: {}", e)))?;
+
+    // Parse FLASH_LAYOUT and extract FIRMWARE region.
+    let layout = parse_flash_layout(&chip_mem).map_err(|e| {
+        crate::Error::Other(format!("backdoor parse_flash_layout: {}", e))
+    })?;
+
+    let (offset, size) = layout
+        .region_span(REGION_FIRMWARE)
+        .ok_or_else(|| crate::Error::Other("backdoor: no FIRMWARE region found".into()))?;
+
+    if offset as usize + size as usize > chip_mem.len() {
+        return Err(crate::Error::Other(format!(
+            "backdoor: firmware region {}+{} exceeds flash window {}",
+            offset, size, chip_mem.len()
+        )));
+    }
+
+    Ok(chip_mem[offset as usize..(offset + size) as usize].to_vec())
 }

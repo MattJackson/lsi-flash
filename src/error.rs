@@ -26,6 +26,9 @@ pub enum Error {
     #[error("flash error: {0}")]
     Flash(#[from] crate::cli::flash::FlashError),
 
+    #[error("card error: {0}")]
+    Card(#[from] crate::card::CardError),
+
     #[error("serde_json: {0}")]
     SerdeJson(#[from] serde_json::Error),
 
