@@ -7,5 +7,6 @@ pub mod flash_layout;
 pub mod inspect;
 pub mod synthesize;
 pub mod validate;
+pub use flash_layout::{verify_flash_consistency, FlashConsistency};
 pub use inspect::*;
 pub use synthesize::*;
