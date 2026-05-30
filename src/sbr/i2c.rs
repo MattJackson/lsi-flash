@@ -122,7 +122,7 @@ pub(crate) fn chip_read32(bar1: &mut [u8], chip_addr: u32) -> u32 {
 
 /// Write a CHIP-memory register via the DIAG RW window. Mirrors lsirec's
 /// `chip_write32`. Cites lsirec.c:106-112.
-fn chip_write32(bar1: &mut [u8], chip_addr: u32, data: u32) {
+pub(crate) fn chip_write32(bar1: &mut [u8], chip_addr: u32, data: u32) {
     write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
     write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
     write32(bar1, MPI2_DIAG_RW_DATA, data);

@@ -403,6 +403,35 @@ impl Bar1MmapSbrTransport {
         Ok(())
     }
 
+    /// Diagnostic WRITE of CHIP-INTERNAL memory via the DIAG RW window. Writes
+    /// `data` as little-endian 32-bit words starting at `chip_addr`. Works on RAM
+    /// and peripheral registers (plain store). For NOR flash this will NOT program
+    /// the array (NOR needs erase/program commands to the flash controller) — use
+    /// this verb to EMPIRICALLY test what a given chip address accepts. IOC-free.
+    /// Symmetric: unlock_diag → word writes → relock_diag. NO RESET. DESTRUCTIVE.
+    pub fn write_chip_mem(
+        &mut self,
+        chip_addr: u32,
+        data: &[u8],
+    ) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{chip_write32, relock_diag, unlock_diag};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        let mut i = 0usize;
+        while i < data.len() {
+            let mut w = [0u8; 4];
+            let n = (data.len() - i).min(4);
+            w[..n].copy_from_slice(&data[i..i + n]);
+            chip_write32(bar1, chip_addr.wrapping_add(i as u32), u32::from_le_bytes(w));
+            i += 4;
+        }
+        relock_diag(bar1);
+        Ok(())
+    }
+
     /// Diagnostic SCAN of the PowerPC DCR bus (a small, separate register file
     /// reached via MPI2_DCR_ADDRESS/DATA — NOT the chip memory bus). lsirec only
     /// ever touches DCR_I2C_SELECT (0x307) and DCR_SBR_CONFIG (0x340); the rest is
