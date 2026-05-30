@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::cli::backup::BackupManifest;
+use crate::firmware::flash_layout::verify_flash_consistency;
 use crate::mpi::messages::MpiError;
 
 #[derive(Debug, Error)]
@@ -185,7 +186,69 @@ pub fn run(
         }
     }
 
+   // ADR-020 whole-flash consistency gate after restore (same as fw write).
+    post_write_whole_flash_verify(&bdf)?;
+
     Ok(())
+}
+
+/// Post-write whole-flash verify helper (mirrors fw.rs implementation).
+fn post_write_whole_flash_verify(bdf: &str) -> Result<(), crate::Error> {
+    use crate::sbr::transport::Bar1MmapSbrTransport;
+
+    const FLASH_WINDOW_ADDR: u32 = 0xFC000000;
+    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
+
+    let mut transport = match Bar1MmapSbrTransport::open(bdf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "WARN: post-write whole-flash verify: could not open diag back-door ({}), \
+                 skipping consistency check — verify backup region manually",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let chip_mem = match transport.read_chip_mem(FLASH_WINDOW_ADDR, FLASH_WINDOW_SIZE) {
+        Ok(mem) => mem,
+        Err(e) => {
+            eprintln!(
+                "WARN: post-write whole-flash verify: diag read failed ({}), \
+                 skipping consistency check — verify backup region manually",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    match verify_flash_consistency(&chip_mem) {
+        Ok(consistency) => {
+            if !consistency.consistent {
+                return Err(crate::Error::Other(format!(
+                    "POST-RESTORE VERIFICATION FAILED: FIRMWARE region version '{}' \
+                     does not match BACKUP region version '{}'. The card may be bricked. \
+                     Run 'lsi-flash backup' immediately to capture current state, then restore \
+                     from a known-good backup.",
+                    consistency.firmware_version, consistency.backup_version
+                )));
+            }
+            eprintln!(
+                "restore: whole-flash verify OK (FIRMWARE={}, BACKUP={})",
+                consistency.firmware_version, consistency.backup_version
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "WARN: post-write whole-flash verify: could not parse flash layout ({}), \
+                 skipping consistency check",
+                e
+            );
+            Ok(())
+        }
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {

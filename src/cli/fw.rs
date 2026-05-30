@@ -10,6 +10,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::firmware::validate::{check_fit, validate_image};
+use crate::firmware::flash_layout::verify_flash_consistency;
 use crate::mpi::messages::ImageType;
 
 fn sha_hex(b: &[u8]) -> String {
@@ -29,6 +30,68 @@ fn fw_banner(data: &[u8]) -> Option<String> {
         .map(|e| pos + e)
         .unwrap_or(data.len());
     std::str::from_utf8(&data[pos..end]).ok().map(String::from)
+}
+
+/// Perform whole-flash consistency check via diag back-door. Reads full 8MiB from 0xFC000000,
+/// calls verify_flash_consistency, and returns Err if FIRMWARE and BACKUP regions disagree.
+/// If the diag read itself fails, logs a warning but Ok(()) — don't false-fail the write.
+fn post_write_whole_flash_verify(bdf: &str) -> Result<(), crate::Error> {
+    use crate::sbr::transport::Bar1MmapSbrTransport;
+
+    const FLASH_WINDOW_ADDR: u32 = 0xFC000000;
+    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
+
+    let mut transport = match Bar1MmapSbrTransport::open(bdf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "WARN: post-write whole-flash verify: could not open diag back-door ({}), \
+                 skipping consistency check — verify backup region manually",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let chip_mem = match transport.read_chip_mem(FLASH_WINDOW_ADDR, FLASH_WINDOW_SIZE) {
+        Ok(mem) => mem,
+        Err(e) => {
+            eprintln!(
+                "WARN: post-write whole-flash verify: diag read failed ({}), \
+                 skipping consistency check — verify backup region manually",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    match verify_flash_consistency(&chip_mem) {
+        Ok(consistency) => {
+            if !consistency.consistent {
+                return Err(crate::Error::Other(format!(
+                    "POST-WRITE VERIFICATION FAILED: FIRMWARE region version '{}' \
+                     does not match BACKUP region version '{}'. The card may be bricked. \
+                     Run 'lsi-flash backup' immediately to capture current state, then restore \
+                     from a known-good backup.",
+                    consistency.firmware_version, consistency.backup_version
+                )));
+            }
+            eprintln!(
+                "fw write: whole-flash verify OK (FIRMWARE={}, BACKUP={})",
+                consistency.firmware_version, consistency.backup_version
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // If parsing the layout fails, we can't verify — warn but don't fail the write.
+            eprintln!(
+                "WARN: post-write whole-flash verify: could not parse flash layout ({}), \
+                 skipping consistency check",
+                e
+            );
+            Ok(())
+        }
+    }
 }
 
 /// `fw read` — read the firmware region. By default reads the **flash** copy
@@ -167,5 +230,8 @@ pub fn run_write(bdf: String, from_file: &Path, yes: bool) -> Result<(), crate::
             e
         ),
     }
-    Ok(())
+
+    // ADR-020 whole-flash consistency gate: after FW_DOWNLOAD, read full flash via diag back-door
+    // and require active == backup. Mismatch → fail loudly with both versions named.
+    post_write_whole_flash_verify(&bdf)
 }

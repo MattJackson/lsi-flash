@@ -439,13 +439,52 @@ mod tests {
         }
     }
 
-    #[test]
+   #[test]
     fn flash_too_short_returns_err() {
         let short_flash = vec![0u8; 1024];
         assert!(matches!(
             verify_flash_consistency(&short_flash),
             Err(FwError::TooShort(_))
         ));
+    }
+
+    /// Test the post-write verify gate: consistent versions should pass.
+    #[test]
+    fn post_write_verify_gate_passes_on_consistent_versions() {
+        let flash = build_synthetic_fixture("07.15.08.00", "07.15.08.00");
+        let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
+        
+        assert!(consistency.consistent, "matching versions should pass verify gate");
+        assert_eq!(consistency.firmware_version, "@(#)MPTFW-07.15.08.00-IE");
+        assert_eq!(consistency.backup_version, "@(#)MPTFW-07.15.08.00-IE");
+    }
+
+    /// Test the post-write verify gate: mismatched versions should fail (brick case).
+    #[test]
+    fn post_write_verify_gate_fails_on_mismatched_versions() {
+        let flash = build_synthetic_fixture("07.15.08.00", "20.00.07.00");
+        let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
+        
+        assert!(
+            !consistency.consistent,
+            "mismatched versions should FAIL verify gate (this is the brick case)"
+        );
+        assert_eq!(consistency.firmware_version, "@(#)MPTFW-07.15.08.00-IE");
+        assert_eq!(consistency.backup_version, "@(#)MPTFW-20.00.07.00-IE");
+    }
+
+    /// Test that the verify gate correctly identifies old vs new version mismatch.
+    #[test]
+    fn post_write_verify_gate_detects_old_backup_mismatch() {
+        // This simulates the exact brick scenario: active=07.15.08.00, backup=20.00.07.00
+        let flash = build_synthetic_fixture("07.15.08.00", "20.00.07.00");
+        let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
+        
+        assert!(!consistency.consistent);
+        
+        // Verify both versions are named in the result (for error message)
+        assert_eq!(consistency.firmware_version, "@(#)MPTFW-07.15.08.00-IE");
+        assert_eq!(consistency.backup_version, "@(#)MPTFW-20.00.07.00-IE");
     }
 }
 
