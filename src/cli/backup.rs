@@ -9,6 +9,7 @@ use crate::card::BackupReport;
 use crate::mpi::messages::{FwUploadRequest, ImageType, IocStatus, MpiError};
 use crate::mpi::mock_ioc::MockIoc;
 use crate::mpi::session::{Personality, Session};
+use crate::sbr::transport::Bar1MmapSbrTransport;
 
 #[derive(Debug, Error)]
 pub enum BackupError {
@@ -96,7 +97,7 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
         let mock_ioc = MockIoc::new(Personality::It);
         let mut session = Session::new(mock_ioc);
         session.raw_ioc_init(&init_req)?;
-        return run_backup_with_session(&mut session, &out_dir, json);
+        return run_backup_with_session(&mut session, &out_dir, json, Some(&bdf));
     }
 
     {
@@ -151,7 +152,7 @@ pub fn run(out: Option<String>, json: bool, pci: Option<String>) -> Result<(), c
             .map_err(|e| crate::Error::Other(format!("RealIoc::open({}) failed: {}", bdf, e)))?;
         let mut session = Session::new(real_ioc);
         let _ = session.raw_ioc_init(&init_req);
-        run_backup_with_session(&mut session, &out_dir, json)
+        run_backup_with_session(&mut session, &out_dir, json, Some(&bdf))
     }
 }
 
@@ -198,6 +199,7 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
     session: &mut Session<B>,
     out_dir: &Path,
     json: bool,
+    bdf: Option<&str>,
 ) -> Result<(), crate::Error> {
     let mut manifest = BackupManifest {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -256,6 +258,39 @@ fn run_backup_with_session<B: crate::mpi::session::IocBackend>(
             sha256,
             size: actual_size as u64,
         });
+    }
+
+    const FLASH_CHIP_ADDR: u32 = 0xFC000000;
+    const FLASH_SIZE: usize = 8 * 1024 * 1024;
+    let flash_path = out_dir.join("flash-full.bin");
+
+    if let Some(bdf_str) = bdf {
+        if let Ok(mut transport) = Bar1MmapSbrTransport::open(bdf_str) {
+            match transport.read_chip_mem(FLASH_CHIP_ADDR, FLASH_SIZE) {
+                Ok(flash_data) => {
+                    std::fs::write(&flash_path, &flash_data)?;
+                    let sha256 = sha256_hex(&flash_data);
+                    manifest.artifacts.push(BackupArtifact {
+                        path: "flash-full.bin".to_string(),
+                        image_type: "FullFlash".to_string(),
+                        sha256,
+                        size: flash_data.len() as u64,
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: backup: diag back-door full-flash read failed: {} — \
+                         continuing with partial backup",
+                        e
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "warning: backup: could not open Bar1MmapSbrTransport for full-flash capture — \
+                 continuing without flash-full.bin"
+            );
+        }
     }
 
     let manifest_path = out_dir.join("manifest.toml");
@@ -337,6 +372,40 @@ mod tests {
         session.raw_ioc_init(&init_req).unwrap();
 
         session
+    }
+
+    #[test]
+    fn backup_with_mock_no_full_flash() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("backup-mock");
+
+        ensure_dir_empty(&out).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+
+        let mut mock_ioc = MockIoc::new(Personality::It);
+        mock_ioc.preload_partition(ImageType::Fw, vec![0xAA; 1024]);
+        mock_ioc.preload_partition(ImageType::Bios, vec![0xBB; 512]);
+        mock_ioc.preload_partition(ImageType::NvData, vec![0xCC; 256]);
+
+        let mut session = Session::new(mock_ioc);
+        let init_req = crate::mpi::messages::IocInitRequest {
+            who_init: 0x04,
+            host_msix_vectors: 0,
+            reply_descriptor_post_queue_depth: 16,
+            system_request_frame_base_address: 0,
+            reply_descriptor_post_queue_address: 0,
+        };
+        session.raw_ioc_init(&init_req).unwrap();
+
+        let result = run_backup_with_session(&mut session, &out, false, None);
+        assert!(result.is_ok());
+
+        assert!(out.join("firmware.bin").exists());
+        assert!(out.join("bios.rom").exists());
+        assert!(out.join("nvdata.bin").exists());
+        assert!(out.join("manifest.toml").exists());
+        // Mock backend should not produce flash-full.bin (no real BAR1)
+        assert!(!out.join("flash-full.bin").exists(), "Mock should not capture full flash");
     }
 
     #[test]
