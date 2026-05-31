@@ -102,7 +102,7 @@ pub(crate) fn dcr_read32(bar1: &mut [u8], offset: u32) -> Result<u32, I2cError> 
 
 /// DCR write32 helper. Cites lsirec.c:40-41, 113-117.
 /// Writes offset to MPI2_DCR_ADDRESS, writes data to MPI2_DCR_DATA.
-fn dcr_write32(bar1: &mut [u8], offset: u32, data: u32) -> Result<(), I2cError> {
+pub(crate) fn dcr_write32(bar1: &mut [u8], offset: u32, data: u32) -> Result<(), I2cError> {
     write32(bar1, MPI2_DCR_ADDRESS as u32, offset);
     write32(bar1, MPI2_DCR_DATA as u32, data);
     Ok(())
@@ -126,6 +126,24 @@ pub(crate) fn chip_write32(bar1: &mut [u8], chip_addr: u32, data: u32) {
     write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
     write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
     write32(bar1, MPI2_DIAG_RW_DATA, data);
+}
+
+/// Write a 16-bit value to a chip address via DIAG_RW using a HALFWORD MMIO write
+/// to the DATA register. Tests whether the diag engine emits a halfword chip-bus
+/// write (the width the flash command interface requires).
+pub(crate) fn chip_write16(bar1: &mut [u8], chip_addr: u32, data: u16) {
+    use crate::mpi::doorbell::write16;
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
+    write16(bar1, MPI2_DIAG_RW_DATA, data);
+}
+
+/// Write an 8-bit value to a chip address via DIAG_RW using a BYTE MMIO write.
+pub(crate) fn chip_write8(bar1: &mut [u8], chip_addr: u32, data: u8) {
+    use crate::mpi::doorbell::write8;
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_HIGH, 0);
+    write32(bar1, MPI2_DIAG_RW_ADDRESS_LOW, chip_addr);
+    write8(bar1, MPI2_DIAG_RW_DATA, data);
 }
 
 /// Delay for I2C timing. Cites lsirec.c:392-395.

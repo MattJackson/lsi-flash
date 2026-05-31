@@ -259,6 +259,21 @@ pub(crate) fn write32(bar1: &mut [u8], offset: u32, data: u32) {
     unsafe { std::ptr::write_volatile(ptr, data) }
 }
 
+/// Write 16-bit value to BAR1 offset (narrower MMIO access). Used to test whether
+/// the DIAG_RW engine propagates a halfword chip write (flash command width).
+#[inline]
+pub(crate) fn write16(bar1: &mut [u8], offset: u32, data: u16) {
+    let ptr = unsafe { bar1.as_mut_ptr().add(offset as usize) } as *mut u16;
+    unsafe { std::ptr::write_volatile(ptr, data) }
+}
+
+/// Write 8-bit value to BAR1 offset (narrowest MMIO access).
+#[inline]
+pub(crate) fn write8(bar1: &mut [u8], offset: u32, data: u8) {
+    let ptr = unsafe { bar1.as_mut_ptr().add(offset as usize) };
+    unsafe { std::ptr::write_volatile(ptr, data) }
+}
+
 // chip_*/dcr_* helpers below mirror lsirec.c's indirect register access
 // path. Not used yet — preserved for the upcoming HCB hostboot path
 // (cycle 3+) which needs DIAG_RW + DCR indirect reads/writes to drive

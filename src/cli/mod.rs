@@ -254,9 +254,12 @@ pub enum DebugCommand {
         /// Chip-internal address (hex, e.g. 0xFC200000).
         #[arg(long, value_name = "0xNNNNNNNN")]
         addr: String,
-        /// Single 32-bit value to write (hex, e.g. 0x12345678). Mutually exclusive with --in.
+        /// Single value to write (hex, e.g. 0x12345678). Mutually exclusive with --in.
         #[arg(long, value_name = "0xNNNNNNNN")]
         value: Option<String>,
+        /// MMIO write width in bits (8/16/32) for --value. Tests diag-engine write granularity.
+        #[arg(long, default_value = "32")]
+        width: u8,
         /// Raw byte file to write starting at --addr. Mutually exclusive with --value.
         #[arg(long, value_name = "PATH")]
         r#in: Option<std::path::PathBuf>,
@@ -275,6 +278,21 @@ pub enum DebugCommand {
         /// Number of DCR words to read.
         #[arg(long, default_value = "256")]
         count: usize,
+    },
+    /// WRITE a single 32-bit value to a PowerPC DCR via the diag indirect path
+    /// (same mechanism lsirec uses for 0x307/0x340). Used to arm the flash
+    /// controller (e.g. 0x29c=7, RMW 0x299) exactly as the firmware does. IOC-free.
+    /// DESTRUCTIVE (writes a chip register).
+    DcrWrite {
+        /// DCR offset (hex, e.g. 0x29c).
+        #[arg(long)]
+        addr: String,
+        /// 32-bit value to write (hex, e.g. 0x7).
+        #[arg(long)]
+        value: String,
+        /// Confirm this destructive DCR write.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -449,6 +467,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
             DebugCommand::ChipWrite {
                 addr,
                 value,
+                width,
                 r#in,
                 yes,
             } => {
@@ -461,24 +480,31 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                     .map_err(|e| crate::Error::Other(format!("{}", e)))?;
                 let chip_addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
                     .map_err(|e| crate::Error::Other(format!("bad --addr {}: {}", addr, e)))?;
-                let bytes: Vec<u8> = match (value, r#in) {
+                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
+                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
+                match (value, r#in) {
                     (Some(v), None) => {
                         let w = u32::from_str_radix(v.trim_start_matches("0x"), 16)
                             .map_err(|e| crate::Error::Other(format!("bad --value {}: {}", v, e)))?;
-                        w.to_le_bytes().to_vec()
+                        t.write_chip_word(chip_addr, w, width)
+                            .map_err(|e| crate::Error::Other(format!("chip write: {}", e)))?;
+                        eprintln!(
+                            "chip-write{}b @0x{:08x} <- 0x{:08x}",
+                            width, chip_addr, w
+                        );
                     }
-                    (None, Some(p)) => std::fs::read(&p)?,
+                    (None, Some(p)) => {
+                        let bytes = std::fs::read(&p)?;
+                        t.write_chip_mem(chip_addr, &bytes)
+                            .map_err(|e| crate::Error::Other(format!("chip write: {}", e)))?;
+                        eprintln!("chip-write @0x{:08x}: {} bytes written", chip_addr, bytes.len());
+                    }
                     _ => {
                         return Err(crate::Error::Other(
                             "specify exactly one of --value or --in".into(),
                         ))
                     }
                 };
-                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
-                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
-                t.write_chip_mem(chip_addr, &bytes)
-                    .map_err(|e| crate::Error::Other(format!("chip write: {}", e)))?;
-                eprintln!("chip-write @0x{:08x}: {} bytes written", chip_addr, bytes.len());
                 Ok(())
             }
             DebugCommand::DcrScan { addr, count } => {
@@ -496,6 +522,34 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                     let _ = std::io::stdout().flush();
                 })
                 .map_err(|e| crate::Error::Other(format!("dcr scan: {}", e)))?;
+                Ok(())
+            }
+            DebugCommand::DcrWrite { addr, value, yes } => {
+                if !yes {
+                    return Err(crate::Error::Other(
+                        "refusing DCR write without --yes (destructive chip-register write)".into(),
+                    ));
+                }
+                let bdf = crate::card::resolve_bdf(cli.pci.as_deref())
+                    .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+                let off = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
+                    .map_err(|e| crate::Error::Other(format!("bad --addr: {}", e)))?;
+                let val = u32::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|e| crate::Error::Other(format!("bad --value: {}", e)))?;
+                let mut t = crate::sbr::transport::Bar1MmapSbrTransport::open(&bdf)
+                    .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
+                let before = t
+                    .read_dcr(off)
+                    .map_err(|e| crate::Error::Other(format!("read_dcr: {}", e)))?;
+                t.write_dcr(off, val)
+                    .map_err(|e| crate::Error::Other(format!("write_dcr: {}", e)))?;
+                let after = t
+                    .read_dcr(off)
+                    .map_err(|e| crate::Error::Other(format!("read_dcr: {}", e)))?;
+                println!(
+                    "DCR 0x{:04x}: was 0x{:08x}, wrote 0x{:08x}, now 0x{:08x}",
+                    off, before, val, after
+                );
                 Ok(())
             }
         },

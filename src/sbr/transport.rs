@@ -458,6 +458,59 @@ impl Bar1MmapSbrTransport {
         relock_diag(bar1);
         Ok(())
     }
+
+    /// Write a single 32-bit value to a PowerPC DCR via the diag indirect path
+    /// (BAR1 0x3c ADDRESS / 0x38 DATA), the same mechanism lsirec uses for
+    /// DCR_I2C_SELECT (0x307) / DCR_SBR_CONFIG (0x340). Symmetric unlock/relock,
+    /// NO RESET. IOC-free. Used to arm the flash controller (0x29c/0x299) exactly
+    /// as the firmware does. DESTRUCTIVE (writes a chip register).
+    pub fn write_dcr(&mut self, offset: u32, data: u32) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{dcr_write32, relock_diag, unlock_diag};
+
+        // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        dcr_write32(bar1, offset, data)
+            .map_err(|e| SbrTransportError::Transport(format!("dcr_write32: {}", e)))?;
+        relock_diag(bar1);
+        Ok(())
+    }
+
+    /// Write a single value to a chip address via DIAG_RW at a chosen width
+    /// (8/16/32 bits). Tests whether the diag engine can emit narrower-than-32-bit
+    /// chip-bus writes (the byte/halfword width the flash command interface needs).
+    /// Symmetric unlock/relock, NO RESET. DESTRUCTIVE.
+    pub fn write_chip_word(
+        &mut self,
+        chip_addr: u32,
+        data: u32,
+        width: u8,
+    ) -> Result<(), SbrTransportError> {
+        use crate::sbr::i2c::{chip_write16, chip_write32, chip_write8, relock_diag, unlock_diag};
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        match width {
+            8 => chip_write8(bar1, chip_addr, data as u8),
+            16 => chip_write16(bar1, chip_addr, data as u16),
+            _ => chip_write32(bar1, chip_addr, data),
+        }
+        relock_diag(bar1);
+        Ok(())
+    }
+
+    /// Read a single DCR (convenience wrapper over the indirect path).
+    pub fn read_dcr(&mut self, offset: u32) -> Result<u32, SbrTransportError> {
+        use crate::sbr::i2c::{dcr_read32, relock_diag, unlock_diag};
+        let bar1: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(self.va, self.len) };
+        unlock_diag(bar1)
+            .map_err(|e| SbrTransportError::Transport(format!("unlock_diag: {}", e)))?;
+        let v = dcr_read32(bar1, offset)
+            .map_err(|e| SbrTransportError::Transport(format!("dcr_read32: {}", e)))?;
+        relock_diag(bar1);
+        Ok(v)
+    }
 }
 
 impl SbrTransport for Bar1MmapSbrTransport {
