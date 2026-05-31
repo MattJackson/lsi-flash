@@ -9,9 +9,15 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::firmware::guard::{GuardedFlash, WriteIntent};
 use crate::firmware::validate::{check_fit, validate_image};
-use crate::firmware::flash_layout::verify_flash_consistency;
 use crate::mpi::messages::ImageType;
+
+/// Directory where guarded-flash writes drop the pre-write recovery snapshot. Current working
+/// directory — discoverable and deterministic (no timestamp in the path; one snapshot per card).
+fn snapshot_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
 
 fn sha_hex(b: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -30,68 +36,6 @@ fn fw_banner(data: &[u8]) -> Option<String> {
         .map(|e| pos + e)
         .unwrap_or(data.len());
     std::str::from_utf8(&data[pos..end]).ok().map(String::from)
-}
-
-/// Perform whole-flash consistency check via diag back-door. Reads full 8MiB from 0xFC000000,
-/// calls verify_flash_consistency, and returns Err if FIRMWARE and BACKUP regions disagree.
-/// If the diag read itself fails, logs a warning but Ok(()) — don't false-fail the write.
-fn post_write_whole_flash_verify(bdf: &str) -> Result<(), crate::Error> {
-    use crate::sbr::transport::Bar1MmapSbrTransport;
-
-    const FLASH_WINDOW_ADDR: u32 = 0xFC000000;
-    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
-
-    let mut transport = match Bar1MmapSbrTransport::open(bdf) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "WARN: post-write whole-flash verify: could not open diag back-door ({}), \
-                 skipping consistency check — verify backup region manually",
-                e
-            );
-            return Ok(());
-        }
-    };
-
-    let chip_mem = match transport.read_chip_mem(FLASH_WINDOW_ADDR, FLASH_WINDOW_SIZE) {
-        Ok(mem) => mem,
-        Err(e) => {
-            eprintln!(
-                "WARN: post-write whole-flash verify: diag read failed ({}), \
-                 skipping consistency check — verify backup region manually",
-                e
-            );
-            return Ok(());
-        }
-    };
-
-    match verify_flash_consistency(&chip_mem) {
-        Ok(consistency) => {
-            if !consistency.consistent {
-                return Err(crate::Error::Other(format!(
-                    "POST-WRITE VERIFICATION FAILED: FIRMWARE region version '{}' \
-                     does not match BACKUP region version '{}'. The card may be bricked. \
-                     Run 'lsi-flash backup' immediately to capture current state, then restore \
-                     from a known-good backup.",
-                    consistency.firmware_version, consistency.backup_version
-                )));
-            }
-            eprintln!(
-                "fw write: whole-flash verify OK (FIRMWARE={}, BACKUP={})",
-                consistency.firmware_version, consistency.backup_version
-            );
-            Ok(())
-        }
-        Err(e) => {
-            // If parsing the layout fails, we can't verify — warn but don't fail the write.
-            eprintln!(
-                "WARN: post-write whole-flash verify: could not parse flash layout ({}), \
-                 skipping consistency check",
-                e
-            );
-            Ok(())
-        }
-    }
 }
 
 /// `fw read` — read the firmware region. By default reads the **flash** copy
@@ -206,32 +150,19 @@ pub fn run_write(bdf: String, from_file: &Path, yes: bool) -> Result<(), crate::
         }
     }
 
-    // Write (FW_DOWNLOAD).
-    card.write_region(ImageType::Fw, &image)
-        .map_err(|e| crate::Error::Other(format!("fw write: {}", e)))?;
-
-    // Check 5 — read-back verify (ADR-015 Rule 5).
-    match card.read_region(ImageType::Fw) {
-        Ok(rb) => {
-            let want = sha_hex(&image);
-            let got = sha_hex(&rb[..rb.len().min(image.len())]);
-            if want == got {
-                eprintln!("fw write: OK ({} bytes), read-back verified ✓", image.len());
-            } else {
-                return Err(crate::Error::Other(format!(
-                    "fw write: read-back MISMATCH (wrote {} got {}) — investigate before trusting",
-                    want, got
-                )));
-            }
-        }
-        Err(e) => eprintln!(
-            "fw write: OK ({} bytes), but read-back verify failed: {} (verify manually)",
-            image.len(),
-            e
-        ),
-    }
-
-    // ADR-020 whole-flash consistency gate: after FW_DOWNLOAD, read full flash via diag back-door
-    // and require active == backup. Mismatch → fail loudly with both versions named.
-    post_write_whole_flash_verify(&bdf)
+    // The guarded transaction (ADR-021) is the ONLY path bytes reach flash: it takes a mandatory
+    // pre-write snapshot (recovery image), writes via FW_DOWNLOAD, then enforces the postflight
+    // invariants (boot-critical zone unchanged, banks consistent, read-back matches intent) with
+    // a severity-driven response. Supersedes the old hand-rolled read-back + whole-flash verify.
+    let txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
+    txn.commit(
+        &mut *card,
+        WriteIntent {
+            region: ImageType::Fw,
+            bytes: image.clone(),
+            label: "firmware".into(),
+        },
+    )?;
+    eprintln!("fw write: OK ({} bytes) — guarded transaction verified ✓", image.len());
+    Ok(())
 }

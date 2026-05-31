@@ -186,10 +186,14 @@ pub trait Card: Send {
         Err(CardError::NotImplemented("read_region_itype"))
     }
 
-    /// Write one flash-chip region (FW / BIOS / NVDATA) via FW_DOWNLOAD.
-    /// DESTRUCTIVE. Shared primitive for `restore` and `fw/bios/nvdata write`.
-    /// (Erase-if-personality-change and HCB-on-lock live in the higher-level
-    /// `fw write` logic, not here — this is the raw region write.)
+    /// Write one flash-chip region (FW / BIOS / NVDATA) via FW_DOWNLOAD. DESTRUCTIVE.
+    ///
+    /// SAFETY CONTRACT (ADR-021): this is the raw, UNGUARDED region write. CLI verbs and any new
+    /// callers MUST NOT call it directly — route through `firmware::guard::GuardedFlash`, which
+    /// takes a mandatory pre-write snapshot and enforces the boot-critical-unchanged + bank-
+    /// consistency postflight invariants. Two cards were bricked by writes that skipped those
+    /// checks. The only legitimate direct callers are `GuardedFlash` itself (and a multi-region
+    /// `restore` invoked *inside* `GuardedFlash::commit_with`).
     fn write_region(
         &mut self,
         _image_type: crate::mpi::messages::ImageType,

@@ -774,7 +774,7 @@ mod tests {
         let transport_err = SbrTransportError::Transport("my error".into());
         assert_eq!(transport_err.to_string(), "transport: my error");
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test io");
+        let io_err = std::io::Error::other("test io");
         let err: SbrTransportError = io_err.into();
         assert!(err.to_string().contains("test io"));
     }

@@ -30,6 +30,18 @@ pub fn run(
 
     let bdf = crate::card::resolve_bdf(bdf.as_deref())
         .map_err(|e| crate::Error::Other(format!("{}", e)))?;
+
+    // Mandatory pre-erase recovery snapshot (ADR-021). Erase intentionally clears flash, so the
+    // boot-critical-unchanged invariant does not apply — but we MUST have a recovery image first.
+    // This enforces what was previously only a text plea ("ensure a fresh backup exists"): no
+    // snapshot (IOC-free diag read), no erase.
+    let snap_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let txn = crate::firmware::guard::GuardedFlash::begin(&bdf, &snap_dir)?;
+    eprintln!(
+        "erase: pre-erase recovery snapshot captured → {}",
+        txn.snapshot_path().display()
+    );
+
     let mut card = crate::card::discover_one(&bdf)
         .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
 

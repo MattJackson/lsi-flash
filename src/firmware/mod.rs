@@ -4,6 +4,7 @@
 //! Cites: references/upstream/lsiutil/lsi/mpi2_ioc.h (lines 1314-1362, 1365-1409)
 
 pub mod flash_layout;
+pub mod guard;
 pub mod inspect;
 pub mod synthesize;
 pub mod validate;

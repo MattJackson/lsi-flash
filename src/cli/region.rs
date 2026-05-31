@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 
+use crate::firmware::guard::{GuardedFlash, WriteIntent};
 use crate::mpi::messages::ImageType;
 
 /// Shared read/write subcommands for a flash-chip region.
@@ -99,35 +100,32 @@ pub fn run_write(
 
     let mut card = crate::card::discover_one(&bdf)
         .map_err(|e| crate::Error::Other(format!("discover_one({}): {}", bdf, e)))?;
-    card.write_region(image_type, &data)
-        .map_err(|e| crate::Error::Other(format!("{} write: {}", region, e)))?;
 
-    // Read-back verify (ADR-015 Rule 5): re-upload and compare sha.
-    match card.read_region(image_type) {
-        Ok(rb) => {
-            let want = sha_hex(&data);
-            let got = sha_hex(&rb[..rb.len().min(data.len())]);
-            if got == want {
-                eprintln!(
-                    "{} write: OK ({} bytes), read-back verified ✓",
-                    region,
-                    data.len()
-                );
-            } else {
-                return Err(crate::Error::Other(format!(
-                    "{} write: read-back MISMATCH (wrote {} got {}) — investigate before trusting",
-                    region, want, got
-                )));
-            }
-        }
-        Err(e) => eprintln!(
-            "{} write: OK ({} bytes), but read-back verify failed: {} (verify manually)",
-            region,
-            data.len(),
-            e
-        ),
-    }
+    // All flash writes go through the guarded transaction (ADR-021). For bios/nvdata this is the
+    // key fix: previously these writes had NO whole-flash check, so a write that spilled into the
+    // boot-critical region (the 2026-05-20 brick mechanism) went undetected. Now every byte of the
+    // boot-input zone is verified unchanged against the mandatory pre-write snapshot, and banks are
+    // checked for consistency, regardless of which region was targeted.
+    let txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
+    txn.commit(
+        &mut *card,
+        WriteIntent {
+            region: image_type,
+            bytes: data.clone(),
+            label: region.to_string(),
+        },
+    )?;
+    eprintln!(
+        "{} write: OK ({} bytes) — guarded transaction verified ✓",
+        region,
+        data.len()
+    );
     Ok(())
+}
+
+/// Directory where guarded-flash writes drop the pre-write recovery snapshot (current dir).
+fn snapshot_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 /// Dispatch a `bios`/`nvdata` region subcommand (fw has its own enum w/ extras).
