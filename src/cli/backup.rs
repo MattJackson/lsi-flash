@@ -405,7 +405,10 @@ mod tests {
         assert!(out.join("nvdata.bin").exists());
         assert!(out.join("manifest.toml").exists());
         // Mock backend should not produce flash-full.bin (no real BAR1)
-        assert!(!out.join("flash-full.bin").exists(), "Mock should not capture full flash");
+        assert!(
+            !out.join("flash-full.bin").exists(),
+            "Mock should not capture full flash"
+        );
     }
 
     #[test]

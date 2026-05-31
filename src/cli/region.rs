@@ -106,7 +106,7 @@ pub fn run_write(
     // boot-critical region (the 2026-05-20 brick mechanism) went undetected. Now every byte of the
     // boot-input zone is verified unchanged against the mandatory pre-write snapshot, and banks are
     // checked for consistency, regardless of which region was targeted.
-    let txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
+    let mut txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
     txn.commit(
         &mut *card,
         WriteIntent {

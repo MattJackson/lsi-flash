@@ -316,6 +316,18 @@ impl<B: IocBackend> Orchestrator<B> {
     /// Step 6: Download main firmware with verify-after-write (Rule 4).
     fn step_download_fw(&mut self, _image: Vec<u8>) -> Result<Phase, FlashError> {
         let target = mode_to_personality(self.mode);
+        // ADR-021 fail-closed guard. This orchestrator is a Stage-4 skeleton: today it only ever
+        // reaches here with an empty (stub) image. A real firmware image MUST be written through
+        // `firmware::guard::GuardedFlash` (mandatory snapshot + boot-critical/bank postflight), not
+        // the bare session FW_DOWNLOAD. Until that wiring lands, refuse any real download here so
+        // the guard can never be bypassed.
+        if !self.dry_run && !_image.is_empty() {
+            return Err(FlashError::SafetyGuard(
+                "orchestrator FW download must route through GuardedFlash (ADR-021); \
+                 Stage-4 guarded wiring not yet implemented — refusing unguarded FW_DOWNLOAD"
+                    .into(),
+            ));
+        }
         if self.dry_run {
             eprintln!(
                 "[dry-run] would download {} bytes of firmware (verify-after-write)",
@@ -339,6 +351,14 @@ impl<B: IocBackend> Orchestrator<B> {
     /// Step 7: Download BIOS option-ROM.
     fn step_download_bios(&mut self, _image: Vec<u8>) -> Result<Phase, FlashError> {
         let target = mode_to_personality(self.mode);
+        // ADR-021 fail-closed guard (see step_download_fw): no unguarded real BIOS write.
+        if !self.dry_run && !_image.is_empty() {
+            return Err(FlashError::SafetyGuard(
+                "orchestrator BIOS download must route through GuardedFlash (ADR-021); \
+                 Stage-4 guarded wiring not yet implemented — refusing unguarded FW_DOWNLOAD"
+                    .into(),
+            ));
+        }
         if self.dry_run {
             eprintln!("[dry-run] would download {} bytes of BIOS", _image.len());
         } else {
@@ -579,6 +599,25 @@ mod tests {
             result.is_ok(),
             "Dry-run orchestrator should complete successfully"
         );
+    }
+
+    #[test]
+    fn orchestrator_refuses_unguarded_real_fw_download() {
+        // ADR-021 fail-closed: a real (non-empty) image must NOT be written via the bare session
+        // path. Until Stage-4 GuardedFlash wiring exists, step_download_fw rejects it.
+        use crate::mpi::mock_ioc::MockIoc;
+        use crate::mpi::session::Session;
+
+        let session = Session::new(MockIoc::new(Personality::It));
+        let mut orch = Orchestrator::new(session, Mode::HBA, None, false, true, false);
+        let result = orch.step_download_fw(vec![0u8; 1024]); // non-empty, not dry-run
+        assert!(
+            matches!(result, Err(FlashError::SafetyGuard(_))),
+            "real FW download outside GuardedFlash must fail closed, got {result:?}"
+        );
+
+        let result_bios = orch.step_download_bios(vec![0u8; 1024]);
+        assert!(matches!(result_bios, Err(FlashError::SafetyGuard(_))));
     }
 
     #[test]

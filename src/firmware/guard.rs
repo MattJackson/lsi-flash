@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::card::Card;
-use crate::firmware::flash_layout::{parse_flash_layout, verify_flash_consistency, REGION_FIRMWARE};
+use crate::firmware::flash_layout::{
+    parse_flash_layout, verify_flash_consistency, REGION_BIOS, REGION_FIRMWARE, REGION_NVDATA,
+};
 use crate::firmware::validate::validate_image;
 use crate::mpi::messages::ImageType;
 
@@ -60,6 +62,11 @@ pub const BOOT_CRITICAL: &[BootCriticalRegion] = &[BootCriticalRegion {
 /// [`GuardedFlash::commit`]. Ordered so `max` picks the worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
+    /// Surfaced loudly but does not fail the write: a change outside the intended region that is
+    /// NOT boot-critical. We can't yet hard-fail this without bricked-hardware proof of what a
+    /// clean FW_DOWNLOAD legitimately touches (firmware-side metadata/checksum updates), so it is
+    /// reported for review. Upgrade to `Error` once observed on a live card.
+    Warn,
     /// Card still alive and recoverable (boot-critical intact). Worth one rollback attempt.
     Error,
     /// Boot-critical zone changed, or banks diverged in a way a re-write can't safely fix.
@@ -78,7 +85,11 @@ pub struct Violation {
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{:?}] {}: {}", self.severity, self.invariant, self.detail)
+        write!(
+            f,
+            "[{:?}] {}: {}",
+            self.severity, self.invariant, self.detail
+        )
     }
 }
 
@@ -154,6 +165,8 @@ impl fmt::Display for GuardError {
                         if *rolled_back { "yes" } else { "FAILED" },
                         snapshot_path.display()
                     ),
+                    // Warn never escalates to a failed transaction; included for exhaustiveness.
+                    Severity::Warn => write!(f, "  (warning-level; recovery image: {})", snapshot_path.display()),
                 }
             }
         }
@@ -216,6 +229,24 @@ impl FlashImage {
     }
 }
 
+/// Reads the full flash image. Abstracted so the transaction's orchestration (snapshot, post-write
+/// read-back, post-rollback read) can be driven by a mock in tests — the real impl talks to
+/// hardware via the diag back door.
+pub trait FlashReader {
+    fn read_full_flash(&mut self) -> Result<FlashImage, GuardError>;
+}
+
+/// Production reader: the IOC-free diag back door.
+struct DiagReader {
+    bdf: String,
+}
+
+impl FlashReader for DiagReader {
+    fn read_full_flash(&mut self) -> Result<FlashImage, GuardError> {
+        FlashImage::from_card_diag(&self.bdf)
+    }
+}
+
 /// What the caller intends to write, with the target region named explicitly so there is never
 /// any "backup vs current" ambiguity about where bytes land.
 pub struct WriteIntent {
@@ -255,8 +286,9 @@ pub fn preflight(snapshot: &FlashImage, intent: &WriteIntent) -> Result<(), Guar
     // 3. The target region must exist in the card's OWN FLASH_LAYOUT (parsed from the snapshot).
     //    A Fw write to a card whose layout has no FIRMWARE region = wrong image / layout mismatch.
     if let Some(code) = region_code(intent.region) {
-        let layout = parse_flash_layout(snapshot.bytes())
-            .map_err(|e| GuardError::SnapshotNotRestorable(format!("snapshot layout parse: {e}")))?;
+        let layout = parse_flash_layout(snapshot.bytes()).map_err(|e| {
+            GuardError::SnapshotNotRestorable(format!("snapshot layout parse: {e}"))
+        })?;
         if layout.region_span(code).is_none() {
             return Err(GuardError::UnknownTargetRegion(intent.region));
         }
@@ -290,6 +322,9 @@ pub fn postflight(pre: &FlashImage, post: &FlashImage, intent: &WriteIntent) -> 
     if let Some(v) = check_target_readback(post, intent) {
         violations.push(v);
     }
+    if let Some(v) = check_write_confined_to_target(pre, post, intent) {
+        violations.push(v);
+    }
     violations
 }
 
@@ -305,8 +340,8 @@ fn check_boot_critical_unchanged(pre: &FlashImage, post: &FlashImage) -> Option<
         let a = pre.region(r.start, r.end);
         let b = post.region(r.start, r.end);
         if a != b {
-            let changed = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count()
-                + a.len().abs_diff(b.len());
+            let changed =
+                a.iter().zip(b.iter()).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
             return Some(Violation {
                 invariant: "BootCriticalUnchanged",
                 severity: Severity::Critical,
@@ -363,11 +398,66 @@ fn check_target_readback(post: &FlashImage, intent: &WriteIntent) -> Option<Viol
     None
 }
 
-/// Map a FW_DOWNLOAD `ImageType` to its FLASH_LAYOUT region-type code, where known. Returns
-/// `None` for regions whose layout code is not yet confirmed (we never guess an offset).
+/// True if `offset` falls in any boot-critical region.
+fn in_boot_critical(offset: usize) -> bool {
+    BOOT_CRITICAL
+        .iter()
+        .any(|r| offset >= r.start && offset < r.end)
+}
+
+/// Every byte OUTSIDE the intended target region must equal the snapshot. Catches a write that
+/// spilled beyond its region (the 2026-05-20 BIOS-into-boot-input mechanism). Boot-critical changes
+/// are already reported as Critical by `check_boot_critical_unchanged`, so this excludes that zone
+/// and reports the *remaining* out-of-region changes as `Warn`: we cannot yet hard-fail them
+/// without bricked-hardware proof of what a clean FW_DOWNLOAD legitimately rewrites outside its
+/// nominal region (e.g. directory/checksum metadata). Computable only where the region span is
+/// known (FW/BIOS/NVDATA).
+fn check_write_confined_to_target(
+    pre: &FlashImage,
+    post: &FlashImage,
+    intent: &WriteIntent,
+) -> Option<Violation> {
+    let code = region_code(intent.region)?;
+    // Use the snapshot's layout — it's the stable, known-good geometry.
+    let layout = parse_flash_layout(pre.bytes()).ok()?;
+    let (off, size) = layout.region_span(code)?;
+    let (tstart, tend) = (off as usize, off as usize + size as usize);
+    let n = pre.len().min(post.len());
+    let (a, b) = (pre.bytes(), post.bytes());
+    let mut outside = 0usize;
+    let mut first = None;
+    for i in 0..n {
+        if (i >= tstart && i < tend) || in_boot_critical(i) {
+            continue;
+        }
+        if a[i] != b[i] {
+            outside += 1;
+            if first.is_none() {
+                first = Some(i);
+            }
+        }
+    }
+    first.map(|f| Violation {
+        invariant: "WriteConfinedToTarget",
+        severity: Severity::Warn,
+        detail: format!(
+            "{} bytes changed outside the {:?} region (0x{:06X}-0x{:06X}); first at 0x{:06X} — \
+             not boot-critical, review (a clean write should touch only its region)",
+            outside, intent.region, tstart, tend, f
+        ),
+    })
+}
+
+/// Map a FW_DOWNLOAD `ImageType` to its FLASH_LAYOUT region-type code. For FW/BIOS the
+/// FW_DOWNLOAD ITYPE value equals the region code (ITYPE_FW=0x01=REGION_FIRMWARE,
+/// ITYPE_BIOS=0x02=REGION_BIOS — mpi2_ioc.h:1154-1155 vs :1507-1508); NVDATA follows the same
+/// value correspondence (REGION_NVDATA=0x03, mpi2_ioc.h:1509). `None` for regions whose layout
+/// code is not confirmed (we never guess an offset).
 fn region_code(t: ImageType) -> Option<u8> {
     match t {
         ImageType::Fw => Some(REGION_FIRMWARE),
+        ImageType::Bios => Some(REGION_BIOS),
+        ImageType::NvData => Some(REGION_NVDATA),
         _ => None,
     }
 }
@@ -391,7 +481,7 @@ fn sha_hex(b: &[u8]) -> String {
 /// A guarded flash-write transaction. Construct with [`begin`](Self::begin) (takes + persists the
 /// mandatory snapshot), then call [`commit`](Self::commit) for each region write.
 pub struct GuardedFlash {
-    bdf: String,
+    reader: Box<dyn FlashReader>,
     snapshot: FlashImage,
     snapshot_path: PathBuf,
 }
@@ -400,7 +490,23 @@ impl GuardedFlash {
     /// Take the mandatory pre-write snapshot (IOC-free diag read) and persist it as the recovery
     /// image under `save_dir`. No snapshot ⇒ no write.
     pub fn begin(bdf: &str, save_dir: &Path) -> Result<Self, GuardError> {
-        let snapshot = FlashImage::from_card_diag(bdf)?;
+        Self::begin_with(
+            Box::new(DiagReader {
+                bdf: bdf.to_string(),
+            }),
+            bdf,
+            save_dir,
+        )
+    }
+
+    /// `begin` with an injected reader. The production path uses [`DiagReader`]; tests supply a
+    /// mock so the transaction's orchestration can be exercised without hardware.
+    fn begin_with(
+        mut reader: Box<dyn FlashReader>,
+        bdf: &str,
+        save_dir: &Path,
+    ) -> Result<Self, GuardError> {
+        let snapshot = reader.read_full_flash()?;
         if snapshot.len() != FLASH_SIZE {
             return Err(GuardError::SnapshotNotRestorable(format!(
                 "diag read returned {} bytes, expected {}",
@@ -418,7 +524,7 @@ impl GuardedFlash {
             sha_hex(snapshot.bytes())
         );
         Ok(Self {
-            bdf: bdf.to_string(),
+            reader,
             snapshot,
             snapshot_path,
         })
@@ -431,7 +537,7 @@ impl GuardedFlash {
 
     /// Preflight → write → postflight, with a severity-driven response. The only place a region
     /// write is issued.
-    pub fn commit(&self, card: &mut dyn Card, intent: WriteIntent) -> Result<(), GuardError> {
+    pub fn commit(&mut self, card: &mut dyn Card, intent: WriteIntent) -> Result<(), GuardError> {
         preflight(&self.snapshot, &intent)?;
         eprintln!(
             "guarded-flash: preflight OK — writing {} ({} bytes) to {:?}",
@@ -443,15 +549,25 @@ impl GuardedFlash {
         card.write_region(intent.region, &intent.bytes)
             .map_err(|e| GuardError::WriteFailed(e.to_string()))?;
 
-        let post = FlashImage::from_card_diag(&self.bdf)
+        let post = self
+            .reader
+            .read_full_flash()
             .map_err(|e| GuardError::PostReadFailed(e.to_string()))?;
         let violations = postflight(&self.snapshot, &post, &intent);
 
         match worst_severity(&violations) {
             None => {
                 eprintln!(
-                    "guarded-flash: postflight OK ✓ — boot-critical intact, banks consistent, read-back matches"
+                    "guarded-flash: postflight OK ✓ — boot-critical intact, banks consistent, read-back matches, write confined to region"
                 );
+                Ok(())
+            }
+            Some(Severity::Warn) => {
+                // Non-fatal: a change outside the target region that is NOT boot-critical. Surface
+                // loudly; the write stands (boot-critical intact, banks consistent).
+                for v in &violations {
+                    eprintln!("guarded-flash: WARNING — {v}");
+                }
                 Ok(())
             }
             Some(Severity::Critical) => {
@@ -483,12 +599,14 @@ impl GuardedFlash {
     /// invariants that don't need a single target region (boot-critical + bank consistency).
     /// No auto-rollback (the regions touched are opaque to us); on failure the saved snapshot is
     /// the recovery image.
-    pub fn commit_with<F>(&self, write: F) -> Result<(), GuardError>
+    pub fn commit_with<F>(&mut self, write: F) -> Result<(), GuardError>
     where
         F: FnOnce() -> Result<(), crate::Error>,
     {
         write().map_err(|e| GuardError::WriteFailed(e.to_string()))?;
-        let post = FlashImage::from_card_diag(&self.bdf)
+        let post = self
+            .reader
+            .read_full_flash()
             .map_err(|e| GuardError::PostReadFailed(e.to_string()))?;
         let mut violations = Vec::new();
         if let Some(v) = check_boot_critical_unchanged(&self.snapshot, &post) {
@@ -498,7 +616,7 @@ impl GuardedFlash {
             violations.push(v);
         }
         match worst_severity(&violations) {
-            None => {
+            None | Some(Severity::Warn) => {
                 eprintln!(
                     "guarded-flash: postflight OK ✓ — boot-critical intact, banks consistent"
                 );
@@ -517,8 +635,13 @@ impl GuardedFlash {
     /// that region. Only attempted for non-critical failures (boot-critical intact). After the
     /// re-write, confirms boot-critical is still untouched — if the rollback itself disturbed it,
     /// that is a hard failure surfaced to the caller.
-    fn try_rollback(&self, card: &mut dyn Card, intent: &WriteIntent) -> Result<(), GuardError> {
-        let code = region_code(intent.region).ok_or(GuardError::UnknownTargetRegion(intent.region))?;
+    fn try_rollback(
+        &mut self,
+        card: &mut dyn Card,
+        intent: &WriteIntent,
+    ) -> Result<(), GuardError> {
+        let code =
+            region_code(intent.region).ok_or(GuardError::UnknownTargetRegion(intent.region))?;
         let layout = parse_flash_layout(self.snapshot.bytes())
             .map_err(|e| GuardError::SnapshotNotRestorable(e.to_string()))?;
         let (off, size) = layout
@@ -534,7 +657,9 @@ impl GuardedFlash {
         );
         card.write_region(intent.region, &orig)
             .map_err(|e| GuardError::WriteFailed(e.to_string()))?;
-        let post = FlashImage::from_card_diag(&self.bdf)
+        let post = self
+            .reader
+            .read_full_flash()
             .map_err(|e| GuardError::PostReadFailed(e.to_string()))?;
         if let Some(v) = check_boot_critical_unchanged(&self.snapshot, &post) {
             return Err(GuardError::PostflightFailed {
@@ -669,7 +794,9 @@ mod tests {
         let intent = intent(ImageType::Bios, vec![0u8; 64]);
         let violations = postflight(&pre, &post, &intent);
         assert!(
-            violations.iter().any(|v| v.invariant == "BootCriticalUnchanged"),
+            violations
+                .iter()
+                .any(|v| v.invariant == "BootCriticalUnchanged"),
             "boot-critical violation must be present"
         );
         assert_eq!(worst_severity(&violations), Some(Severity::Critical));
@@ -690,5 +817,253 @@ mod tests {
         let img = FlashImage::new(vec![0u8; 100]);
         assert_eq!(img.region(50, 200).len(), 50);
         assert_eq!(img.region(200, 300).len(), 0);
+    }
+
+    // ---- Transaction orchestration tests (mock reader + mock card) ----------------------------
+
+    use crate::card::{
+        BackupReport, Card, CardError, CardIdentity, ChipFamily, DetectReport, Personality,
+    };
+    use crate::firmware::flash_layout::build_synthetic_fixture;
+    use std::path::Path;
+
+    /// Reader that serves a fixed queue of images: snapshot first, then each post-read in order.
+    struct MockReader {
+        images: Vec<FlashImage>,
+        idx: usize,
+    }
+    impl FlashReader for MockReader {
+        fn read_full_flash(&mut self) -> Result<FlashImage, GuardError> {
+            let img = self
+                .images
+                .get(self.idx)
+                .cloned()
+                .ok_or_else(|| GuardError::SnapshotFailed("mock: no more images".into()))?;
+            self.idx += 1;
+            Ok(img)
+        }
+    }
+
+    /// Card that records every write_region call and never touches hardware.
+    struct MockCard {
+        ident: CardIdentity,
+        writes: Vec<(ImageType, usize)>,
+    }
+    impl MockCard {
+        fn new() -> Self {
+            Self {
+                ident: CardIdentity {
+                    bdf: "0000:01:00.0".into(),
+                    vendor_id: 0x1000,
+                    device_id: 0x0072,
+                    subsystem_vid: None,
+                    subsystem_did: None,
+                    chip_family: ChipFamily::Sas2008,
+                    friendly_name: None,
+                },
+                writes: Vec::new(),
+            }
+        }
+    }
+    impl Card for MockCard {
+        fn identity(&self) -> &CardIdentity {
+            &self.ident
+        }
+        fn detect(&mut self) -> Result<DetectReport, CardError> {
+            Err(CardError::NotImplemented("mock detect"))
+        }
+        fn backup(&mut self, _: &Path) -> Result<BackupReport, CardError> {
+            Err(CardError::NotImplemented("mock backup"))
+        }
+        fn current_personality(&mut self) -> Result<Personality, CardError> {
+            Err(CardError::NotImplemented("mock current_personality"))
+        }
+        fn write_region(&mut self, t: ImageType, d: &[u8]) -> Result<(), CardError> {
+            self.writes.push((t, d.len()));
+            Ok(())
+        }
+    }
+
+    /// Build a transaction with a mocked reader. `images[0]` is the snapshot (read by begin);
+    /// subsequent entries are served to each post-read.
+    fn mock_txn(images: Vec<Vec<u8>>) -> GuardedFlash {
+        let reader = Box::new(MockReader {
+            images: images.into_iter().map(FlashImage::new).collect(),
+            idx: 0,
+        });
+        GuardedFlash::begin_with(reader, "0000:01:00.0", &std::env::temp_dir())
+            .expect("mock begin should snapshot")
+    }
+
+    fn fixture() -> Vec<u8> {
+        build_synthetic_fixture("07.15.08.00", "07.15.08.00")
+    }
+
+    fn erase_boot_critical(mut img: Vec<u8>) -> Vec<u8> {
+        for b in img[0x54_0000..0x5A_0000].iter_mut() {
+            *b = 0xFF;
+        }
+        img
+    }
+
+    #[test]
+    fn begin_rejects_non_8mb_snapshot() {
+        let reader = Box::new(MockReader {
+            images: vec![FlashImage::new(vec![0xAB; 1024])],
+            idx: 0,
+        });
+        let result = GuardedFlash::begin_with(reader, "x", &std::env::temp_dir());
+        assert!(matches!(result, Err(GuardError::SnapshotNotRestorable(_))));
+    }
+
+    #[test]
+    fn commit_does_not_write_when_preflight_fails() {
+        // Empty image trips preflight; the card must NOT be written.
+        let mut txn = mock_txn(vec![fixture()]);
+        let mut card = MockCard::new();
+        let err = txn
+            .commit(
+                &mut card,
+                WriteIntent {
+                    region: ImageType::Fw,
+                    bytes: vec![],
+                    label: "fw".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, GuardError::EmptyImage));
+        assert!(
+            card.writes.is_empty(),
+            "no write may be issued on preflight failure"
+        );
+    }
+
+    // BIOS region in the fixture (see build_synthetic_fixture).
+    const BIOS_OFF: usize = 0x08_0000;
+
+    /// snap with the BIOS region's first `bytes.len()` bytes overwritten — models a write landing.
+    fn bios_written(mut img: Vec<u8>, bytes: &[u8]) -> Vec<u8> {
+        img[BIOS_OFF..BIOS_OFF + bytes.len()].copy_from_slice(bytes);
+        img
+    }
+
+    #[test]
+    fn commit_clean_when_target_matches_and_nothing_else_changed() {
+        // Write 0xCD into BIOS; post reflects exactly that and nothing else.
+        let snap = fixture();
+        let payload = vec![0xCDu8; 256];
+        let post = bios_written(snap.clone(), &payload);
+        let mut txn = mock_txn(vec![snap, post]);
+        let mut card = MockCard::new();
+        txn.commit(
+            &mut card,
+            WriteIntent {
+                region: ImageType::Bios,
+                bytes: payload,
+                label: "bios".into(),
+            },
+        )
+        .expect("clean write should pass postflight");
+        assert_eq!(card.writes.len(), 1, "exactly one write, no rollback");
+    }
+
+    #[test]
+    fn commit_halts_on_boot_critical_corruption_without_rollback() {
+        // The write corrupted the boot-input zone (the brick mechanism).
+        let snap = fixture();
+        let post = erase_boot_critical(snap.clone());
+        let mut txn = mock_txn(vec![snap, post]);
+        let mut card = MockCard::new();
+        let err = txn
+            .commit(
+                &mut card,
+                WriteIntent {
+                    region: ImageType::Bios,
+                    bytes: vec![0u8; 256],
+                    label: "bios".into(),
+                },
+            )
+            .unwrap_err();
+        match err {
+            GuardError::PostflightFailed {
+                worst, rolled_back, ..
+            } => {
+                assert_eq!(worst, Severity::Critical);
+                assert!(!rolled_back, "Critical must NOT trigger further writes");
+            }
+            other => panic!("expected PostflightFailed, got {other:?}"),
+        }
+        assert_eq!(card.writes.len(), 1, "no rollback write after Critical");
+    }
+
+    #[test]
+    fn commit_rolls_back_target_on_recoverable_error() {
+        // post1 == snapshot, so the BIOS region (zeros) != the intended 0xCD bytes → TargetReadback
+        // (Error), boot-critical intact. Rollback re-writes BIOS; post2 (snapshot) is clean.
+        let snap = fixture();
+        let mut txn = mock_txn(vec![snap.clone(), snap.clone(), snap]);
+        let mut card = MockCard::new();
+        let err = txn
+            .commit(
+                &mut card,
+                WriteIntent {
+                    region: ImageType::Bios,
+                    bytes: vec![0xCD; 256],
+                    label: "bios".into(),
+                },
+            )
+            .unwrap_err();
+        match err {
+            GuardError::PostflightFailed {
+                worst, rolled_back, ..
+            } => {
+                assert_eq!(worst, Severity::Error);
+                assert!(rolled_back, "Error path should roll the target region back");
+            }
+            other => panic!("expected PostflightFailed, got {other:?}"),
+        }
+        assert_eq!(card.writes.len(), 2, "original write + one rollback write");
+    }
+
+    #[test]
+    fn commit_with_halts_on_boot_critical_corruption() {
+        let snap = fixture();
+        let post = erase_boot_critical(snap.clone());
+        let mut txn = mock_txn(vec![snap, post]);
+        let err = txn.commit_with(|| Ok(())).unwrap_err();
+        assert!(matches!(
+            err,
+            GuardError::PostflightFailed {
+                worst: Severity::Critical,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn commit_with_clean_passes() {
+        let snap = fixture();
+        let mut txn = mock_txn(vec![snap.clone(), snap]);
+        txn.commit_with(|| Ok(()))
+            .expect("clean multi-region write should pass");
+    }
+
+    #[test]
+    fn confinement_warns_on_out_of_region_change() {
+        // Change a byte OUTSIDE the FIRMWARE region and outside boot-critical → Warn (non-fatal).
+        let snap = fixture();
+        let mut post = snap.clone();
+        post[0x10_0000] ^= 0xFF; // outside FIRMWARE (0x5A0000+) and outside boot-critical
+        let fw = snap[0x5A_0000..0x5A_0000 + 0x10_0000].to_vec();
+        let intent = WriteIntent {
+            region: ImageType::Fw,
+            bytes: fw,
+            label: "fw".into(),
+        };
+        let v =
+            check_write_confined_to_target(&FlashImage::new(snap), &FlashImage::new(post), &intent)
+                .expect("out-of-region change must be flagged");
+        assert_eq!(v.invariant, "WriteConfinedToTarget");
+        assert_eq!(v.severity, Severity::Warn);
     }
 }

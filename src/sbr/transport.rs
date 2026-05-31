@@ -409,11 +409,7 @@ impl Bar1MmapSbrTransport {
     /// the array (NOR needs erase/program commands to the flash controller) — use
     /// this verb to EMPIRICALLY test what a given chip address accepts. IOC-free.
     /// Symmetric: unlock_diag → word writes → relock_diag. NO RESET. DESTRUCTIVE.
-    pub fn write_chip_mem(
-        &mut self,
-        chip_addr: u32,
-        data: &[u8],
-    ) -> Result<(), SbrTransportError> {
+    pub fn write_chip_mem(&mut self, chip_addr: u32, data: &[u8]) -> Result<(), SbrTransportError> {
         use crate::sbr::i2c::{chip_write32, relock_diag, unlock_diag};
 
         // SAFETY: `va` valid for `self.len` bytes (mmap success + fstat).
@@ -425,7 +421,11 @@ impl Bar1MmapSbrTransport {
             let mut w = [0u8; 4];
             let n = (data.len() - i).min(4);
             w[..n].copy_from_slice(&data[i..i + n]);
-            chip_write32(bar1, chip_addr.wrapping_add(i as u32), u32::from_le_bytes(w));
+            chip_write32(
+                bar1,
+                chip_addr.wrapping_add(i as u32),
+                u32::from_le_bytes(w),
+            );
             i += 4;
         }
         relock_diag(bar1);

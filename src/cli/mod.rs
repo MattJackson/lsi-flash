@@ -7,6 +7,7 @@
 pub mod backup;
 pub mod config;
 pub mod detect;
+pub mod diff;
 pub mod erase;
 pub mod flash;
 pub mod fw;
@@ -148,6 +149,20 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         sub: config::ConfigSubCommand,
+    },
+
+    /// Compare two flash-image files region-by-region (offline mode). Reports which FLASH_LAYOUT
+    /// regions differ by how much and classification (IDENTICAL/DIFFERS/A_ERASED/B_ERASED); falls back
+    /// to coalesced 4KB blocks if layout parsing fails. Cites: src/cli/diff.rs for implementation;
+    /// uses parse_flash_layout from src/firmware/flash_layout.rs for region mapping.
+    Diff {
+        /// First flash-image file (source).
+        #[arg(value_name = "FILE_A")]
+        file_a: std::path::PathBuf,
+
+        /// Second flash-image file (target/backup).
+        #[arg(value_name = "FILE_B")]
+        file_b: std::path::PathBuf,
     },
 
     /// DIAGNOSTIC: send a raw TOOLBOX_CLEAN and print the firmware's exact
@@ -484,20 +499,23 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                     .map_err(|e| crate::Error::Other(format!("bar1 open: {}", e)))?;
                 match (value, r#in) {
                     (Some(v), None) => {
-                        let w = u32::from_str_radix(v.trim_start_matches("0x"), 16)
-                            .map_err(|e| crate::Error::Other(format!("bad --value {}: {}", v, e)))?;
+                        let w =
+                            u32::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|e| {
+                                crate::Error::Other(format!("bad --value {}: {}", v, e))
+                            })?;
                         t.write_chip_word(chip_addr, w, width)
                             .map_err(|e| crate::Error::Other(format!("chip write: {}", e)))?;
-                        eprintln!(
-                            "chip-write{}b @0x{:08x} <- 0x{:08x}",
-                            width, chip_addr, w
-                        );
+                        eprintln!("chip-write{}b @0x{:08x} <- 0x{:08x}", width, chip_addr, w);
                     }
                     (None, Some(p)) => {
                         let bytes = std::fs::read(&p)?;
                         t.write_chip_mem(chip_addr, &bytes)
                             .map_err(|e| crate::Error::Other(format!("chip write: {}", e)))?;
-                        eprintln!("chip-write @0x{:08x}: {} bytes written", chip_addr, bytes.len());
+                        eprintln!(
+                            "chip-write @0x{:08x}: {} bytes written",
+                            chip_addr,
+                            bytes.len()
+                        );
                     }
                     _ => {
                         return Err(crate::Error::Other(
@@ -558,6 +576,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                 .map_err(|e| crate::Error::Other(format!("{}", e)))?;
             config::run(bdf, sub)
         }
+        Command::Diff { file_a, file_b } => diff::run(file_a, file_b, cli.json),
         Command::Firmware { sub } => match sub {
             FirmwareCommand::ReversePhy { input, output } => {
                 let data = std::fs::read(&input)?;

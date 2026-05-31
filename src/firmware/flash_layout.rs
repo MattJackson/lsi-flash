@@ -19,6 +19,14 @@ use crate::firmware::inspect::{FwError, MPI2_FW_HEADER_SIGNATURE};
 /// `MPI2_FLASH_REGION_FIRMWARE` — the region a `fw` image lands in (mpi2_ioc.h:1507).
 pub const REGION_FIRMWARE: u8 = 0x01;
 
+/// `MPI2_FLASH_REGION_BIOS` — where a `bios` image lands (mpi2_ioc.h:1508). The FW_DOWNLOAD
+/// ITYPE value equals the region code (ITYPE_BIOS = 0x02 = REGION_BIOS), so the `bios` verb's
+/// target region is unambiguous.
+pub const REGION_BIOS: u8 = 0x02;
+
+/// `MPI2_FLASH_REGION_NVDATA` — where an `nvdata` image lands (mpi2_ioc.h:1509).
+pub const REGION_NVDATA: u8 = 0x03;
+
 /// BACKUP firmware region type. Cites: 2026-05-30-bank-mismatch-rootcause.md line 15, region table showing BACKUP type=0x05 @0x6E0000.
 pub const REGION_BACKUP: u8 = 0x05;
 
@@ -66,7 +74,10 @@ impl FlashLayout {
     /// Returns None if no matching region is found. Reuses existing parse_flash_layout;
     /// does not duplicate parsing logic. Cites: flash_layout.rs line 30-34 for FlashRegion struct.
     pub fn region_span(&self, region_type: u8) -> Option<(u32, u32)> {
-        self.layouts.iter().flat_map(|l| l.regions.iter()).find(|r| r.region_type == region_type)
+        self.layouts
+            .iter()
+            .flat_map(|l| l.regions.iter())
+            .find(|r| r.region_type == region_type)
             .map(|r| (r.offset, r.size))
     }
 }
@@ -199,8 +210,16 @@ pub fn verify_flash_consistency(flash: &[u8]) -> Result<FlashConsistency, FwErro
             && (1..=16).contains(&rd_u16(flash, c + 4))
             && (1..=16).contains(&rd_u16(flash, c + 6))
         {
-            eprintln!("verify_flash_consistency: found layout at c={:#x}, flash[c+2]={:#x}", c, flash[c + 2]);
-            eprintln!("verify_flash_consistency: n_layouts={}, regions_per={}", rd_u16(flash, c + 4), rd_u16(flash, c + 6));
+            eprintln!(
+                "verify_flash_consistency: found layout at c={:#x}, flash[c+2]={:#x}",
+                c,
+                flash[c + 2]
+            );
+            eprintln!(
+                "verify_flash_consistency: n_layouts={}, regions_per={}",
+                rd_u16(flash, c + 4),
+                rd_u16(flash, c + 6)
+            );
             layout_start = Some(c);
             break;
         }
@@ -254,6 +273,114 @@ pub fn verify_flash_consistency(flash: &[u8]) -> Result<FlashConsistency, FwErro
         backup_version: bak_version.clone(),
         consistent: fw_version == bak_version,
     })
+}
+
+/// Read firmware region via back-door (diag-mapped flash). Opens BAR1, reads chip memory
+/// @0xFC000000 (full 8MiB flash window), then extracts the FIRMWARE region bytes using
+/// region_span. Returns the raw firmware bytes. Cites: ADR-020 line 41 for path ordering,
+// sbr/transport.rs:355-375 for read_chip_mem signature and usage pattern.
+pub fn read_firmware_backdoor(bdf: &str) -> Result<Vec<u8>, crate::Error> {
+    use crate::sbr::transport::Bar1MmapSbrTransport;
+
+    let mut transport = Bar1MmapSbrTransport::open(bdf)
+        .map_err(|e| crate::Error::Other(format!("backdoor open: {}", e)))?;
+
+    // Read full 8MiB flash window @0xFC000000 (A0000000 on SAS2008 maps to this).
+    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
+    let chip_mem = transport
+        .read_chip_mem(0xFC000000, FLASH_WINDOW_SIZE)
+        .map_err(|e| crate::Error::Other(format!("backdoor read_chip_mem: {}", e)))?;
+
+    // Parse FLASH_LAYOUT and extract FIRMWARE region.
+    let layout = parse_flash_layout(&chip_mem)
+        .map_err(|e| crate::Error::Other(format!("backdoor parse_flash_layout: {}", e)))?;
+
+    let (offset, size) = layout
+        .region_span(REGION_FIRMWARE)
+        .ok_or_else(|| crate::Error::Other("backdoor: no FIRMWARE region found".into()))?;
+
+    if offset as usize + size as usize > chip_mem.len() {
+        return Err(crate::Error::Other(format!(
+            "backdoor: firmware region {}+{} exceeds flash window {}",
+            offset,
+            size,
+            chip_mem.len()
+        )));
+    }
+
+    Ok(chip_mem[offset as usize..(offset + size) as usize].to_vec())
+}
+
+/// SYNTHETIC test fixture: a minimal valid 8 MiB flash with a parseable FLASH_LAYOUT (FIRMWARE
+/// region @0x5A0000, BACKUP @0x6E0000) and MPTFW version strings. Shared by the flash_layout and
+/// guard test suites so neither hand-rolls a layout. `pub(crate)` + cfg(test): test-only.
+#[cfg(test)]
+pub(crate) fn build_synthetic_fixture(fw_ver: &str, bak_ver: &str) -> Vec<u8> {
+    // Need space for backup region at 0x6E0000 plus 1 MiB = 0x7E0000
+    let mut flash = vec![0u8; 0x800000];
+
+    // FW header with correct signatures
+    flash[0..4].copy_from_slice(&MPI2_FW_HEADER_SIGNATURE.to_le_bytes());
+    flash[4..8].copy_from_slice(&0x5AFAA55Au32.to_le_bytes());
+    flash[8..12].copy_from_slice(&0xA55AFAA5u32.to_le_bytes());
+    flash[12..16].copy_from_slice(&0x5AA55AFAu32.to_le_bytes());
+    flash[0x20..0x22].copy_from_slice(&0x1000u16.to_le_bytes()); // Vendor ID LSI
+    flash[0x22..0x24].copy_from_slice(&0x2713u16.to_le_bytes()); // Product ID SAS2008 IT
+
+    // NextImageHeaderOffset@0x30 points to first ext image @ 0x100
+    flash[0x30..0x34].copy_from_slice(&0x100u32.to_le_bytes());
+
+    // Ext image chain: type=0x05 at 0x100, next->0x400 (FLASH_LAYOUT)
+    flash[0x100] = 0x05; // ImageType @0x00
+    flash[0x108..0x10C].copy_from_slice(&0u32.to_le_bytes()); // ImageSize @0x04 (4 bytes, zero)
+    flash[0x10C..0x110].copy_from_slice(&0x400u32.to_le_bytes()); // NextImageHeaderOffset @0x08 (per mpi2_ioc.h comment at line 11)
+
+    // FLASH_LAYOUT ext image @ 0x400: type=0x06, next=0 (no further images)
+    flash[0x400] = EXT_IMAGE_TYPE_FLASH_LAYOUT;
+    // ImageSize at offset +0x04
+    flash[0x404..0x408].copy_from_slice(&0x100u32.to_le_bytes());
+    // NextImageHeaderOffset at offset +0x0C = 0 (no next)
+    flash[0x40C..0x410].copy_from_slice(&0u32.to_le_bytes());
+
+    // FLASH_LAYOUT_DATA payload at 0x420: SizeOfRegion=0x10, NumLayouts=1, RegionsPerLayout=2
+    let layout_start = 0x420;
+    flash[layout_start + 2] = 0x10; // SizeOfRegion @0x02
+    flash[layout_start + 4..layout_start + 6].copy_from_slice(&1u16.to_le_bytes()); // NumLayouts @0x04
+    flash[layout_start + 6..layout_start + 8].copy_from_slice(&3u16.to_le_bytes()); // RegionsPerLayout @0x06
+
+    // MPI2_FLASH_LAYOUT header at layout_start+0x10 = 0x430: FlashSize @0x00
+    let flash_size_offset = layout_start + 0x10;
+    flash[flash_size_offset..flash_size_offset + 4].copy_from_slice(&(0x800000u32).to_le_bytes()); // Flash size 8MB
+
+    // Region table at layout_start+0x20 = 0x440, each region is 0x10 bytes
+    let region_base = 0x440;
+
+    // Region 0: FIRMWARE (type=0x01) @ 0x5A0000, size=0x100000
+    flash[region_base] = REGION_FIRMWARE;
+    flash[region_base + 4..region_base + 8].copy_from_slice(&(0x5A0000u32).to_le_bytes()); // Offset
+    flash[region_base + 8..region_base + 12].copy_from_slice(&(0x100000u32).to_le_bytes()); // Size
+
+    // Region 1: BACKUP (type=0x05) @ 0x6E0000, size=0x100000
+    let backup_region = region_base + 0x10;
+    flash[backup_region] = REGION_BACKUP;
+    flash[backup_region + 4..backup_region + 8].copy_from_slice(&(0x6E0000u32).to_le_bytes()); // Offset
+    flash[backup_region + 8..backup_region + 12].copy_from_slice(&(0x100000u32).to_le_bytes()); // Size
+
+    // Region 2: BIOS (type=0x02) @ 0x080000, size=0x40000 — clear of boot-critical/FIRMWARE/BACKUP.
+    let bios_region = region_base + 0x20;
+    flash[bios_region] = REGION_BIOS;
+    flash[bios_region + 4..bios_region + 8].copy_from_slice(&(0x080000u32).to_le_bytes()); // Offset
+    flash[bios_region + 8..bios_region + 12].copy_from_slice(&(0x040000u32).to_le_bytes()); // Size
+
+    // Version strings at region_offset + 0x68 (per 2026-05-30-bank-mismatch-rootcause.md line 19)
+    let fw_ver_start = 0x5A0000 + 0x68;
+    let bak_ver_start = 0x6E0000 + 0x68;
+    let ver_bytes_fw = format!("@(#)MPTFW-{}-IE", fw_ver).into_bytes();
+    let ver_bytes_bak = format!("@(#)MPTFW-{}-IE", bak_ver).into_bytes();
+    flash[fw_ver_start..fw_ver_start + ver_bytes_fw.len()].copy_from_slice(&ver_bytes_fw);
+    flash[bak_ver_start..bak_ver_start + ver_bytes_bak.len()].copy_from_slice(&ver_bytes_bak);
+
+    flash
 }
 
 #[cfg(test)]
@@ -313,69 +440,6 @@ mod tests {
 
         // Non-existent region type returns None
         assert_eq!(fl.region_span(0xFF), None);
-    }
-
-    /// SYNTHETIC: minimal FLASH_LAYOUT with two firmware regions (FIRMWARE=0x01, BACKUP=0x05).
-    fn build_synthetic_fixture(fw_ver: &str, bak_ver: &str) -> Vec<u8> {
-        // Need space for backup region at 0x6E0000 plus 1 MiB = 0x7E0000
-        let mut flash = vec![0u8; 0x800000];
-
-        // FW header with correct signatures
-        flash[0..4].copy_from_slice(&MPI2_FW_HEADER_SIGNATURE.to_le_bytes());
-        flash[4..8].copy_from_slice(&0x5AFAA55Au32.to_le_bytes());
-        flash[8..12].copy_from_slice(&0xA55AFAA5u32.to_le_bytes());
-        flash[12..16].copy_from_slice(&0x5AA55AFAu32.to_le_bytes());
-        flash[0x20..0x22].copy_from_slice(&0x1000u16.to_le_bytes()); // Vendor ID LSI
-        flash[0x22..0x24].copy_from_slice(&0x2713u16.to_le_bytes()); // Product ID SAS2008 IT
-
-        // NextImageHeaderOffset@0x30 points to first ext image @ 0x100
-        flash[0x30..0x34].copy_from_slice(&0x100u32.to_le_bytes());
-
-        // Ext image chain: type=0x05 at 0x100, next->0x400 (FLASH_LAYOUT)
-        flash[0x100] = 0x05; // ImageType @0x00
-        flash[0x108..0x10C].copy_from_slice(&0u32.to_le_bytes()); // ImageSize @0x04 (4 bytes, zero)
-        flash[0x10C..0x110].copy_from_slice(&0x400u32.to_le_bytes()); // NextImageHeaderOffset @0x08 (per mpi2_ioc.h comment at line 11)
-
-        // FLASH_LAYOUT ext image @ 0x400: type=0x06, next=0 (no further images)
-        flash[0x400] = EXT_IMAGE_TYPE_FLASH_LAYOUT;
-        // ImageSize at offset +0x04
-        flash[0x404..0x408].copy_from_slice(&0x100u32.to_le_bytes());
-        // NextImageHeaderOffset at offset +0x0C = 0 (no next)
-        flash[0x40C..0x410].copy_from_slice(&0u32.to_le_bytes());
-
-        // FLASH_LAYOUT_DATA payload at 0x420: SizeOfRegion=0x10, NumLayouts=1, RegionsPerLayout=2
-        let layout_start = 0x420;
-        flash[layout_start + 2] = 0x10; // SizeOfRegion @0x02
-        flash[layout_start + 4..layout_start + 6].copy_from_slice(&1u16.to_le_bytes()); // NumLayouts @0x04
-        flash[layout_start + 6..layout_start + 8].copy_from_slice(&2u16.to_le_bytes()); // RegionsPerLayout @0x06
-
-        // MPI2_FLASH_LAYOUT header at layout_start+0x10 = 0x430: FlashSize @0x00
-        let flash_size_offset = layout_start + 0x10;
-        flash[flash_size_offset..flash_size_offset+4].copy_from_slice(&(0x800000u32).to_le_bytes()); // Flash size 8MB
-
-        // Region table at layout_start+0x20 = 0x440, each region is 0x10 bytes
-        let region_base = 0x440;
-
-        // Region 0: FIRMWARE (type=0x01) @ 0x5A0000, size=0x100000
-        flash[region_base] = REGION_FIRMWARE;
-        flash[region_base + 4..region_base + 8].copy_from_slice(&(0x5A0000u32).to_le_bytes()); // Offset
-        flash[region_base + 8..region_base + 12].copy_from_slice(&(0x100000u32).to_le_bytes()); // Size
-
-        // Region 1: BACKUP (type=0x05) @ 0x6E0000, size=0x100000
-        let backup_region = region_base + 0x10;
-        flash[backup_region] = REGION_BACKUP;
-        flash[backup_region + 4..backup_region + 8].copy_from_slice(&(0x6E0000u32).to_le_bytes()); // Offset
-        flash[backup_region + 8..backup_region + 12].copy_from_slice(&(0x100000u32).to_le_bytes()); // Size
-
-        // Version strings at region_offset + 0x68 (per 2026-05-30-bank-mismatch-rootcause.md line 19)
-        let fw_ver_start = 0x5A0000 + 0x68;
-        let bak_ver_start = 0x6E0000 + 0x68;
-        let ver_bytes_fw = format!("@(#)MPTFW-{}-IE", fw_ver).into_bytes();
-        let ver_bytes_bak = format!("@(#)MPTFW-{}-IE", bak_ver).into_bytes();
-        flash[fw_ver_start..fw_ver_start + ver_bytes_fw.len()].copy_from_slice(&ver_bytes_fw);
-        flash[bak_ver_start..bak_ver_start + ver_bytes_bak.len()].copy_from_slice(&ver_bytes_bak);
-
-        flash
     }
 
     #[test]
@@ -439,7 +503,7 @@ mod tests {
         }
     }
 
-   #[test]
+    #[test]
     fn flash_too_short_returns_err() {
         let short_flash = vec![0u8; 1024];
         assert!(matches!(
@@ -453,8 +517,11 @@ mod tests {
     fn post_write_verify_gate_passes_on_consistent_versions() {
         let flash = build_synthetic_fixture("07.15.08.00", "07.15.08.00");
         let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
-        
-        assert!(consistency.consistent, "matching versions should pass verify gate");
+
+        assert!(
+            consistency.consistent,
+            "matching versions should pass verify gate"
+        );
         assert_eq!(consistency.firmware_version, "@(#)MPTFW-07.15.08.00-IE");
         assert_eq!(consistency.backup_version, "@(#)MPTFW-07.15.08.00-IE");
     }
@@ -464,7 +531,7 @@ mod tests {
     fn post_write_verify_gate_fails_on_mismatched_versions() {
         let flash = build_synthetic_fixture("07.15.08.00", "20.00.07.00");
         let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
-        
+
         assert!(
             !consistency.consistent,
             "mismatched versions should FAIL verify gate (this is the brick case)"
@@ -479,46 +546,11 @@ mod tests {
         // This simulates the exact brick scenario: active=07.15.08.00, backup=20.00.07.00
         let flash = build_synthetic_fixture("07.15.08.00", "20.00.07.00");
         let consistency = verify_flash_consistency(&flash).expect("should parse valid fixture");
-        
+
         assert!(!consistency.consistent);
-        
+
         // Verify both versions are named in the result (for error message)
         assert_eq!(consistency.firmware_version, "@(#)MPTFW-07.15.08.00-IE");
         assert_eq!(consistency.backup_version, "@(#)MPTFW-20.00.07.00-IE");
     }
-}
-
-/// Read firmware region via back-door (diag-mapped flash). Opens BAR1, reads chip memory
-/// @0xFC000000 (full 8MiB flash window), then extracts the FIRMWARE region bytes using
-/// region_span. Returns the raw firmware bytes. Cites: ADR-020 line 41 for path ordering,
-// sbr/transport.rs:355-375 for read_chip_mem signature and usage pattern.
-pub fn read_firmware_backdoor(bdf: &str) -> Result<Vec<u8>, crate::Error> {
-    use crate::sbr::transport::Bar1MmapSbrTransport;
-
-    let mut transport = Bar1MmapSbrTransport::open(bdf)
-        .map_err(|e| crate::Error::Other(format!("backdoor open: {}", e)))?;
-
-    // Read full 8MiB flash window @0xFC000000 (A0000000 on SAS2008 maps to this).
-    const FLASH_WINDOW_SIZE: usize = 8 * 1024 * 1024;
-    let chip_mem = transport
-        .read_chip_mem(0xFC000000, FLASH_WINDOW_SIZE)
-        .map_err(|e| crate::Error::Other(format!("backdoor read_chip_mem: {}", e)))?;
-
-    // Parse FLASH_LAYOUT and extract FIRMWARE region.
-    let layout = parse_flash_layout(&chip_mem).map_err(|e| {
-        crate::Error::Other(format!("backdoor parse_flash_layout: {}", e))
-    })?;
-
-    let (offset, size) = layout
-        .region_span(REGION_FIRMWARE)
-        .ok_or_else(|| crate::Error::Other("backdoor: no FIRMWARE region found".into()))?;
-
-    if offset as usize + size as usize > chip_mem.len() {
-        return Err(crate::Error::Other(format!(
-            "backdoor: firmware region {}+{} exceeds flash window {}",
-            offset, size, chip_mem.len()
-        )));
-    }
-
-    Ok(chip_mem[offset as usize..(offset + size) as usize].to_vec())
 }

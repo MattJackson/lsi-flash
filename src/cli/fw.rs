@@ -154,7 +154,7 @@ pub fn run_write(bdf: String, from_file: &Path, yes: bool) -> Result<(), crate::
     // pre-write snapshot (recovery image), writes via FW_DOWNLOAD, then enforces the postflight
     // invariants (boot-critical zone unchanged, banks consistent, read-back matches intent) with
     // a severity-driven response. Supersedes the old hand-rolled read-back + whole-flash verify.
-    let txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
+    let mut txn = GuardedFlash::begin(&bdf, &snapshot_dir())?;
     txn.commit(
         &mut *card,
         WriteIntent {
@@ -163,6 +163,9 @@ pub fn run_write(bdf: String, from_file: &Path, yes: bool) -> Result<(), crate::
             label: "firmware".into(),
         },
     )?;
-    eprintln!("fw write: OK ({} bytes) — guarded transaction verified ✓", image.len());
+    eprintln!(
+        "fw write: OK ({} bytes) — guarded transaction verified ✓",
+        image.len()
+    );
     Ok(())
 }

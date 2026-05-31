@@ -165,7 +165,7 @@ pub fn run(
     let mut card = crate::card::discover_one(&bdf)
         .map_err(|e| crate::Error::Other(format!("recover: discover_one({}): {}", bdf, e)))?;
 
-    let txn = crate::firmware::guard::GuardedFlash::begin(&bdf, &snapshot_dir())?;
+    let mut txn = crate::firmware::guard::GuardedFlash::begin(&bdf, &snapshot_dir())?;
     let mut report_slot = None;
     txn.commit_with(|| {
         let report = card
