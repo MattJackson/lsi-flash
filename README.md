@@ -1,8 +1,9 @@
 # lsi-flash
 
 [![CI](https://github.com/MattJackson/lsi-flash/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/lsi-flash/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MattJackson/lsi-flash?display_name=tag&sort=semver)](https://github.com/MattJackson/lsi-flash/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust: 1.74+](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
+[![MSRV](https://img.shields.io/badge/MSRV-1.74-blue.svg)](https://www.rust-lang.org)
 [![Status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](#status)
 
 > One Linux-native static binary for cross-flashing LSI SAS2008-based HBAs between IT, IR, and OEM identities. Replaces a fragile pile of DOS tools, Python scripts, and abandonware.
@@ -211,6 +212,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Hardware-compatibility reports (good or 
 ## Security
 
 If you find a bug that could brick a card, please report it privately first — see [SECURITY.md](SECURITY.md).
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). This project follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
 ## License
 
