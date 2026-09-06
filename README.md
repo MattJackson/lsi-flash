@@ -212,6 +212,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Hardware-compatibility reports (good or 
 
 If you find a bug that could brick a card, please report it privately first — see [SECURITY.md](SECURITY.md).
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). This project follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
+
 ## License
 
 [MIT](LICENSE). Firmware files in the companion `lsi-flash-firmware` repo retain their original Broadcom proprietary license; that repo's `LICENSE.md` explains the fair-use preservation rationale.
