@@ -168,24 +168,20 @@ impl<B: IocBackend> Session<B> {
             payload_buffer: &mut upload_data,
         };
 
-        match self.backend.send_fw_upload(&mut upload_req_concrete) {
-            Ok(reply) => {
-                if reply.ioc_status.is_flash_hard_stop() {
-                    return Err(MpiError::IocStatus(reply.ioc_status));
-                }
+        let reply = self.backend.send_fw_upload(&mut upload_req_concrete)?;
+        if reply.ioc_status.is_flash_hard_stop() {
+            return Err(MpiError::IocStatus(reply.ioc_status));
+        }
 
-                // Verify byte-for-byte match
-                if upload_data != data {
-                    let mismatch = data
-                        .iter()
-                        .zip(upload_data.iter())
-                        .position(|(a, b)| a != b);
-                    return Err(MpiError::VerifyMismatch {
-                        offset: mismatch.unwrap_or(0),
-                    });
-                }
-            }
-            Err(e) => return Err(e),
+        // Verify byte-for-byte match
+        if upload_data != data {
+            let mismatch = data
+                .iter()
+                .zip(upload_data.iter())
+                .position(|(a, b)| a != b);
+            return Err(MpiError::VerifyMismatch {
+                offset: mismatch.unwrap_or(0),
+            });
         }
 
         Ok(())
