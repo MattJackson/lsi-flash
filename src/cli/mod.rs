@@ -438,7 +438,7 @@ pub fn run(cli: Cli) -> Result<(), crate::Error> {
                         use sha2::{Digest, Sha256};
                         let mut h = Sha256::new();
                         h.update(&bytes);
-                        format!("{:x}", h.finalize())
+                        hex::encode(h.finalize())
                     }
                 );
                 match out {

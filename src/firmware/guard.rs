@@ -471,7 +471,7 @@ fn sanitize_bdf(bdf: &str) -> String {
 fn sha_hex(b: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(b);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 // ===========================================================================================

@@ -282,7 +282,7 @@ impl Card for MptCard {
             let mut hasher = Sha256::new();
             hasher.update(&data);
             let result = hasher.finalize();
-            let sha256 = format!("{:x}", result);
+            let sha256 = hex::encode(result);
 
             let artifact = crate::card::BackupArtifact {
                 path: file_name.to_string(),
@@ -305,7 +305,7 @@ impl Card for MptCard {
                 fs::write(&path, &sbr[..]).map_err(CardError::Io)?;
                 let mut hasher = Sha256::new();
                 hasher.update(&sbr[..]);
-                let sha256 = format!("{:x}", hasher.finalize());
+                let sha256 = hex::encode(hasher.finalize());
                 artifacts.push(crate::card::BackupArtifact {
                     path: "sbr.bin".to_string(),
                     image_type: "Sbr".to_string(),
@@ -440,7 +440,7 @@ impl Card for MptCard {
             let mut hasher = Sha256::new();
             hasher.update(&file_bytes);
             let result = hasher.finalize();
-            let computed_sha256 = format!("{:x}", result);
+            let computed_sha256 = hex::encode(result);
             if computed_sha256 != artifact.sha256 {
                 return Err(CardError::Transport(format!(
                     "SHA256 mismatch for {}: disk={} vs manifest={}",
@@ -991,12 +991,12 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(vec![0xAA; fw_size]);
         let result = hasher.finalize();
-        let fw_sha256 = format!("{:x}", result);
+        let fw_sha256 = hex::encode(result);
 
         let mut hasher = Sha256::new();
         hasher.update(vec![0xBB; bios_size]);
         let result = hasher.finalize();
-        let bios_sha256 = format!("{:x}", result);
+        let bios_sha256 = hex::encode(result);
 
         let manifest = BackupManifest {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1150,12 +1150,12 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(&fw_content);
         let result = hasher.finalize();
-        let fw_sha256 = format!("{:x}", result);
+        let fw_sha256 = hex::encode(result);
 
         let mut hasher = Sha256::new();
         hasher.update(&bios_content);
         let result = hasher.finalize();
-        let bios_sha256 = format!("{:x}", result);
+        let bios_sha256 = hex::encode(result);
 
         let manifest = BackupManifest {
             timestamp: chrono::Utc::now().to_rfc3339(),

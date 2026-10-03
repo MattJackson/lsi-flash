@@ -42,7 +42,7 @@ pub struct RegionWriteArgs {
 fn sha_hex(b: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(b);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Read a region to a file (or stdout) + print its sha256 to stderr.
