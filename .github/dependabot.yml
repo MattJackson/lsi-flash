@@ -1,29 +1,34 @@
+# Version updates are monthly and grouped into one PR per ecosystem.
+# Security updates are separate and run whenever an advisory is published.
 version: 2
 updates:
-  - package-ecosystem: "cargo"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "rust"
-    commit-message:
-      prefix: "deps"
-    groups:
-      patch-updates:
-        update-types:
-          - "patch"
-
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 3
-    labels:
-      - "dependencies"
-      - "github-actions"
-    commit-message:
-      prefix: "ci"
+- package-ecosystem: cargo
+  directory: /
+  schedule:
+    interval: monthly
+    day: monday
+  open-pull-requests-limit: 5
+  labels:
+  - dependencies
+  - rust
+  commit-message:
+    prefix: deps
+  groups:
+    all:
+      patterns:
+      - '*'
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: monthly
+    day: monday
+  open-pull-requests-limit: 3
+  labels:
+  - dependencies
+  - github-actions
+  commit-message:
+    prefix: ci
+  groups:
+    all:
+      patterns:
+      - '*'
