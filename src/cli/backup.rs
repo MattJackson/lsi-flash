@@ -342,7 +342,7 @@ fn ensure_dir_empty(dir: &Path) -> Result<(), BackupError> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 #[cfg(test)]

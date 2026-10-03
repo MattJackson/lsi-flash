@@ -182,7 +182,7 @@ fn resolve_bdf(pci_bdf: Option<&str>) -> Result<String, crate::Error> {
 fn sha_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 // ---- write ------------------------------------------------------------------
@@ -299,7 +299,7 @@ fn read_sbr_from_chip(
     // Compute SHA256 of SBR bytes - printed to stderr regardless of output mode
     let mut hasher = Sha256::new();
     hasher.update(sbr_bytes);
-    let sha256_hex = format!("{:x}", hasher.finalize());
+    let sha256_hex = hex::encode(hasher.finalize());
     eprintln!("SBR SHA256: {}", sha256_hex);
 
     // Output handling - identical to original implementation for consistency
@@ -631,7 +631,7 @@ mod tests {
         // Verify SHA256 computation
         let mut hasher = sha2::Sha256::new();
         hasher.update(canned_sbr);
-        let sha256_hex = format!("{:x}", hasher.finalize());
+        let sha256_hex = hex::encode(hasher.finalize());
         assert_eq!(sha256_hex.len(), 64);
     }
 

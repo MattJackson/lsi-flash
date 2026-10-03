@@ -22,7 +22,7 @@ fn snapshot_dir() -> std::path::PathBuf {
 fn sha_hex(b: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(b);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// First `MPTFW-<ver>-<suffix>` banner in a firmware blob, for human-readable
